@@ -1,17 +1,26 @@
 //! The `rpc_service` module implements the Solana JSON RPC service.
 
-use crate::{cluster_info::ClusterInfo, rpc::*, rpc_health::*, validator::ValidatorExit};
-use jsonrpc_core::MetaIoHandler;
+use crate::{
+    bigtable_upload_service::BigTableUploadService,
+    cluster_info::ClusterInfo,
+    optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
+    poh_recorder::PohRecorder,
+    rpc::*,
+    rpc_health::*,
+    send_transaction_service::{LeaderInfo, SendTransactionService},
+    validator::ValidatorExit,
+};
+use jsonrpc_core::{futures::prelude::*, MetaIoHandler};
 use jsonrpc_http_server::{
     hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
     RequestMiddlewareAction, ServerBuilder,
 };
 use regex::Regex;
 use solana_ledger::blockstore::Blockstore;
+use solana_metrics::inc_new_counter_info;
 use solana_runtime::{
     bank_forks::{BankForks, SnapshotConfig},
     commitment::BlockCommitmentCache,
-    send_transaction_service::SendTransactionService,
     snapshot_utils,
 };
 use solana_sdk::{hash::Hash, native_token::lamports_to_sol, pubkey::Pubkey};
@@ -20,10 +29,11 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
-    sync::{mpsc::channel, Arc, RwLock},
+    sync::{mpsc::channel, Arc, Mutex, RwLock},
     thread::{self, Builder, JoinHandle},
 };
 use tokio::runtime;
+use tokio_util::codec::{BytesCodec, FramedRead};
 
 pub struct JsonRpcService {
     thread_hdl: JoinHandle<()>,
@@ -32,7 +42,6 @@ pub struct JsonRpcService {
     pub request_processor: JsonRpcRequestProcessor, // Used only by test_rpc_new()...
 
     close_handle: Option<CloseHandle>,
-    runtime: runtime::Runtime,
 }
 
 struct RpcRequestMiddleware {
@@ -53,7 +62,7 @@ impl RpcRequestMiddleware {
         Self {
             ledger_path,
             snapshot_archive_path_regex: Regex::new(
-                r"/snapshot-\d+-[[:alnum:]]+\.tar\.(bz2|zst|gz)$",
+                r"/snapshot-\d+-[[:alnum:]]+\.(tar|tar\.bz2|tar\.zst|tar\.gz)$",
             )
             .unwrap(),
             snapshot_config,
@@ -77,6 +86,7 @@ impl RpcRequestMiddleware {
             .unwrap()
     }
 
+    #[allow(dead_code)]
     fn internal_server_error() -> hyper::Response<hyper::Body> {
         hyper::Response::builder()
             .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
@@ -98,43 +108,54 @@ impl RpcRequestMiddleware {
     }
 
     fn process_file_get(&self, path: &str) -> RequestMiddlewareAction {
-        // Stuck on tokio 0.1 until the jsonrpc-http-server crate upgrades to tokio 0.2
-        use tokio_01::prelude::*;
-
         let stem = path.split_at(1).1; // Drop leading '/' from path
         let filename = {
             match path {
-                "/genesis.tar.bz2" => self.ledger_path.join(stem),
-                _ => self
-                    .snapshot_config
-                    .as_ref()
-                    .unwrap()
-                    .snapshot_package_output_path
-                    .join(stem),
+                "/genesis.tar.bz2" => {
+                    inc_new_counter_info!("rpc-get_genesis", 1);
+                    self.ledger_path.join(stem)
+                }
+                _ => {
+                    inc_new_counter_info!("rpc-get_snapshot", 1);
+                    self.snapshot_config
+                        .as_ref()
+                        .unwrap()
+                        .snapshot_package_output_path
+                        .join(stem)
+                }
             }
         };
 
-        info!("get {} -> {:?}", path, filename);
-
+        let file_length = std::fs::metadata(&filename)
+            .map(|m| m.len())
+            .unwrap_or(0)
+            .to_string();
+        info!("get {} -> {:?} ({} bytes)", path, filename, file_length);
         RequestMiddlewareAction::Respond {
             should_validate_hosts: true,
-            response: Box::new(
-                tokio_fs_01::file::File::open(filename)
-                    .and_then(|file| {
-                        let buf: Vec<u8> = Vec::new();
-                        tokio_io_01::io::read_to_end(file, buf)
-                            .and_then(|item| Ok(hyper::Response::new(item.1.into())))
-                            .or_else(|_| Ok(RpcRequestMiddleware::internal_server_error()))
-                    })
-                    .or_else(|_| Ok(RpcRequestMiddleware::not_found())),
-            ),
+            response: Box::pin(async {
+                // Stuck on tokio 0.2 until the jsonrpc crates upgrade
+                match tokio_02::fs::File::open(filename).await {
+                    Err(_) => Ok(Self::internal_server_error()),
+                    Ok(file) => {
+                        let stream =
+                            FramedRead::new(file, BytesCodec::new()).map_ok(|b| b.freeze());
+                        let body = hyper::Body::wrap_stream(stream);
+
+                        Ok(hyper::Response::builder()
+                            .header(hyper::header::CONTENT_LENGTH, file_length)
+                            .body(body)
+                            .unwrap())
+                    }
+                }
+            }),
         }
     }
 
     fn health_check(&self) -> &'static str {
         let response = match self.health.check() {
             RpcHealthStatus::Ok => "ok",
-            RpcHealthStatus::Behind => "behind",
+            RpcHealthStatus::Behind { num_slots: _ } => "behind",
         };
         info!("health check: {}", response);
         response
@@ -148,57 +169,41 @@ impl RequestMiddleware for RpcRequestMiddleware {
         if let Some(ref snapshot_config) = self.snapshot_config {
             if request.uri().path() == "/snapshot.tar.bz2" {
                 // Convenience redirect to the latest snapshot
-                return RequestMiddlewareAction::Respond {
-                    should_validate_hosts: true,
-                    response: Box::new(jsonrpc_core::futures::future::ok(
-                        if let Some((snapshot_archive, _)) =
-                            snapshot_utils::get_highest_snapshot_archive_path(
-                                &snapshot_config.snapshot_package_output_path,
-                            )
-                        {
-                            RpcRequestMiddleware::redirect(&format!(
-                                "/{}",
-                                snapshot_archive
-                                    .file_name()
-                                    .unwrap_or_else(|| std::ffi::OsStr::new(""))
-                                    .to_str()
-                                    .unwrap_or(&"")
-                            ))
-                        } else {
-                            RpcRequestMiddleware::not_found()
-                        },
-                    )),
-                };
+                return if let Some((snapshot_archive, _)) =
+                    snapshot_utils::get_highest_snapshot_archive_path(
+                        &snapshot_config.snapshot_package_output_path,
+                    ) {
+                    RpcRequestMiddleware::redirect(&format!(
+                        "/{}",
+                        snapshot_archive
+                            .file_name()
+                            .unwrap_or_else(|| std::ffi::OsStr::new(""))
+                            .to_str()
+                            .unwrap_or(&"")
+                    ))
+                } else {
+                    RpcRequestMiddleware::not_found()
+                }
+                .into();
             }
         }
 
         if let Some(result) = process_rest(&self.bank_forks, request.uri().path()) {
-            RequestMiddlewareAction::Respond {
-                should_validate_hosts: true,
-                response: Box::new(jsonrpc_core::futures::future::ok(
-                    hyper::Response::builder()
-                        .status(hyper::StatusCode::OK)
-                        .body(hyper::Body::from(result))
-                        .unwrap(),
-                )),
-            }
+            hyper::Response::builder()
+                .status(hyper::StatusCode::OK)
+                .body(hyper::Body::from(result))
+                .unwrap()
+                .into()
         } else if self.is_file_get_path(request.uri().path()) {
             self.process_file_get(request.uri().path())
         } else if request.uri().path() == "/health" {
-            RequestMiddlewareAction::Respond {
-                should_validate_hosts: true,
-                response: Box::new(jsonrpc_core::futures::future::ok(
-                    hyper::Response::builder()
-                        .status(hyper::StatusCode::OK)
-                        .body(hyper::Body::from(self.health_check()))
-                        .unwrap(),
-                )),
-            }
+            hyper::Response::builder()
+                .status(hyper::StatusCode::OK)
+                .body(hyper::Body::from(self.health_check()))
+                .unwrap()
+                .into()
         } else {
-            RequestMiddlewareAction::Proceed {
-                should_continue_on_invalid_cors: false,
-                request,
-            }
+            request.into()
         }
     }
 }
@@ -236,14 +241,19 @@ impl JsonRpcService {
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         blockstore: Arc<Blockstore>,
         cluster_info: Arc<ClusterInfo>,
+        poh_recorder: Option<Arc<Mutex<PohRecorder>>>,
         genesis_hash: Hash,
         ledger_path: &Path,
         validator_exit: Arc<RwLock<Option<ValidatorExit>>>,
         trusted_validators: Option<HashSet<Pubkey>>,
         override_health_check: Arc<AtomicBool>,
+        optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        send_transaction_retry_ms: u64,
+        send_transaction_leader_forward_count: u64,
     ) -> Self {
         info!("rpc bound to {:?}", rpc_addr);
         info!("rpc configuration: {:?}", config);
+        let rpc_threads = 1.max(config.rpc_threads);
 
         let health = Arc::new(RpcHealth::new(
             cluster_info.clone(),
@@ -253,53 +263,99 @@ impl JsonRpcService {
         ));
 
         let tpu_address = cluster_info.my_contact_info().tpu;
-        let mut runtime = runtime::Builder::new()
-            .threaded_scheduler()
-            .thread_name("rpc-runtime")
-            .enable_all()
-            .build()
-            .expect("Runtime");
+        let runtime = Arc::new(
+            runtime::Builder::new_multi_thread()
+                .thread_name("rpc-runtime")
+                .enable_all()
+                .build()
+                .expect("Runtime"),
+        );
 
-        let bigtable_ledger_storage = if config.enable_bigtable_ledger_storage {
-            runtime
-                .block_on(solana_storage_bigtable::LedgerStorage::new(false))
-                .map(|x| {
-                    info!("BigTable ledger storage initialized");
-                    Some(x)
-                })
-                .unwrap_or_else(|err| {
-                    error!("Failed to initialize BigTable ledger storage: {:?}", err);
-                    None
-                })
-        } else {
-            None
-        };
+        let exit_bigtable_ledger_upload_service = Arc::new(AtomicBool::new(false));
+
+        let (bigtable_ledger_storage, _bigtable_ledger_upload_service) =
+            if config.enable_bigtable_ledger_storage || config.enable_bigtable_ledger_upload {
+                runtime
+                    .block_on(solana_storage_bigtable::LedgerStorage::new(
+                        !config.enable_bigtable_ledger_upload,
+                        config.rpc_bigtable_timeout,
+                    ))
+                    .map(|bigtable_ledger_storage| {
+                        info!("BigTable ledger storage initialized");
+
+                        let bigtable_ledger_upload_service = if config.enable_bigtable_ledger_upload
+                        {
+                            Some(Arc::new(BigTableUploadService::new(
+                                runtime.clone(),
+                                bigtable_ledger_storage.clone(),
+                                blockstore.clone(),
+                                block_commitment_cache.clone(),
+                                exit_bigtable_ledger_upload_service.clone(),
+                            )))
+                        } else {
+                            None
+                        };
+
+                        (
+                            Some(bigtable_ledger_storage),
+                            bigtable_ledger_upload_service,
+                        )
+                    })
+                    .unwrap_or_else(|err| {
+                        error!("Failed to initialize BigTable ledger storage: {:?}", err);
+                        (None, None)
+                    })
+            } else {
+                (None, None)
+            };
 
         let (request_processor, receiver) = JsonRpcRequestProcessor::new(
             config,
+            snapshot_config.clone(),
             bank_forks.clone(),
             block_commitment_cache,
             blockstore,
             validator_exit.clone(),
             health.clone(),
-            cluster_info,
+            cluster_info.clone(),
             genesis_hash,
-            &runtime,
+            runtime,
             bigtable_ledger_storage,
+            optimistically_confirmed_bank,
         );
 
-        let exit_send_transaction_service = Arc::new(AtomicBool::new(false));
+        let leader_info =
+            poh_recorder.map(|recorder| LeaderInfo::new(cluster_info.clone(), recorder));
         let _send_transaction_service = Arc::new(SendTransactionService::new(
             tpu_address,
             &bank_forks,
-            &exit_send_transaction_service,
+            leader_info,
             receiver,
+            send_transaction_retry_ms,
+            send_transaction_leader_forward_count,
         ));
 
         #[cfg(test)]
         let test_request_processor = request_processor.clone();
 
         let ledger_path = ledger_path.to_path_buf();
+
+        // sadly, some parts of our current rpc implemention block the jsonrpc's
+        // _socket-listening_ event loop for too long, due to (blocking) long IO or intesive CPU,
+        // causing no further processing of incoming requests and ultimatily innocent clients timing-out.
+        // So create a (shared) multi-threaded event_loop for jsonrpc and set its .threads() to 1,
+        // so that we avoid the single-threaded event loops from being created automatically by
+        // jsonrpc for threads when .threads(N > 1) is given.
+        let event_loop = {
+            // Stuck on tokio 0.2 until the jsonrpc crates upgrade
+            tokio_02::runtime::Builder::new()
+                .core_threads(rpc_threads)
+                .threaded_scheduler()
+                .enable_all()
+                .thread_name("sol-rpc-el")
+                .build()
+                .unwrap()
+        };
 
         let (close_handle_sender, close_handle_receiver) = channel();
         let thread_hdl = Builder::new()
@@ -319,12 +375,14 @@ impl JsonRpcService {
                     io,
                     move |_req: &hyper::Request<hyper::Body>| request_processor.clone(),
                 )
-                .threads(num_cpus::get())
+                .event_loop_executor(event_loop.handle().clone())
+                .threads(1)
                 .cors(DomainsValidation::AllowOnly(vec![
                     AccessControlAllowOrigin::Any,
                 ]))
                 .cors_max_age(86400)
                 .request_middleware(request_middleware)
+                .max_request_body_size(MAX_REQUEST_PAYLOAD_SIZE)
                 .start_http(&rpc_addr);
 
                 if let Err(e) = server {
@@ -340,7 +398,7 @@ impl JsonRpcService {
                 let server = server.unwrap();
                 close_handle_sender.send(server.close_handle()).unwrap();
                 server.wait();
-                exit_send_transaction_service.store(true, Ordering::Relaxed);
+                exit_bigtable_ledger_upload_service.store(true, Ordering::Relaxed);
             })
             .unwrap();
 
@@ -353,7 +411,6 @@ impl JsonRpcService {
             .register_exit(Box::new(move || close_handle_.close()));
         Self {
             thread_hdl,
-            runtime,
             #[cfg(test)]
             request_processor: test_request_processor,
             close_handle: Some(close_handle),
@@ -367,7 +424,6 @@ impl JsonRpcService {
     }
 
     pub fn join(self) -> thread::Result<()> {
-        self.runtime.shutdown_background();
         self.thread_hdl.join()
     }
 }
@@ -383,10 +439,8 @@ mod tests {
         genesis_utils::{create_genesis_config, GenesisConfigInfo},
         get_tmp_ledger_path,
     };
-    use solana_runtime::{
-        bank::Bank, bank_forks::CompressionType, snapshot_utils::SnapshotVersion,
-    };
-    use solana_sdk::signature::Signer;
+    use solana_runtime::{bank::Bank, bank_forks::ArchiveFormat, snapshot_utils::SnapshotVersion};
+    use solana_sdk::{genesis_config::ClusterType, signature::Signer};
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
@@ -409,6 +463,8 @@ mod tests {
         let ledger_path = get_tmp_ledger_path!();
         let blockstore = Arc::new(Blockstore::open(&ledger_path).unwrap());
         let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
+        let optimistically_confirmed_bank =
+            OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let mut rpc_service = JsonRpcService::new(
             rpc_addr,
             JsonRpcConfig::default(),
@@ -417,11 +473,15 @@ mod tests {
             block_commitment_cache,
             blockstore,
             cluster_info,
+            None,
             Hash::default(),
             &PathBuf::from("farf"),
             validator_exit,
             None,
             Arc::new(AtomicBool::new(false)),
+            optimistically_confirmed_bank,
+            1000,
+            1,
         );
         let thread = rpc_service.thread_hdl.thread();
         assert_eq!(thread.name().unwrap(), "solana-jsonrpc");
@@ -438,7 +498,10 @@ mod tests {
     }
 
     fn create_bank_forks() -> Arc<RwLock<BankForks>> {
-        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config(10_000);
+        genesis_config.cluster_type = ClusterType::MainnetBeta;
         let bank = Bank::new(&genesis_config);
         Arc::new(RwLock::new(BankForks::new(bank)))
     }
@@ -449,11 +512,7 @@ mod tests {
 
         assert_eq!(None, process_rest(&bank_forks, "not-a-supported-rest-api"));
         assert_eq!(
-            Some("0.000010127".to_string()),
-            process_rest(&bank_forks, "/v0/circulating-supply")
-        );
-        assert_eq!(
-            Some("0.000010127".to_string()),
+            process_rest(&bank_forks, "/v0/circulating-supply"),
             process_rest(&bank_forks, "/v0/total-supply")
         );
     }
@@ -473,7 +532,7 @@ mod tests {
                 snapshot_interval_slots: 0,
                 snapshot_package_output_path: PathBuf::from("/"),
                 snapshot_path: PathBuf::from("/"),
-                compression: CompressionType::Bzip2,
+                archive_format: ArchiveFormat::TarBzip2,
                 snapshot_version: SnapshotVersion::default(),
             }),
             bank_forks,
@@ -491,6 +550,13 @@ mod tests {
         assert!(rrm_with_snapshot_config.is_file_get_path(
             "/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2"
         ));
+        assert!(rrm_with_snapshot_config.is_file_get_path(
+            "/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
+        ));
+        assert!(rrm_with_snapshot_config
+            .is_file_get_path("/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.gz"));
+        assert!(rrm_with_snapshot_config
+            .is_file_get_path("/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"));
 
         assert!(!rrm.is_file_get_path(
             "/snapshot-notaslotnumber-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2"
@@ -517,7 +583,11 @@ mod tests {
         let cluster_info = Arc::new(ClusterInfo::default());
         let health_check_slot_distance = 123;
         let override_health_check = Arc::new(AtomicBool::new(false));
-        let trusted_validators = vec![Pubkey::new_rand(), Pubkey::new_rand(), Pubkey::new_rand()];
+        let trusted_validators = vec![
+            solana_sdk::pubkey::new_rand(),
+            solana_sdk::pubkey::new_rand(),
+            solana_sdk::pubkey::new_rand(),
+        ];
 
         let health = Arc::new(RpcHealth::new(
             cluster_info.clone(),
@@ -533,6 +603,7 @@ mod tests {
 
         // No account hashes for any trusted validators == "behind"
         cluster_info.push_accounts_hashes(vec![(1000, Hash::default()), (900, Hash::default())]);
+        cluster_info.flush_push_queue();
         assert_eq!(rm.health_check(), "behind");
         override_health_check.store(true, Ordering::Relaxed);
         assert_eq!(rm.health_check(), "ok");

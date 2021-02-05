@@ -6,15 +6,22 @@ use rand::{thread_rng, Rng};
 use solana_client::thin_client::{create_client, ThinClient};
 use solana_perf::recycler::Recycler;
 use solana_runtime::bank_forks::BankForks;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::{
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+};
 use solana_streamer::streamer;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::channel;
-use std::sync::{Arc, RwLock};
-use std::thread::{self, sleep, JoinHandle};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::channel,
+        {Arc, RwLock},
+    },
+    thread::{self, sleep, JoinHandle},
+    time::{Duration, Instant},
+};
 
 pub struct GossipService {
     thread_hdls: Vec<JoinHandle<()>>,
@@ -25,6 +32,8 @@ impl GossipService {
         cluster_info: &Arc<ClusterInfo>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         gossip_socket: UdpSocket,
+        gossip_validators: Option<HashSet<Pubkey>>,
+        should_check_duplicate_instance: bool,
         exit: &Arc<AtomicBool>,
     ) -> Self {
         let (request_sender, request_receiver) = channel();
@@ -48,9 +57,16 @@ impl GossipService {
             bank_forks.clone(),
             request_receiver,
             response_sender.clone(),
+            should_check_duplicate_instance,
             exit,
         );
-        let t_gossip = ClusterInfo::gossip(cluster_info.clone(), bank_forks, response_sender, exit);
+        let t_gossip = ClusterInfo::gossip(
+            cluster_info.clone(),
+            bank_forks,
+            response_sender,
+            gossip_validators,
+            exit,
+        );
         let thread_hdls = vec![t_receiver, t_responder, t_listen, t_gossip];
         Self { thread_hdls }
     }
@@ -69,6 +85,7 @@ pub fn discover_cluster(
     num_nodes: usize,
 ) -> std::io::Result<Vec<ContactInfo>> {
     discover(
+        None,
         Some(entrypoint),
         Some(num_nodes),
         Some(30),
@@ -81,6 +98,7 @@ pub fn discover_cluster(
 }
 
 pub fn discover(
+    keypair: Option<Arc<Keypair>>,
     entrypoint: Option<&SocketAddr>,
     num_nodes: Option<usize>, // num_nodes only counts validators, excludes spy nodes
     timeout: Option<u64>,
@@ -89,9 +107,17 @@ pub fn discover(
     my_gossip_addr: Option<&SocketAddr>,
     my_shred_version: u16,
 ) -> std::io::Result<(Vec<ContactInfo>, Vec<ContactInfo>)> {
+    let keypair = keypair.unwrap_or_else(|| Arc::new(Keypair::new()));
+
     let exit = Arc::new(AtomicBool::new(false));
-    let (gossip_service, ip_echo, spy_ref) =
-        make_gossip_node(entrypoint, &exit, my_gossip_addr, my_shred_version);
+    let (gossip_service, ip_echo, spy_ref) = make_gossip_node(
+        keypair,
+        entrypoint,
+        &exit,
+        my_gossip_addr,
+        my_shred_version,
+        true, // should_check_duplicate_instance,
+    );
 
     let id = spy_ref.id();
     info!("Entrypoint: {:?}", entrypoint);
@@ -245,12 +271,13 @@ fn spy(
 /// Makes a spy or gossip node based on whether or not a gossip_addr was passed in
 /// Pass in a gossip addr to fully participate in gossip instead of relying on just pulls
 fn make_gossip_node(
+    keypair: Arc<Keypair>,
     entrypoint: Option<&SocketAddr>,
     exit: &Arc<AtomicBool>,
     gossip_addr: Option<&SocketAddr>,
     shred_version: u16,
+    should_check_duplicate_instance: bool,
 ) -> (GossipService, Option<TcpListener>, Arc<ClusterInfo>) {
-    let keypair = Arc::new(Keypair::new());
     let (node, gossip_socket, ip_echo) = if let Some(gossip_addr) = gossip_addr {
         ClusterInfo::gossip_node(&keypair.pubkey(), gossip_addr, shred_version)
     } else {
@@ -261,7 +288,14 @@ fn make_gossip_node(
         cluster_info.set_entrypoint(ContactInfo::new_gossip_entry_point(entrypoint));
     }
     let cluster_info = Arc::new(cluster_info);
-    let gossip_service = GossipService::new(&cluster_info, None, gossip_socket, &exit);
+    let gossip_service = GossipService::new(
+        &cluster_info,
+        None,
+        gossip_socket,
+        None,
+        should_check_duplicate_instance,
+        &exit,
+    );
     (gossip_service, ip_echo, cluster_info)
 }
 
@@ -280,7 +314,14 @@ mod tests {
         let tn = Node::new_localhost();
         let cluster_info = ClusterInfo::new_with_invalid_keypair(tn.info.clone());
         let c = Arc::new(cluster_info);
-        let d = GossipService::new(&c, None, tn.sockets.gossip, &exit);
+        let d = GossipService::new(
+            &c,
+            None,
+            tn.sockets.gossip,
+            None,
+            true, // should_check_duplicate_instance
+            &exit,
+        );
         exit.store(true, Ordering::Relaxed);
         d.join().unwrap();
     }
@@ -288,8 +329,8 @@ mod tests {
     #[test]
     fn test_gossip_services_spy() {
         let keypair = Keypair::new();
-        let peer0 = Pubkey::new_rand();
-        let peer1 = Pubkey::new_rand();
+        let peer0 = solana_sdk::pubkey::new_rand();
+        let peer1 = solana_sdk::pubkey::new_rand();
         let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), 0);
         let peer0_info = ContactInfo::new_localhost(&peer0, 0);
         let peer1_info = ContactInfo::new_localhost(&peer1, 0);
@@ -317,7 +358,7 @@ mod tests {
             spy_ref.clone(),
             None,
             Some(0),
-            Some(Pubkey::new_rand()),
+            Some(solana_sdk::pubkey::new_rand()),
             None,
         );
         assert_eq!(met_criteria, false);
@@ -331,7 +372,7 @@ mod tests {
             spy_ref.clone(),
             Some(1),
             Some(0),
-            Some(Pubkey::new_rand()),
+            Some(solana_sdk::pubkey::new_rand()),
             None,
         );
         assert_eq!(met_criteria, false);

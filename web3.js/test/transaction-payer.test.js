@@ -1,8 +1,15 @@
 // @flow
-import {Account, Connection, SystemProgram, LAMPORTS_PER_SOL} from '../src';
+import {
+  Account,
+  Connection,
+  Transaction,
+  SystemProgram,
+  LAMPORTS_PER_SOL,
+} from '../src';
 import {mockRpc, mockRpcEnabled} from './__mocks__/node-fetch';
 import {mockGetRecentBlockhash} from './mockrpc/get-recent-blockhash';
 import {url} from './url';
+import {mockConfirmTransaction} from './mockrpc/confirm-transaction';
 
 if (!mockRpcEnabled) {
   // The default of 5 seconds is too slow for live testing sometimes
@@ -13,13 +20,13 @@ test('transaction-payer', async () => {
   const accountPayer = new Account();
   const accountFrom = new Account();
   const accountTo = new Account();
-  const connection = new Connection(url, 'recent');
+  const connection = new Connection(url, 'singleGossip');
 
   mockRpc.push([
     url,
     {
       method: 'getMinimumBalanceForRentExemption',
-      params: [0, {commitment: 'recent'}],
+      params: [0, {commitment: 'singleGossip'}],
     },
     {
       error: null,
@@ -29,7 +36,7 @@ test('transaction-payer', async () => {
 
   const minimumAmount = await connection.getMinimumBalanceForRentExemption(
     0,
-    'recent',
+    'singleGossip',
   );
 
   mockRpc.push([
@@ -41,10 +48,15 @@ test('transaction-payer', async () => {
     {
       error: null,
       result:
-        '0WE5w4B7v59x6qjyC4FbG2FEKYKQfvsJwqSxNVmtMjT8TQ31hsZieDHcSgqzxiAoTL56n2w5TncjqEKjLhtF4Vk',
+        '8WE5w4B7v59x6qjyC4FbG2FEKYKQfvsJwqSxNVmtMjT8TQ31hsZieDHcSgqzxiAoTL56n2w5TncjqEKjLhtF4Vk',
     },
   ]);
-  await connection.requestAirdrop(accountPayer.publicKey, LAMPORTS_PER_SOL);
+  let signature = await connection.requestAirdrop(
+    accountPayer.publicKey,
+    LAMPORTS_PER_SOL,
+  );
+  mockConfirmTransaction(signature);
+  await connection.confirmTransaction(signature, 'singleGossip');
 
   mockRpc.push([
     url,
@@ -55,10 +67,15 @@ test('transaction-payer', async () => {
     {
       error: null,
       result:
-        '0WE5w4B7v59x6qjyC4FbG2FEKYKQfvsJwqSxNVmtMjT8TQ31hsZieDHcSgqzxiAoTL56n2w5TncjqEKjLhtF4Vk',
+        '8WE5w4B7v59x6qjyC4FbG2FEKYKQfvsJwqSxNVmtMjT8TQ31hsZieDHcSgqzxiAoTL56n2w5TncjqEKjLhtF4Vk',
     },
   ]);
-  await connection.requestAirdrop(accountFrom.publicKey, minimumAmount + 12);
+  signature = await connection.requestAirdrop(
+    accountFrom.publicKey,
+    minimumAmount + 12,
+  );
+  mockConfirmTransaction(signature);
+  await connection.confirmTransaction(signature, 'singleGossip');
 
   mockRpc.push([
     url,
@@ -72,7 +89,12 @@ test('transaction-payer', async () => {
         '8WE5w4B7v59x6qjyC4FbG2FEKYKQfvsJwqSxNVmtMjT8TQ31hsZieDHcSgqzxiAoTL56n2w5TncjqEKjLhtF4Vk',
     },
   ]);
-  await connection.requestAirdrop(accountTo.publicKey, minimumAmount + 21);
+  signature = await connection.requestAirdrop(
+    accountTo.publicKey,
+    minimumAmount + 21,
+  );
+  mockConfirmTransaction(signature);
+  await connection.confirmTransaction(signature, 'singleGossip');
 
   mockGetRecentBlockhash('max');
   mockRpc.push([
@@ -87,47 +109,22 @@ test('transaction-payer', async () => {
     },
   ]);
 
-  const transaction = SystemProgram.transfer({
-    fromPubkey: accountFrom.publicKey,
-    toPubkey: accountTo.publicKey,
-    lamports: 10,
-  });
+  const transaction = new Transaction().add(
+    SystemProgram.transfer({
+      fromPubkey: accountFrom.publicKey,
+      toPubkey: accountTo.publicKey,
+      lamports: 10,
+    }),
+  );
 
-  const signature = await connection.sendTransaction(
+  signature = await connection.sendTransaction(
     transaction,
     [accountPayer, accountFrom],
     {skipPreflight: true},
   );
 
-  mockRpc.push([
-    url,
-    {
-      method: 'getSignatureStatuses',
-      params: [
-        [
-          '3WE5w4B7v59x6qjyC4FbG2FEKYKQfvsJwqSxNVmtMjT8TQ31hsZieDHcSgqzxiAoTL56n2w5TncjqEKjLhtF4Vk',
-        ],
-      ],
-    },
-    {
-      error: null,
-      result: {
-        context: {
-          slot: 11,
-        },
-        value: [
-          {
-            slot: 0,
-            confirmations: 1,
-            status: {Ok: null},
-            err: null,
-          },
-        ],
-      },
-    },
-  ]);
-
-  await connection.confirmTransaction(signature, 1);
+  mockConfirmTransaction(signature);
+  await connection.confirmTransaction(signature, 'singleGossip');
 
   mockRpc.push([
     url,
@@ -168,7 +165,7 @@ test('transaction-payer', async () => {
     url,
     {
       method: 'getBalance',
-      params: [accountPayer.publicKey.toBase58(), {commitment: 'recent'}],
+      params: [accountPayer.publicKey.toBase58(), {commitment: 'singleGossip'}],
     },
     {
       error: null,
@@ -192,7 +189,7 @@ test('transaction-payer', async () => {
     url,
     {
       method: 'getBalance',
-      params: [accountFrom.publicKey.toBase58(), {commitment: 'recent'}],
+      params: [accountFrom.publicKey.toBase58(), {commitment: 'singleGossip'}],
     },
     {
       error: null,

@@ -1,39 +1,33 @@
 use solana_cli::{
     cli::{process_command, request_and_confirm_airdrop, CliCommand, CliConfig},
-    offline::{blockhash_query::BlockhashQuery, *},
     spend_utils::SpendAmount,
     test_utils::check_recent_balance,
 };
-use solana_client::rpc_client::RpcClient;
-use solana_core::validator::TestValidator;
+use solana_client::{
+    blockhash_query::{self, BlockhashQuery},
+    rpc_client::RpcClient,
+};
+use solana_core::test_validator::TestValidator;
 use solana_faucet::faucet::run_local_faucet;
 use solana_sdk::{
     account_utils::StateMut,
     commitment_config::CommitmentConfig,
-    pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
 use solana_vote_program::vote_state::{VoteAuthorize, VoteState, VoteStateVersions};
-use std::{fs::remove_dir_all, sync::mpsc::channel};
 
 #[test]
 fn test_vote_authorize_and_withdraw() {
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run();
-    let (sender, receiver) = channel();
-    run_local_faucet(alice, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_no_fees(mint_keypair.pubkey());
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
     let default_signer = Keypair::new();
 
     let mut config = CliConfig::recent_for_tests();
-    config.json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&default_signer];
 
     request_and_confirm_airdrop(
@@ -59,9 +53,7 @@ fn test_vote_authorize_and_withdraw() {
     };
     process_command(&config).unwrap();
     let vote_account = rpc_client
-        .get_account_with_commitment(&vote_account_keypair.pubkey(), CommitmentConfig::recent())
-        .unwrap()
-        .value
+        .get_account(&vote_account_keypair.pubkey())
         .unwrap();
     let vote_state: VoteStateVersions = vote_account.state().unwrap();
     let authorized_withdrawer = vote_state.convert_to_current().authorized_withdrawer;
@@ -99,16 +91,14 @@ fn test_vote_authorize_and_withdraw() {
     };
     process_command(&config).unwrap();
     let vote_account = rpc_client
-        .get_account_with_commitment(&vote_account_keypair.pubkey(), CommitmentConfig::recent())
-        .unwrap()
-        .value
+        .get_account(&vote_account_keypair.pubkey())
         .unwrap();
     let vote_state: VoteStateVersions = vote_account.state().unwrap();
     let authorized_withdrawer = vote_state.convert_to_current().authorized_withdrawer;
     assert_eq!(authorized_withdrawer, withdraw_authority.pubkey());
 
     // Withdraw from vote account
-    let destination_account = Pubkey::new_rand(); // Send withdrawal to new account to make balance check easy
+    let destination_account = solana_sdk::pubkey::new_rand(); // Send withdrawal to new account to make balance check easy
     config.signers = vec![&default_signer, &withdraw_authority];
     config.command = CliCommand::WithdrawFromVoteAccount {
         vote_account_pubkey,
@@ -129,7 +119,4 @@ fn test_vote_authorize_and_withdraw() {
         withdraw_authority: 1,
     };
     process_command(&config).unwrap();
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }

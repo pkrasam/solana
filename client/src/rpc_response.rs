@@ -1,13 +1,13 @@
 use crate::client_error;
 use solana_account_decoder::{parse_token::UiTokenAmount, UiAccount};
 use solana_sdk::{
-    clock::{Epoch, Slot},
+    clock::{Epoch, Slot, UnixTimestamp},
     fee_calculator::{FeeCalculator, FeeRateGovernor},
     inflation::Inflation,
     transaction::{Result, TransactionError},
 };
 use solana_transaction_status::ConfirmedTransactionStatusWithSignature;
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, fmt, net::SocketAddr};
 
 pub type RpcResult<T> = client_error::Result<Response<T>>;
 
@@ -94,13 +94,42 @@ pub struct RpcKeyedAccount {
     pub account: UiAccount,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct SlotInfo {
+    pub slot: Slot,
+    pub parent: Slot,
+    pub root: Slot,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase", untagged)]
+pub enum RpcSignatureResult {
+    ProcessedSignature(ProcessedSignatureResult),
+    ReceivedSignature(ReceivedSignatureResult),
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct RpcSignatureResult {
+pub struct RpcLogsResponse {
+    pub signature: String, // Signature as base58 string
+    pub err: Option<TransactionError>,
+    pub logs: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessedSignatureResult {
     pub err: Option<TransactionError>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub enum ReceivedSignatureResult {
+    ReceivedSignature,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct RpcContactInfo {
     /// Pubkey of the node as a base-58 string
     pub pubkey: String,
@@ -112,16 +141,37 @@ pub struct RpcContactInfo {
     pub rpc: Option<SocketAddr>,
     /// Software version
     pub version: Option<String>,
+    /// First 4 bytes of the FeatureSet identifier
+    pub feature_set: Option<u32>,
 }
 
 /// Map of leader base58 identity pubkeys to the slot indices relative to the first epoch slot
 pub type RpcLeaderSchedule = HashMap<String, Vec<usize>>;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct RpcVersionInfo {
     /// The current version of solana-core
     pub solana_core: String,
+    /// first 4 bytes of the FeatureSet identifier
+    pub feature_set: Option<u32>,
+}
+
+impl fmt::Debug for RpcVersionInfo {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.solana_core)
+    }
+}
+
+impl fmt::Display for RpcVersionInfo {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if let Some(version) = self.solana_core.split_whitespace().next() {
+            // Display just the semver if possible
+            write!(f, "{}", version)
+        } else {
+            write!(f, "{}", self.solana_core)
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -236,6 +286,16 @@ pub struct RpcConfirmedTransactionStatusWithSignature {
     pub slot: Slot,
     pub err: Option<TransactionError>,
     pub memo: Option<String>,
+    pub block_time: Option<UnixTimestamp>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPerfSample {
+    pub slot: Slot,
+    pub num_transactions: u64,
+    pub num_slots: u64,
+    pub sample_period_secs: u16,
 }
 
 impl From<ConfirmedTransactionStatusWithSignature> for RpcConfirmedTransactionStatusWithSignature {
@@ -245,12 +305,14 @@ impl From<ConfirmedTransactionStatusWithSignature> for RpcConfirmedTransactionSt
             slot,
             err,
             memo,
+            block_time,
         } = value;
         Self {
             signature: signature.to_string(),
             slot,
             err,
             memo,
+            block_time,
         }
     }
 }

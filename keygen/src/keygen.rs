@@ -1,9 +1,10 @@
 use bip39::{Language, Mnemonic, MnemonicType, Seed};
 use clap::{
-    crate_description, crate_name, value_t, values_t_or_exit, App, AppSettings, Arg, ArgMatches,
-    SubCommand,
+    crate_description, crate_name, value_t, value_t_or_exit, values_t_or_exit, App, AppSettings,
+    Arg, ArgMatches, SubCommand,
 };
 use solana_clap_utils::{
+    input_validators::is_parsable,
     keypair::{
         keypair_from_seed_phrase, prompt_passphrase, signer_from_path,
         SKIP_SEED_PHRASE_VALIDATION_ARG,
@@ -52,10 +53,10 @@ fn get_keypair_from_matches(
     config: Config,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<Box<dyn Signer>, Box<dyn error::Error>> {
-    let mut path = dirs::home_dir().expect("home directory");
+    let mut path = dirs_next::home_dir().expect("home directory");
     let path = if matches.is_present("keypair") {
         matches.value_of("keypair").unwrap()
-    } else if config.keypair_path != "" {
+    } else if !config.keypair_path.is_empty() {
         &config.keypair_path
     } else {
         path.extend(&[".config", "solana", "id.json"]);
@@ -129,8 +130,8 @@ fn grind_validator_starts_and_ends_with(v: String) -> Result<(), String> {
     Ok(())
 }
 
-fn grind_print_info(grind_matches: &[GrindMatch]) {
-    println!("Searching with {} threads for:", num_cpus::get());
+fn grind_print_info(grind_matches: &[GrindMatch], num_threads: usize) {
+    println!("Searching with {} threads for:", num_threads);
     for gm in grind_matches {
         let mut msg = Vec::<String>::new();
         if gm.count.load(Ordering::Relaxed) > 1 {
@@ -159,6 +160,7 @@ fn grind_parse_args(
     starts_with_args: HashSet<String>,
     ends_with_args: HashSet<String>,
     starts_and_ends_with_args: HashSet<String>,
+    num_threads: usize,
 ) -> Vec<GrindMatch> {
     let mut grind_matches = Vec::<GrindMatch>::new();
     for sw in starts_with_args {
@@ -201,11 +203,12 @@ fn grind_parse_args(
             count: AtomicU64::new(args[2].parse::<u64>().unwrap()),
         });
     }
-    grind_print_info(&grind_matches);
+    grind_print_info(&grind_matches, num_threads);
     grind_matches
 }
 
 fn main() -> Result<(), Box<dyn error::Error>> {
+    let default_num_threads = num_cpus::get().to_string();
     let matches = App::new(crate_name!())
         .about(crate_description!())
         .version(solana_version::version!())
@@ -245,7 +248,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         )
         .subcommand(
             SubCommand::with_name("new")
-                .about("Generate new keypair file from a passphrase and random seed phrase")
+                .about("Generate new keypair file from a random seed phrase and optional BIP39 passphrase")
                 .setting(AppSettings::DisableVersion)
                 .arg(
                     Arg::with_name("outfile")
@@ -271,9 +274,19 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                         .help("Specify the number of words that will be present in the generated seed phrase"),
                 )
                 .arg(
+                    Arg::with_name("language")
+                        .long("language")
+                        .possible_values(&["english", "chinese-simplified", "chinese-traditional", "japanese", "spanish", "korean", "french", "italian"])
+                        .default_value("english")
+                        .value_name("LANGUAGE")
+                        .takes_value(true)
+                        .help("Specify the mnemonic lanaguage that will be present in the generated seed phrase"),
+                )
+                .arg(
                     Arg::with_name("no_passphrase")
-                        .long("no-passphrase")
-                        .help("Do not prompt for a passphrase"),
+                        .long("no-bip39-passphrase")
+                        .alias("no-passphrase")
+                        .help("Do not prompt for a BIP39 passphrase"),
                 )
                 .arg(
                     Arg::with_name("no_outfile")
@@ -326,6 +339,15 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                         .multiple(true)
                         .validator(grind_validator_starts_and_ends_with)
                         .help("Saves specified number of keypairs whos public key starts and ends with the indicated perfix and suffix\nExample: --starts-and-ends-with sol:ana:4\nPREFIX and SUFFIX type is Base58\nCOUNT type is u64"),
+                )
+                .arg(
+                    Arg::with_name("num_threads")
+                        .long("num-threads")
+                        .value_name("NUMBER")
+                        .takes_value(true)
+                        .validator(is_parsable::<usize>)
+                        .default_value(&default_num_threads)
+                        .help("Specify the number of grind threads"),
                 ),
         )
         .subcommand(
@@ -361,7 +383,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         )
         .subcommand(
             SubCommand::with_name("recover")
-                .about("Recover keypair from seed phrase and passphrase")
+                .about("Recover keypair from seed phrase and optional BIP39 passphrase")
                 .setting(AppSettings::DisableVersion)
                 .arg(
                     Arg::with_name("outfile")
@@ -412,7 +434,7 @@ fn do_main(matches: &ArgMatches<'_>) -> Result<(), Box<dyn error::Error>> {
             }
         }
         ("new", Some(matches)) => {
-            let mut path = dirs::home_dir().expect("home directory");
+            let mut path = dirs_next::home_dir().expect("home directory");
             let outfile = if matches.is_present("outfile") {
                 matches.value_of("outfile")
             } else if matches.is_present("no_outfile") {
@@ -430,15 +452,42 @@ fn do_main(matches: &ArgMatches<'_>) -> Result<(), Box<dyn error::Error>> {
 
             let word_count = value_t!(matches.value_of("word_count"), usize).unwrap();
             let mnemonic_type = MnemonicType::for_word_count(word_count)?;
-            let mnemonic = Mnemonic::new(mnemonic_type, Language::English);
+            let language = match matches.value_of("language").unwrap() {
+                "english" => Language::English,
+                "chinese-simplified" => Language::ChineseSimplified,
+                "chinese-traditional" => Language::ChineseTraditional,
+                "japanese" => Language::Japanese,
+                "spanish" => Language::Spanish,
+                "korean" => Language::Korean,
+                "french" => Language::French,
+                "italian" => Language::Italian,
+                _ => unreachable!(),
+            };
+
+            let silent = matches.is_present("silent");
+            if !silent {
+                println!("Generating a new keypair");
+            }
+            let mnemonic = Mnemonic::new(mnemonic_type, language);
             let passphrase = if matches.is_present("no_passphrase") {
                 NO_PASSPHRASE.to_string()
             } else {
-                println!("Generating a new keypair");
-                prompt_passphrase(
-                    "For added security, enter a passphrase (empty for no passphrase): ",
-                )?
+                let passphrase = prompt_passphrase(
+                    "\nFor added security, enter a BIP39 passphrase\n\
+                    \nNOTE! This passphrase improves security of the recovery seed phrase NOT the\n\
+                    keypair file itself, which is stored as insecure plain text\n\
+                    \nBIP39 Passphrase (empty for none): ",
+                )?;
+                println!();
+                passphrase
             };
+
+            let passphrase_message = if passphrase == NO_PASSPHRASE {
+                "".to_string()
+            } else {
+                " and your BIP39 passphrase".to_string()
+            };
+
             let seed = Seed::new(&mnemonic, &passphrase);
             let keypair = keypair_from_seed(seed.as_bytes())?;
 
@@ -447,18 +496,17 @@ fn do_main(matches: &ArgMatches<'_>) -> Result<(), Box<dyn error::Error>> {
                     .map_err(|err| format!("Unable to write {}: {}", outfile, err))?;
             }
 
-            let silent = matches.is_present("silent");
             if !silent {
                 let phrase: &str = mnemonic.phrase();
                 let divider = String::from_utf8(vec![b'='; phrase.len()]).unwrap();
                 println!(
-                    "{}\npubkey: {}\n{}\nSave this seed phrase to recover your new keypair:\n{}\n{}",
-                    &divider, keypair.pubkey(), &divider, phrase, &divider
+                    "{}\npubkey: {}\n{}\nSave this seed phrase{} to recover your new keypair:\n{}\n{}",
+                    &divider, keypair.pubkey(), &divider, passphrase_message, phrase, &divider
                 );
             }
         }
         ("recover", Some(matches)) => {
-            let mut path = dirs::home_dir().expect("home directory");
+            let mut path = dirs_next::home_dir().expect("home directory");
             let outfile = if matches.is_present("outfile") {
                 matches.value_of("outfile").unwrap()
             } else {
@@ -512,11 +560,14 @@ fn do_main(matches: &ArgMatches<'_>) -> Result<(), Box<dyn error::Error>> {
                 exit(1);
             }
 
+            let num_threads = value_t_or_exit!(matches.value_of("num_threads"), usize);
+
             let grind_matches = grind_parse_args(
                 ignore_case,
                 starts_with_args,
                 ends_with_args,
                 starts_and_ends_with_args,
+                num_threads,
             );
 
             let grind_matches_thread_safe = Arc::new(grind_matches);
@@ -525,7 +576,7 @@ fn do_main(matches: &ArgMatches<'_>) -> Result<(), Box<dyn error::Error>> {
             let start = Instant::now();
             let done = Arc::new(AtomicBool::new(false));
 
-            let thread_handles: Vec<_> = (0..num_cpus::get())
+            let thread_handles: Vec<_> = (0..num_threads)
                 .map(|_| {
                     let done = done.clone();
                     let attempts = attempts.clone();

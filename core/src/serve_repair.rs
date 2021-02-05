@@ -8,6 +8,7 @@ use crate::{
     weighted_shuffle::weighted_best,
 };
 use bincode::serialize;
+use rand::distributions::{Distribution, WeightedIndex};
 use solana_ledger::{blockstore::Blockstore, shred::Nonce};
 use solana_measure::measure::Measure;
 use solana_measure::thread_mem_usage;
@@ -21,7 +22,7 @@ use solana_sdk::{
 };
 use solana_streamer::streamer::{PacketReceiver, PacketSender};
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Entry, HashMap, HashSet},
     net::SocketAddr,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, RwLock},
@@ -80,7 +81,7 @@ pub struct ServeRepair {
     cluster_info: Arc<ClusterInfo>,
 }
 
-type RepairCache = HashMap<Slot, (Vec<ContactInfo>, Vec<(u64, usize)>)>;
+type RepairCache = HashMap<Slot, (Vec<ContactInfo>, WeightedIndex<u64>)>;
 
 impl ServeRepair {
     /// Without a valid keypair gossip will not function. Only useful for tests.
@@ -382,20 +383,25 @@ impl ServeRepair {
         repair_request: RepairType,
         cache: &mut RepairCache,
         repair_stats: &mut RepairStats,
+        repair_validators: &Option<HashSet<Pubkey>>,
     ) -> Result<(SocketAddr, Vec<u8>)> {
         // find a peer that appears to be accepting replication and has the desired slot, as indicated
         // by a valid tvu port location
         let slot = repair_request.slot();
-        if cache.get(&slot).is_none() {
-            let repair_peers: Vec<_> = self.cluster_info.repair_peers(slot);
-            if repair_peers.is_empty() {
-                return Err(ClusterInfoError::NoPeers.into());
+        let (repair_peers, weighted_index) = match cache.entry(slot) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let repair_peers = self.repair_peers(&repair_validators, slot);
+                if repair_peers.is_empty() {
+                    return Err(Error::from(ClusterInfoError::NoPeers));
+                }
+                let weights = cluster_slots.compute_weights(slot, &repair_peers);
+                debug_assert_eq!(weights.len(), repair_peers.len());
+                let weighted_index = WeightedIndex::new(weights)?;
+                entry.insert((repair_peers, weighted_index))
             }
-            let weights = cluster_slots.compute_weights(slot, &repair_peers);
-            cache.insert(slot, (repair_peers, weights));
-        }
-        let (repair_peers, weights) = cache.get(&slot).unwrap();
-        let n = weighted_best(&weights, Pubkey::new_rand().to_bytes());
+        };
+        let n = weighted_index.sample(&mut rand::thread_rng());
         let addr = repair_peers[n].serve_repair; // send the request to the peer's serve_repair port
         let repair_peer_id = repair_peers[n].id;
         let out = self.map_repair_request(
@@ -411,13 +417,14 @@ impl ServeRepair {
         &self,
         slot: Slot,
         cluster_slots: &ClusterSlots,
+        repair_validators: &Option<HashSet<Pubkey>>,
     ) -> Result<(Pubkey, SocketAddr)> {
-        let repair_peers: Vec<_> = self.cluster_info.repair_peers(slot);
+        let repair_peers: Vec<_> = self.repair_peers(repair_validators, slot);
         if repair_peers.is_empty() {
             return Err(ClusterInfoError::NoPeers.into());
         }
         let weights = cluster_slots.compute_weights_exclude_noncomplete(slot, &repair_peers);
-        let n = weighted_best(&weights, Pubkey::new_rand().to_bytes());
+        let n = weighted_best(&weights, solana_sdk::pubkey::new_rand().to_bytes());
         Ok((repair_peers[n].id, repair_peers[n].serve_repair))
     }
 
@@ -445,6 +452,27 @@ impl ServeRepair {
                 repair_stats.orphan.update(repair_peer_id, *slot, 0);
                 Ok(self.orphan_bytes(*slot, nonce)?)
             }
+        }
+    }
+
+    fn repair_peers(
+        &self,
+        repair_validators: &Option<HashSet<Pubkey>>,
+        slot: Slot,
+    ) -> Vec<ContactInfo> {
+        if let Some(repair_validators) = repair_validators {
+            repair_validators
+                .iter()
+                .filter_map(|key| {
+                    if *key != self.my_info.id {
+                        self.cluster_info.lookup_contact_info(key, |ci| ci.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            self.cluster_info.repair_peers(slot)
         }
     }
 
@@ -655,14 +683,14 @@ mod tests {
         {
             let blockstore = Arc::new(Blockstore::open(&ledger_path).unwrap());
             let me = ContactInfo {
-                id: Pubkey::new_rand(),
+                id: solana_sdk::pubkey::new_rand(),
                 gossip: socketaddr!("127.0.0.1:1234"),
                 tvu: socketaddr!("127.0.0.1:1235"),
                 tvu_forwards: socketaddr!("127.0.0.1:1236"),
                 repair: socketaddr!("127.0.0.1:1237"),
                 tpu: socketaddr!("127.0.0.1:1238"),
                 tpu_forwards: socketaddr!("127.0.0.1:1239"),
-                rpc_banks: socketaddr!("127.0.0.1:1240"),
+                unused: socketaddr!("127.0.0.1:1240"),
                 rpc: socketaddr!("127.0.0.1:1241"),
                 rpc_pubsub: socketaddr!("127.0.0.1:1242"),
                 serve_repair: socketaddr!("127.0.0.1:1243"),
@@ -680,11 +708,15 @@ mod tests {
                 nonce,
             );
             assert!(rv.is_none());
-            let mut common_header = ShredCommonHeader::default();
-            common_header.slot = slot;
-            common_header.index = 1;
-            let mut data_header = DataShredHeader::default();
-            data_header.parent_offset = 1;
+            let common_header = ShredCommonHeader {
+                slot,
+                index: 1,
+                ..ShredCommonHeader::default()
+            };
+            let data_header = DataShredHeader {
+                parent_offset: 1,
+                ..DataShredHeader::default()
+            };
             let shred_info = Shred::new_empty_from_header(
                 common_header,
                 data_header,
@@ -725,7 +757,7 @@ mod tests {
     #[test]
     fn window_index_request() {
         let cluster_slots = ClusterSlots::default();
-        let me = ContactInfo::new_localhost(&Pubkey::new_rand(), timestamp());
+        let me = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), timestamp());
         let cluster_info = Arc::new(ClusterInfo::new_with_invalid_keypair(me));
         let serve_repair = ServeRepair::new(cluster_info.clone());
         let rv = serve_repair.repair_request(
@@ -733,19 +765,20 @@ mod tests {
             RepairType::Shred(0, 0),
             &mut HashMap::new(),
             &mut RepairStats::default(),
+            &None,
         );
         assert_matches!(rv, Err(Error::ClusterInfoError(ClusterInfoError::NoPeers)));
 
         let serve_repair_addr = socketaddr!([127, 0, 0, 1], 1243);
         let nxt = ContactInfo {
-            id: Pubkey::new_rand(),
+            id: solana_sdk::pubkey::new_rand(),
             gossip: socketaddr!([127, 0, 0, 1], 1234),
             tvu: socketaddr!([127, 0, 0, 1], 1235),
             tvu_forwards: socketaddr!([127, 0, 0, 1], 1236),
             repair: socketaddr!([127, 0, 0, 1], 1237),
             tpu: socketaddr!([127, 0, 0, 1], 1238),
             tpu_forwards: socketaddr!([127, 0, 0, 1], 1239),
-            rpc_banks: socketaddr!([127, 0, 0, 1], 1240),
+            unused: socketaddr!([127, 0, 0, 1], 1240),
             rpc: socketaddr!([127, 0, 0, 1], 1241),
             rpc_pubsub: socketaddr!([127, 0, 0, 1], 1242),
             serve_repair: serve_repair_addr,
@@ -759,6 +792,7 @@ mod tests {
                 RepairType::Shred(0, 0),
                 &mut HashMap::new(),
                 &mut RepairStats::default(),
+                &None,
             )
             .unwrap();
         assert_eq!(nxt.serve_repair, serve_repair_addr);
@@ -766,14 +800,14 @@ mod tests {
 
         let serve_repair_addr2 = socketaddr!([127, 0, 0, 2], 1243);
         let nxt = ContactInfo {
-            id: Pubkey::new_rand(),
+            id: solana_sdk::pubkey::new_rand(),
             gossip: socketaddr!([127, 0, 0, 1], 1234),
             tvu: socketaddr!([127, 0, 0, 1], 1235),
             tvu_forwards: socketaddr!([127, 0, 0, 1], 1236),
             repair: socketaddr!([127, 0, 0, 1], 1237),
             tpu: socketaddr!([127, 0, 0, 1], 1238),
             tpu_forwards: socketaddr!([127, 0, 0, 1], 1239),
-            rpc_banks: socketaddr!([127, 0, 0, 1], 1240),
+            unused: socketaddr!([127, 0, 0, 1], 1240),
             rpc: socketaddr!([127, 0, 0, 1], 1241),
             rpc_pubsub: socketaddr!([127, 0, 0, 1], 1242),
             serve_repair: serve_repair_addr2,
@@ -791,6 +825,7 @@ mod tests {
                     RepairType::Shred(0, 0),
                     &mut HashMap::new(),
                     &mut RepairStats::default(),
+                    &None,
                 )
                 .unwrap();
             if rv.0 == serve_repair_addr {
@@ -936,5 +971,74 @@ mod tests {
         }
 
         Blockstore::destroy(&ledger_path).expect("Expected successful database destruction");
+    }
+
+    #[test]
+    fn test_repair_with_repair_validators() {
+        let cluster_slots = ClusterSlots::default();
+        let me = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), timestamp());
+        let cluster_info = Arc::new(ClusterInfo::new_with_invalid_keypair(me.clone()));
+
+        // Insert two peers on the network
+        let contact_info2 =
+            ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), timestamp());
+        let contact_info3 =
+            ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), timestamp());
+        cluster_info.insert_info(contact_info2.clone());
+        cluster_info.insert_info(contact_info3.clone());
+        let serve_repair = ServeRepair::new(cluster_info);
+
+        // If:
+        // 1) repair validator set doesn't exist in gossip
+        // 2) repair validator set only includes our own id
+        // then no repairs should be generated
+        for pubkey in &[solana_sdk::pubkey::new_rand(), me.id] {
+            let trusted_validators = Some(vec![*pubkey].into_iter().collect());
+            assert!(serve_repair.repair_peers(&trusted_validators, 1).is_empty());
+            assert!(serve_repair
+                .repair_request(
+                    &cluster_slots,
+                    RepairType::Shred(0, 0),
+                    &mut HashMap::new(),
+                    &mut RepairStats::default(),
+                    &trusted_validators,
+                )
+                .is_err());
+        }
+
+        // If trusted validator exists in gossip, should return repair successfully
+        let trusted_validators = Some(vec![contact_info2.id].into_iter().collect());
+        let repair_peers = serve_repair.repair_peers(&trusted_validators, 1);
+        assert_eq!(repair_peers.len(), 1);
+        assert_eq!(repair_peers[0].id, contact_info2.id);
+        assert!(serve_repair
+            .repair_request(
+                &cluster_slots,
+                RepairType::Shred(0, 0),
+                &mut HashMap::new(),
+                &mut RepairStats::default(),
+                &trusted_validators,
+            )
+            .is_ok());
+
+        // Using no trusted validators should default to all
+        // validator's available in gossip, excluding myself
+        let repair_peers: HashSet<Pubkey> = serve_repair
+            .repair_peers(&None, 1)
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(repair_peers.len(), 2);
+        assert!(repair_peers.contains(&contact_info2.id));
+        assert!(repair_peers.contains(&contact_info3.id));
+        assert!(serve_repair
+            .repair_request(
+                &cluster_slots,
+                RepairType::Shred(0, 0),
+                &mut HashMap::new(),
+                &mut RepairStats::default(),
+                &None,
+            )
+            .is_ok());
     }
 }

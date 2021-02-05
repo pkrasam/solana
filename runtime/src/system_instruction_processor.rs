@@ -1,14 +1,17 @@
 use log::*;
 use solana_sdk::{
-    account::{get_signers, next_keyed_account, Account, KeyedAccount},
+    account::Account,
     account_utils::StateMut,
     instruction::InstructionError,
-    nonce::{self, Account as NonceAccount},
+    keyed_account::{from_keyed_account, get_signers, next_keyed_account, KeyedAccount},
+    nonce,
+    nonce_keyed_account::NonceKeyedAccount,
+    process_instruction::InvokeContext,
     program_utils::limited_deserialize,
     pubkey::Pubkey,
     system_instruction::{SystemError, SystemInstruction, MAX_PERMITTED_DATA_LENGTH},
     system_program,
-    sysvar::{self, recent_blockhashes::RecentBlockhashes, rent::Rent, Sysvar},
+    sysvar::{self, recent_blockhashes::RecentBlockhashes, rent::Rent},
 };
 use std::collections::HashSet;
 
@@ -145,16 +148,11 @@ fn create_account(
     transfer(from, to, lamports)
 }
 
-fn transfer(from: &KeyedAccount, to: &KeyedAccount, lamports: u64) -> Result<(), InstructionError> {
-    if lamports == 0 {
-        return Ok(());
-    }
-
-    if from.signer_key().is_none() {
-        debug!("Transfer: from must sign");
-        return Err(InstructionError::MissingRequiredSignature);
-    }
-
+fn transfer_verified(
+    from: &KeyedAccount,
+    to: &KeyedAccount,
+    lamports: u64,
+) -> Result<(), InstructionError> {
     if !from.data_is_empty()? {
         debug!("Transfer: `from` must not carry data");
         return Err(InstructionError::InvalidArgument);
@@ -173,10 +171,50 @@ fn transfer(from: &KeyedAccount, to: &KeyedAccount, lamports: u64) -> Result<(),
     Ok(())
 }
 
+fn transfer(from: &KeyedAccount, to: &KeyedAccount, lamports: u64) -> Result<(), InstructionError> {
+    if lamports == 0 {
+        return Ok(());
+    }
+
+    if from.signer_key().is_none() {
+        debug!("Transfer: from must sign");
+        return Err(InstructionError::MissingRequiredSignature);
+    }
+
+    transfer_verified(from, to, lamports)
+}
+
+fn transfer_with_seed(
+    from: &KeyedAccount,
+    from_base: &KeyedAccount,
+    from_seed: &str,
+    from_owner: &Pubkey,
+    to: &KeyedAccount,
+    lamports: u64,
+) -> Result<(), InstructionError> {
+    if lamports == 0 {
+        return Ok(());
+    }
+
+    if from_base.signer_key().is_none() {
+        debug!("Transfer: from must sign");
+        return Err(InstructionError::MissingRequiredSignature);
+    }
+
+    if *from.unsigned_key()
+        != Pubkey::create_with_seed(from_base.unsigned_key(), from_seed, from_owner)?
+    {
+        return Err(SystemError::AddressWithSeedMismatch.into());
+    }
+
+    transfer_verified(from, to, lamports)
+}
+
 pub fn process_instruction(
     _owner: &Pubkey,
     keyed_accounts: &[KeyedAccount],
     instruction_data: &[u8],
+    _invoke_context: &mut dyn InvokeContext,
 ) -> Result<(), InstructionError> {
     let instruction = limited_deserialize(instruction_data)?;
 
@@ -220,10 +258,20 @@ pub fn process_instruction(
             let to = next_keyed_account(keyed_accounts_iter)?;
             transfer(from, to, lamports)
         }
+        SystemInstruction::TransferWithSeed {
+            lamports,
+            from_seed,
+            from_owner,
+        } => {
+            let from = next_keyed_account(keyed_accounts_iter)?;
+            let base = next_keyed_account(keyed_accounts_iter)?;
+            let to = next_keyed_account(keyed_accounts_iter)?;
+            transfer_with_seed(from, base, &from_seed, &from_owner, to, lamports)
+        }
         SystemInstruction::AdvanceNonceAccount => {
             let me = &mut next_keyed_account(keyed_accounts_iter)?;
             me.advance_nonce_account(
-                &RecentBlockhashes::from_keyed_account(next_keyed_account(keyed_accounts_iter)?)?,
+                &from_keyed_account::<RecentBlockhashes>(next_keyed_account(keyed_accounts_iter)?)?,
                 &signers,
             )
         }
@@ -233,8 +281,8 @@ pub fn process_instruction(
             me.withdraw_nonce_account(
                 lamports,
                 to,
-                &RecentBlockhashes::from_keyed_account(next_keyed_account(keyed_accounts_iter)?)?,
-                &Rent::from_keyed_account(next_keyed_account(keyed_accounts_iter)?)?,
+                &from_keyed_account::<RecentBlockhashes>(next_keyed_account(keyed_accounts_iter)?)?,
+                &from_keyed_account::<Rent>(next_keyed_account(keyed_accounts_iter)?)?,
                 &signers,
             )
         }
@@ -242,8 +290,8 @@ pub fn process_instruction(
             let me = &mut next_keyed_account(keyed_accounts_iter)?;
             me.initialize_nonce_account(
                 &authorized,
-                &RecentBlockhashes::from_keyed_account(next_keyed_account(keyed_accounts_iter)?)?,
-                &Rent::from_keyed_account(next_keyed_account(keyed_accounts_iter)?)?,
+                &from_keyed_account::<RecentBlockhashes>(next_keyed_account(keyed_accounts_iter)?)?,
+                &from_keyed_account::<Rent>(next_keyed_account(keyed_accounts_iter)?)?,
             )
         }
         SystemInstruction::AuthorizeNonceAccount(nonce_authority) => {
@@ -310,14 +358,16 @@ mod tests {
     use crate::{bank::Bank, bank_client::BankClient};
     use bincode::serialize;
     use solana_sdk::{
-        account::Account,
+        account::{self, Account},
         client::SyncClient,
         fee_calculator::FeeCalculator,
         genesis_config::create_genesis_config,
         hash::{hash, Hash},
         instruction::{AccountMeta, Instruction, InstructionError},
         message::Message,
-        nonce,
+        nonce, nonce_account,
+        process_instruction::MockInvokeContext,
+        recent_blockhashes_account,
         signature::{Keypair, Signer},
         system_instruction, system_program, sysvar,
         sysvar::recent_blockhashes::IterItem,
@@ -335,11 +385,24 @@ mod tests {
         }
     }
 
+    fn process_instruction(
+        owner: &Pubkey,
+        keyed_accounts: &[KeyedAccount],
+        instruction_data: &[u8],
+    ) -> Result<(), InstructionError> {
+        super::process_instruction(
+            owner,
+            keyed_accounts,
+            instruction_data,
+            &mut MockInvokeContext::default(),
+        )
+    }
+
     fn create_default_account() -> RefCell<Account> {
         RefCell::new(Account::default())
     }
     fn create_default_recent_blockhashes_account() -> RefCell<Account> {
-        RefCell::new(sysvar::recent_blockhashes::create_account_with_data(
+        RefCell::new(recent_blockhashes_account::create_account_with_data(
             1,
             vec![
                 IterItem(0u64, &Hash::default(), &FeeCalculator::default());
@@ -349,14 +412,14 @@ mod tests {
         ))
     }
     fn create_default_rent_account() -> RefCell<Account> {
-        RefCell::new(sysvar::rent::create_account(1, &Rent::free()))
+        RefCell::new(account::create_account(&Rent::free(), 1))
     }
 
     #[test]
     fn test_create_account() {
         let new_owner = Pubkey::new(&[9; 32]);
-        let from = Pubkey::new_rand();
-        let to = Pubkey::new_rand();
+        let from = solana_sdk::pubkey::new_rand();
+        let to = solana_sdk::pubkey::new_rand();
         let from_account = Account::new_ref(100, 0, &system_program::id());
         let to_account = Account::new_ref(0, 0, &Pubkey::default());
 
@@ -385,7 +448,7 @@ mod tests {
     #[test]
     fn test_create_account_with_seed() {
         let new_owner = Pubkey::new(&[9; 32]);
-        let from = Pubkey::new_rand();
+        let from = solana_sdk::pubkey::new_rand();
         let seed = "shiny pepper";
         let to = Pubkey::create_with_seed(&from, seed, &new_owner).unwrap();
 
@@ -417,11 +480,48 @@ mod tests {
     }
 
     #[test]
+    fn test_create_account_with_seed_separate_base_account() {
+        let new_owner = Pubkey::new(&[9; 32]);
+        let from = solana_sdk::pubkey::new_rand();
+        let base = solana_sdk::pubkey::new_rand();
+        let seed = "shiny pepper";
+        let to = Pubkey::create_with_seed(&base, seed, &new_owner).unwrap();
+
+        let from_account = Account::new_ref(100, 0, &system_program::id());
+        let to_account = Account::new_ref(0, 0, &Pubkey::default());
+        let base_account = Account::new_ref(0, 0, &Pubkey::default());
+
+        assert_eq!(
+            process_instruction(
+                &Pubkey::default(),
+                &[
+                    KeyedAccount::new(&from, true, &from_account),
+                    KeyedAccount::new(&to, false, &to_account),
+                    KeyedAccount::new(&base, true, &base_account)
+                ],
+                &bincode::serialize(&SystemInstruction::CreateAccountWithSeed {
+                    base,
+                    seed: seed.to_string(),
+                    lamports: 50,
+                    space: 2,
+                    owner: new_owner
+                })
+                .unwrap()
+            ),
+            Ok(())
+        );
+        assert_eq!(from_account.borrow().lamports, 50);
+        assert_eq!(to_account.borrow().lamports, 50);
+        assert_eq!(to_account.borrow().owner, new_owner);
+        assert_eq!(to_account.borrow().data, [0, 0]);
+    }
+
+    #[test]
     fn test_address_create_with_seed_mismatch() {
-        let from = Pubkey::new_rand();
+        let from = solana_sdk::pubkey::new_rand();
         let seed = "dull boy";
-        let to = Pubkey::new_rand();
-        let owner = Pubkey::new_rand();
+        let to = solana_sdk::pubkey::new_rand();
+        let owner = solana_sdk::pubkey::new_rand();
 
         assert_eq!(
             Address::create(&to, Some((&from, seed, &owner))),
@@ -432,7 +532,7 @@ mod tests {
     #[test]
     fn test_create_account_with_seed_missing_sig() {
         let new_owner = Pubkey::new(&[9; 32]);
-        let from = Pubkey::new_rand();
+        let from = solana_sdk::pubkey::new_rand();
         let seed = "dull boy";
         let to = Pubkey::create_with_seed(&from, seed, &new_owner).unwrap();
 
@@ -460,10 +560,10 @@ mod tests {
     fn test_create_with_zero_lamports() {
         // create account with zero lamports tranferred
         let new_owner = Pubkey::new(&[9; 32]);
-        let from = Pubkey::new_rand();
-        let from_account = Account::new_ref(100, 1, &Pubkey::new_rand()); // not from system account
+        let from = solana_sdk::pubkey::new_rand();
+        let from_account = Account::new_ref(100, 1, &solana_sdk::pubkey::new_rand()); // not from system account
 
-        let to = Pubkey::new_rand();
+        let to = solana_sdk::pubkey::new_rand();
         let to_account = Account::new_ref(0, 0, &Pubkey::default());
 
         assert_eq!(
@@ -493,10 +593,10 @@ mod tests {
     fn test_create_negative_lamports() {
         // Attempt to create account with more lamports than remaining in from_account
         let new_owner = Pubkey::new(&[9; 32]);
-        let from = Pubkey::new_rand();
+        let from = solana_sdk::pubkey::new_rand();
         let from_account = Account::new_ref(100, 0, &system_program::id());
 
-        let to = Pubkey::new_rand();
+        let to = solana_sdk::pubkey::new_rand();
         let to_account = Account::new_ref(0, 0, &Pubkey::default());
 
         let result = create_account(
@@ -514,9 +614,9 @@ mod tests {
     #[test]
     fn test_request_more_than_allowed_data_length() {
         let from_account = Account::new_ref(100, 0, &system_program::id());
-        let from = Pubkey::new_rand();
+        let from = solana_sdk::pubkey::new_rand();
         let to_account = Account::new_ref(0, 0, &system_program::id());
-        let to = Pubkey::new_rand();
+        let to = solana_sdk::pubkey::new_rand();
 
         let signers = &[from, to].iter().cloned().collect::<HashSet<_>>();
         let address = &to.into();
@@ -559,11 +659,11 @@ mod tests {
     fn test_create_already_in_use() {
         // Attempt to create system account in account already owned by another program
         let new_owner = Pubkey::new(&[9; 32]);
-        let from = Pubkey::new_rand();
+        let from = solana_sdk::pubkey::new_rand();
         let from_account = Account::new_ref(100, 0, &system_program::id());
 
         let original_program_owner = Pubkey::new(&[5; 32]);
-        let owned_key = Pubkey::new_rand();
+        let owned_key = solana_sdk::pubkey::new_rand();
         let owned_account = Account::new_ref(0, 0, &original_program_owner);
         let unchanged_account = owned_account.clone();
 
@@ -623,10 +723,10 @@ mod tests {
     fn test_create_unsigned() {
         // Attempt to create an account without signing the transfer
         let new_owner = Pubkey::new(&[9; 32]);
-        let from = Pubkey::new_rand();
+        let from = solana_sdk::pubkey::new_rand();
         let from_account = Account::new_ref(100, 0, &system_program::id());
 
-        let owned_key = Pubkey::new_rand();
+        let owned_key = solana_sdk::pubkey::new_rand();
         let owned_account = Account::new_ref(0, 0, &Pubkey::default());
 
         let owned_address = owned_key.into();
@@ -673,10 +773,10 @@ mod tests {
     #[test]
     fn test_create_sysvar_invalid_id() {
         // Attempt to create system account in account already owned by another program
-        let from = Pubkey::new_rand();
+        let from = solana_sdk::pubkey::new_rand();
         let from_account = Account::new_ref(100, 0, &system_program::id());
 
-        let to = Pubkey::new_rand();
+        let to = solana_sdk::pubkey::new_rand();
         let to_account = Account::new_ref(0, 0, &system_program::id());
 
         let signers = [from, to].iter().cloned().collect::<HashSet<_>>();
@@ -700,10 +800,10 @@ mod tests {
     fn test_create_data_populated() {
         // Attempt to create system account in account with populated data
         let new_owner = Pubkey::new(&[9; 32]);
-        let from = Pubkey::new_rand();
+        let from = solana_sdk::pubkey::new_rand();
         let from_account = Account::new_ref(100, 0, &system_program::id());
 
-        let populated_key = Pubkey::new_rand();
+        let populated_key = solana_sdk::pubkey::new_rand();
         let populated_account = Account {
             data: vec![0, 1, 2, 3],
             ..Account::default()
@@ -730,7 +830,7 @@ mod tests {
 
     #[test]
     fn test_create_from_account_is_nonce_fail() {
-        let nonce = Pubkey::new_rand();
+        let nonce = solana_sdk::pubkey::new_rand();
         let nonce_account = Account::new_ref_data(
             42,
             &nonce::state::Versions::new_current(nonce::State::Initialized(
@@ -740,7 +840,7 @@ mod tests {
         )
         .unwrap();
         let from = KeyedAccount::new(&nonce, true, &nonce_account);
-        let new = Pubkey::new_rand();
+        let new = solana_sdk::pubkey::new_rand();
 
         let new_account = Account::new_ref(0, 0, &system_program::id());
 
@@ -755,7 +855,7 @@ mod tests {
                 &new_address,
                 42,
                 0,
-                &Pubkey::new_rand(),
+                &solana_sdk::pubkey::new_rand(),
                 &signers
             ),
             Err(InstructionError::InvalidArgument),
@@ -766,7 +866,7 @@ mod tests {
     fn test_assign() {
         let new_owner = Pubkey::new(&[9; 32]);
 
-        let pubkey = Pubkey::new_rand();
+        let pubkey = solana_sdk::pubkey::new_rand();
         let mut account = Account::new(100, 0, &system_program::id());
 
         assert_eq!(
@@ -799,7 +899,7 @@ mod tests {
     fn test_assign_to_sysvar() {
         let new_owner = sysvar::id();
 
-        let from = Pubkey::new_rand();
+        let from = solana_sdk::pubkey::new_rand();
         let mut from_account = Account::new(100, 0, &system_program::id());
 
         assert_eq!(
@@ -817,13 +917,13 @@ mod tests {
     fn test_process_bogus_instruction() {
         // Attempt to assign with no accounts
         let instruction = SystemInstruction::Assign {
-            owner: Pubkey::new_rand(),
+            owner: solana_sdk::pubkey::new_rand(),
         };
         let data = serialize(&instruction).unwrap();
         let result = process_instruction(&system_program::id(), &[], &data);
         assert_eq!(result, Err(InstructionError::NotEnoughAccountKeys));
 
-        let from = Pubkey::new_rand();
+        let from = solana_sdk::pubkey::new_rand();
         let from_account = Account::new_ref(100, 0, &system_program::id());
         // Attempt to transfer with no destination
         let instruction = SystemInstruction::Transfer { lamports: 0 };
@@ -838,7 +938,7 @@ mod tests {
 
     #[test]
     fn test_transfer_lamports() {
-        let from = Pubkey::new_rand();
+        let from = solana_sdk::pubkey::new_rand();
         let from_account = Account::new_ref(100, 0, &Pubkey::new(&[2; 32])); // account owner should not matter
         let to = Pubkey::new(&[3; 32]);
         let to_account = Account::new_ref(1, 0, &to); // account owner should not matter
@@ -865,8 +965,64 @@ mod tests {
     }
 
     #[test]
+    fn test_transfer_with_seed() {
+        let base = solana_sdk::pubkey::new_rand();
+        let base_account = Account::new_ref(100, 0, &Pubkey::new(&[2; 32])); // account owner should not matter
+        let from_base_keyed_account = KeyedAccount::new(&base, true, &base_account);
+        let from_seed = "42";
+        let from_owner = system_program::id();
+        let from = Pubkey::create_with_seed(&base, from_seed, &from_owner).unwrap();
+        let from_account = Account::new_ref(100, 0, &Pubkey::new(&[2; 32])); // account owner should not matter
+        let to = Pubkey::new(&[3; 32]);
+        let to_account = Account::new_ref(1, 0, &to); // account owner should not matter
+        let from_keyed_account = KeyedAccount::new(&from, true, &from_account);
+        let to_keyed_account = KeyedAccount::new(&to, false, &to_account);
+        transfer_with_seed(
+            &from_keyed_account,
+            &from_base_keyed_account,
+            &from_seed,
+            &from_owner,
+            &to_keyed_account,
+            50,
+        )
+        .unwrap();
+        let from_lamports = from_keyed_account.account.borrow().lamports;
+        let to_lamports = to_keyed_account.account.borrow().lamports;
+        assert_eq!(from_lamports, 50);
+        assert_eq!(to_lamports, 51);
+
+        // Attempt to move more lamports than remaining in from_account
+        let from_keyed_account = KeyedAccount::new(&from, true, &from_account);
+        let result = transfer_with_seed(
+            &from_keyed_account,
+            &from_base_keyed_account,
+            &from_seed,
+            &from_owner,
+            &to_keyed_account,
+            100,
+        );
+        assert_eq!(result, Err(SystemError::ResultWithNegativeLamports.into()));
+        assert_eq!(from_keyed_account.account.borrow().lamports, 50);
+        assert_eq!(to_keyed_account.account.borrow().lamports, 51);
+
+        // test unsigned transfer of zero
+        let from_keyed_account = KeyedAccount::new(&from, false, &from_account);
+        assert!(transfer_with_seed(
+            &from_keyed_account,
+            &from_base_keyed_account,
+            &from_seed,
+            &from_owner,
+            &to_keyed_account,
+            0,
+        )
+        .is_ok(),);
+        assert_eq!(from_keyed_account.account.borrow().lamports, 50);
+        assert_eq!(to_keyed_account.account.borrow().lamports, 51);
+    }
+
+    #[test]
     fn test_transfer_lamports_from_nonce_account_fail() {
-        let from = Pubkey::new_rand();
+        let from = solana_sdk::pubkey::new_rand();
         let from_account = Account::new_ref_data(
             100,
             &nonce::state::Versions::new_current(nonce::State::Initialized(nonce::state::Data {
@@ -902,7 +1058,7 @@ mod tests {
         let alice_keypair = Keypair::new();
         let alice_pubkey = alice_keypair.pubkey();
         let seed = "seed";
-        let owner = Pubkey::new_rand();
+        let owner = solana_sdk::pubkey::new_rand();
         let alice_with_seed = Pubkey::create_with_seed(&alice_pubkey, seed, &owner).unwrap();
 
         bank_client
@@ -943,8 +1099,8 @@ mod tests {
         let alice_pubkey = alice_keypair.pubkey();
         let bob_pubkey = bob_keypair.pubkey();
 
-        let program = Pubkey::new_rand();
-        let collector = Pubkey::new_rand();
+        let program = solana_sdk::pubkey::new_rand();
+        let collector = solana_sdk::pubkey::new_rand();
 
         let mint_lamports = 10000;
         let len1 = 123;
@@ -970,10 +1126,10 @@ mod tests {
         let bank = Arc::new(Bank::new_from_parent(&bank, &collector, bank.slot() + 1));
         let bank_client = BankClient::new_shared(&bank);
         bank_client
-            .transfer_and_confirm(50, &alice_keypair, &Pubkey::new_rand())
+            .transfer_and_confirm(50, &alice_keypair, &solana_sdk::pubkey::new_rand())
             .unwrap();
 
-        // super fun time; callback chooses to .clean_accounts() or not
+        // super fun time; callback chooses to .clean_accounts(None) or not
         callback(&*bank);
 
         // create a normal account at the same pubkey as the zero-lamports account
@@ -988,10 +1144,12 @@ mod tests {
     #[test]
     fn test_create_zero_lamport_with_clean() {
         with_create_zero_lamport(|bank| {
+            bank.freeze();
             bank.squash();
+            bank.force_flush_accounts_cache();
             // do clean and assert that it actually did its job
             assert_eq!(3, bank.get_snapshot_storages().len());
-            bank.clean_accounts();
+            bank.clean_accounts(false);
             assert_eq!(2, bank.get_snapshot_storages().len());
         });
     }
@@ -1012,7 +1170,7 @@ mod tests {
         let alice_keypair = Keypair::new();
         let alice_pubkey = alice_keypair.pubkey();
         let seed = "seed";
-        let owner = Pubkey::new_rand();
+        let owner = solana_sdk::pubkey::new_rand();
         let alice_with_seed = Pubkey::create_with_seed(&alice_pubkey, seed, &owner).unwrap();
 
         bank_client
@@ -1078,7 +1236,7 @@ mod tests {
                 RefCell::new(if sysvar::recent_blockhashes::check_id(&meta.pubkey) {
                     create_default_recent_blockhashes_account().into_inner()
                 } else if sysvar::rent::check_id(&meta.pubkey) {
-                    sysvar::rent::create_account(1, &Rent::free())
+                    account::create_account(&Rent::free(), 1)
                 } else {
                     Account::default()
                 })
@@ -1092,7 +1250,7 @@ mod tests {
                 .zip(accounts.iter())
                 .map(|(meta, account)| KeyedAccount::new(&meta.pubkey, meta.is_signer, account))
                 .collect();
-            super::process_instruction(&Pubkey::default(), &keyed_accounts, &instruction.data)
+            process_instruction(&Pubkey::default(), &keyed_accounts, &instruction.data)
         }
     }
 
@@ -1110,7 +1268,7 @@ mod tests {
     #[test]
     fn test_process_nonce_ix_no_keyed_accs_fail() {
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[],
                 &serialize(&SystemInstruction::AdvanceNonceAccount).unwrap()
@@ -1122,7 +1280,7 @@ mod tests {
     #[test]
     fn test_process_nonce_ix_only_nonce_acc_fail() {
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[KeyedAccount::new(
                     &Pubkey::default(),
@@ -1138,7 +1296,7 @@ mod tests {
     #[test]
     fn test_process_nonce_ix_bad_recent_blockhash_state_fail() {
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[
                     KeyedAccount::new(&Pubkey::default(), true, &create_default_account()),
@@ -1156,8 +1314,8 @@ mod tests {
 
     #[test]
     fn test_process_nonce_ix_ok() {
-        let nonce_acc = nonce::create_account(1_000_000);
-        super::process_instruction(
+        let nonce_acc = nonce_account::create_account(1_000_000);
+        process_instruction(
             &Pubkey::default(),
             &[
                 KeyedAccount::new(&Pubkey::default(), true, &nonce_acc),
@@ -1171,8 +1329,8 @@ mod tests {
             &serialize(&SystemInstruction::InitializeNonceAccount(Pubkey::default())).unwrap(),
         )
         .unwrap();
-        let new_recent_blockhashes_account =
-            RefCell::new(sysvar::recent_blockhashes::create_account_with_data(
+        let new_recent_blockhashes_account = RefCell::new(
+            solana_sdk::recent_blockhashes_account::create_account_with_data(
                 1,
                 vec![
                     IterItem(
@@ -1183,9 +1341,10 @@ mod tests {
                     sysvar::recent_blockhashes::MAX_ENTRIES
                 ]
                 .into_iter(),
-            ));
+            ),
+        );
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[
                     KeyedAccount::new(&Pubkey::default(), true, &nonce_acc,),
@@ -1217,7 +1376,7 @@ mod tests {
     #[test]
     fn test_process_withdraw_ix_no_keyed_accs_fail() {
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[],
                 &serialize(&SystemInstruction::WithdrawNonceAccount(42)).unwrap(),
@@ -1229,7 +1388,7 @@ mod tests {
     #[test]
     fn test_process_withdraw_ix_only_nonce_acc_fail() {
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[KeyedAccount::new(
                     &Pubkey::default(),
@@ -1245,7 +1404,7 @@ mod tests {
     #[test]
     fn test_process_withdraw_ix_bad_recent_blockhash_state_fail() {
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[
                     KeyedAccount::new(&Pubkey::default(), true, &create_default_account()),
@@ -1265,10 +1424,14 @@ mod tests {
     #[test]
     fn test_process_withdraw_ix_bad_rent_state_fail() {
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[
-                    KeyedAccount::new(&Pubkey::default(), true, &nonce::create_account(1_000_000),),
+                    KeyedAccount::new(
+                        &Pubkey::default(),
+                        true,
+                        &nonce_account::create_account(1_000_000),
+                    ),
                     KeyedAccount::new(&Pubkey::default(), true, &create_default_account()),
                     KeyedAccount::new(
                         &sysvar::recent_blockhashes::id(),
@@ -1286,10 +1449,14 @@ mod tests {
     #[test]
     fn test_process_withdraw_ix_ok() {
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[
-                    KeyedAccount::new(&Pubkey::default(), true, &nonce::create_account(1_000_000),),
+                    KeyedAccount::new(
+                        &Pubkey::default(),
+                        true,
+                        &nonce_account::create_account(1_000_000),
+                    ),
                     KeyedAccount::new(&Pubkey::default(), true, &create_default_account()),
                     KeyedAccount::new(
                         &sysvar::recent_blockhashes::id(),
@@ -1307,7 +1474,7 @@ mod tests {
     #[test]
     fn test_process_initialize_ix_no_keyed_accs_fail() {
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[],
                 &serialize(&SystemInstruction::InitializeNonceAccount(Pubkey::default())).unwrap(),
@@ -1319,12 +1486,12 @@ mod tests {
     #[test]
     fn test_process_initialize_ix_only_nonce_acc_fail() {
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[KeyedAccount::new(
                     &Pubkey::default(),
                     true,
-                    &nonce::create_account(1_000_000),
+                    &nonce_account::create_account(1_000_000),
                 ),],
                 &serialize(&SystemInstruction::InitializeNonceAccount(Pubkey::default())).unwrap(),
             ),
@@ -1335,10 +1502,14 @@ mod tests {
     #[test]
     fn test_process_initialize_bad_recent_blockhash_state_fail() {
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[
-                    KeyedAccount::new(&Pubkey::default(), true, &nonce::create_account(1_000_000),),
+                    KeyedAccount::new(
+                        &Pubkey::default(),
+                        true,
+                        &nonce_account::create_account(1_000_000),
+                    ),
                     KeyedAccount::new(
                         &sysvar::recent_blockhashes::id(),
                         false,
@@ -1354,10 +1525,14 @@ mod tests {
     #[test]
     fn test_process_initialize_ix_bad_rent_state_fail() {
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[
-                    KeyedAccount::new(&Pubkey::default(), true, &nonce::create_account(1_000_000),),
+                    KeyedAccount::new(
+                        &Pubkey::default(),
+                        true,
+                        &nonce_account::create_account(1_000_000),
+                    ),
                     KeyedAccount::new(
                         &sysvar::recent_blockhashes::id(),
                         false,
@@ -1374,10 +1549,14 @@ mod tests {
     #[test]
     fn test_process_initialize_ix_ok() {
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[
-                    KeyedAccount::new(&Pubkey::default(), true, &nonce::create_account(1_000_000),),
+                    KeyedAccount::new(
+                        &Pubkey::default(),
+                        true,
+                        &nonce_account::create_account(1_000_000),
+                    ),
                     KeyedAccount::new(
                         &sysvar::recent_blockhashes::id(),
                         false,
@@ -1393,8 +1572,8 @@ mod tests {
 
     #[test]
     fn test_process_authorize_ix_ok() {
-        let nonce_acc = nonce::create_account(1_000_000);
-        super::process_instruction(
+        let nonce_acc = nonce_account::create_account(1_000_000);
+        process_instruction(
             &Pubkey::default(),
             &[
                 KeyedAccount::new(&Pubkey::default(), true, &nonce_acc),
@@ -1409,7 +1588,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            super::process_instruction(
+            process_instruction(
                 &Pubkey::default(),
                 &[KeyedAccount::new(&Pubkey::default(), true, &nonce_acc,),],
                 &serialize(&SystemInstruction::AuthorizeNonceAccount(Pubkey::default(),)).unwrap(),
@@ -1458,7 +1637,7 @@ mod tests {
     #[test]
     fn test_get_system_account_kind_uninitialized_nonce_account_fail() {
         assert_eq!(
-            get_system_account_kind(&nonce::create_account(42).borrow()),
+            get_system_account_kind(&nonce_account::create_account(42).borrow()),
             None
         );
     }
@@ -1476,7 +1655,7 @@ mod tests {
             &nonce::state::Versions::new_current(nonce::State::Initialized(
                 nonce::state::Data::default(),
             )),
-            &Pubkey::new_rand(),
+            &solana_sdk::pubkey::new_rand(),
         )
         .unwrap();
         assert_eq!(get_system_account_kind(&nonce_account), None);

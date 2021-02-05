@@ -7,6 +7,7 @@ use crate::{
     cluster_info::ClusterInfo,
     cluster_info_vote_listener::{ClusterInfoVoteListener, VerifiedVoteSender, VoteTracker},
     fetch_stage::FetchStage,
+    optimistically_confirmed_bank_tracker::BankNotificationSender,
     poh_recorder::{PohRecorder, WorkingBankEntry},
     rpc_subscriptions::RpcSubscriptions,
     sigverify::TransactionSigVerifier,
@@ -57,6 +58,7 @@ impl Tpu {
         verified_vote_sender: VerifiedVoteSender,
         replay_vote_receiver: ReplayVoteReceiver,
         replay_vote_sender: ReplayVoteSender,
+        bank_notification_sender: Option<BankNotificationSender>,
     ) -> Self {
         let (packet_sender, packet_receiver) = channel();
         let fetch_stage = FetchStage::new_with_sender(
@@ -85,6 +87,7 @@ impl Tpu {
             verified_vote_sender,
             replay_vote_receiver,
             blockstore.clone(),
+            bank_notification_sender,
         );
 
         let banking_stage = BankingStage::new(
@@ -116,11 +119,12 @@ impl Tpu {
     }
 
     pub fn join(self) -> thread::Result<()> {
-        let mut results = vec![];
-        results.push(self.fetch_stage.join());
-        results.push(self.sigverify_stage.join());
-        results.push(self.cluster_info_vote_listener.join());
-        results.push(self.banking_stage.join());
+        let results = vec![
+            self.fetch_stage.join(),
+            self.sigverify_stage.join(),
+            self.cluster_info_vote_listener.join(),
+            self.banking_stage.join(),
+        ];
         let broadcast_result = self.broadcast_stage.join();
         for result in results {
             result?;

@@ -11,6 +11,11 @@ let naclLowLevel = nacl.lowlevel;
 type PublicKeyNonce = [PublicKey, number]; // This type exists to workaround an esdoc parse error
 
 /**
+ * Maximum length of derived pubkey seed
+ */
+export const MAX_SEED_LENGTH = 32;
+
+/**
  * A public key
  */
 export class PublicKey {
@@ -97,6 +102,9 @@ export class PublicKey {
   ): Promise<PublicKey> {
     let buffer = Buffer.alloc(0);
     seeds.forEach(function (seed) {
+      if (seed.length > MAX_SEED_LENGTH) {
+        throw new Error(`Max seed length exceeded`);
+      }
       buffer = Buffer.concat([buffer, Buffer.from(seed)]);
     });
     buffer = Buffer.concat([
@@ -105,7 +113,7 @@ export class PublicKey {
       Buffer.from('ProgramDerivedAddress'),
     ]);
     let hash = await sha256(new Uint8Array(buffer));
-    let publicKeyBytes = new BN(hash, 16).toArray();
+    let publicKeyBytes = new BN(hash, 16).toArray(null, 32);
     if (is_on_curve(publicKeyBytes)) {
       throw new Error(`Invalid seeds, address must fall off the curve`);
     }

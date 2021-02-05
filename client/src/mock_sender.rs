@@ -1,17 +1,19 @@
 use crate::{
     client_error::Result,
     rpc_request::RpcRequest,
-    rpc_response::{Response, RpcResponseContext},
+    rpc_response::{Response, RpcResponseContext, RpcVersionInfo},
     rpc_sender::RpcSender,
 };
-use serde_json::{Number, Value};
+use serde_json::{json, Number, Value};
 use solana_sdk::{
+    epoch_info::EpochInfo,
     fee_calculator::{FeeCalculator, FeeRateGovernor},
     instruction::InstructionError,
     signature::Signature,
     transaction::{self, Transaction, TransactionError},
 };
-use solana_transaction_status::TransactionStatus;
+use solana_transaction_status::{TransactionConfirmationStatus, TransactionStatus};
+use solana_version::Version;
 use std::{collections::HashMap, sync::RwLock};
 
 pub const PUBKEY: &str = "7RoSF9fUmdphVCpabEoefH81WwrW7orsWonXWqTXkKV8";
@@ -46,6 +48,10 @@ impl RpcSender for MockSender {
             return Ok(Value::Null);
         }
         let val = match request {
+            RpcRequest::GetAccountInfo => serde_json::to_value(Response {
+                context: RpcResponseContext { slot: 1 },
+                value: Value::Null,
+            })?,
             RpcRequest::GetBalance => serde_json::to_value(Response {
                 context: RpcResponseContext { slot: 1 },
                 value: Value::Number(Number::from(50)),
@@ -56,6 +62,14 @@ impl RpcSender for MockSender {
                     Value::String(PUBKEY.to_string()),
                     serde_json::to_value(FeeCalculator::default()).unwrap(),
                 ),
+            })?,
+            RpcRequest::GetEpochInfo => serde_json::to_value(EpochInfo {
+                epoch: 1,
+                slot_index: 2,
+                slots_in_epoch: 32,
+                absolute_slot: 34,
+                block_height: 34,
+                transaction_count: Some(123),
             })?,
             RpcRequest::GetFeeCalculatorForBlockhash => {
                 let value = if self.url == "blockhash_expired" {
@@ -92,11 +106,18 @@ impl RpcSender for MockSender {
                         slot: 1,
                         confirmations: None,
                         err,
+                        confirmation_status: Some(TransactionConfirmationStatus::Finalized),
                     })
                 };
+                let statuses: Vec<Option<TransactionStatus>> = params.as_array().unwrap()[0]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|_| status.clone())
+                    .collect();
                 serde_json::to_value(Response {
                     context: RpcResponseContext { slot: 1 },
-                    value: vec![status],
+                    value: statuses,
                 })?
             }
             RpcRequest::GetTransactionCount => Value::Number(Number::from(1234)),
@@ -106,13 +127,20 @@ impl RpcSender for MockSender {
                     Signature::new(&[8; 64]).to_string()
                 } else {
                     let tx_str = params.as_array().unwrap()[0].as_str().unwrap().to_string();
-                    let data = bs58::decode(tx_str).into_vec().unwrap();
+                    let data = base64::decode(tx_str).unwrap();
                     let tx: Transaction = bincode::deserialize(&data).unwrap();
                     tx.signatures[0].to_string()
                 };
                 Value::String(signature)
             }
             RpcRequest::GetMinimumBalanceForRentExemption => Value::Number(Number::from(20)),
+            RpcRequest::GetVersion => {
+                let version = Version::default();
+                json!(RpcVersionInfo {
+                    solana_core: version.to_string(),
+                    feature_set: Some(version.feature_set),
+                })
+            }
             _ => Value::Null,
         };
         Ok(val)

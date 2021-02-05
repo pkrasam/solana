@@ -9,13 +9,16 @@ import { RichListProvider } from "./providers/richList";
 import { SupplyProvider } from "./providers/supply";
 import { TransactionsProvider } from "./providers/transactions";
 import { AccountsProvider } from "./providers/accounts";
+import { BlockProvider } from "./providers/block";
 import { StatsProvider } from "providers/stats";
 import { MintsProvider } from "providers/mints";
 
-Sentry.init({
-  dsn:
-    "https://5efdc15b4828434fbe949b5daed472be@o434108.ingest.sentry.io/5390542",
-});
+if (process.env.NODE_ENV === "production") {
+  Sentry.init({
+    dsn:
+      "https://5efdc15b4828434fbe949b5daed472be@o434108.ingest.sentry.io/5390542",
+  });
+}
 
 ReactDOM.render(
   <Router>
@@ -24,11 +27,13 @@ ReactDOM.render(
         <SupplyProvider>
           <RichListProvider>
             <AccountsProvider>
-              <MintsProvider>
-                <TransactionsProvider>
-                  <App />
-                </TransactionsProvider>
-              </MintsProvider>
+              <BlockProvider>
+                <MintsProvider>
+                  <TransactionsProvider>
+                    <App />
+                  </TransactionsProvider>
+                </MintsProvider>
+              </BlockProvider>
             </AccountsProvider>
           </RichListProvider>
         </SupplyProvider>

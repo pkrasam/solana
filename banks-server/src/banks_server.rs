@@ -1,15 +1,13 @@
+use crate::send_transaction_service::{SendTransactionService, TransactionInfo};
 use bincode::{deserialize, serialize};
 use futures::{
     future,
     prelude::stream::{self, StreamExt},
 };
-use solana_banks_interface::{Banks, BanksRequest, BanksResponse, TransactionStatus};
-use solana_runtime::{
-    bank::Bank,
-    bank_forks::BankForks,
-    commitment::{BlockCommitmentCache, CommitmentSlots},
-    send_transaction_service::{SendTransactionService, TransactionInfo},
+use solana_banks_interface::{
+    Banks, BanksRequest, BanksResponse, TransactionConfirmationStatus, TransactionStatus,
 };
+use solana_runtime::{bank::Bank, bank_forks::BankForks, commitment::BlockCommitmentCache};
 use solana_sdk::{
     account::Account,
     clock::Slot,
@@ -21,11 +19,9 @@ use solana_sdk::{
     transaction::{self, Transaction},
 };
 use std::{
-    collections::HashMap,
     io,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     sync::{
-        atomic::AtomicBool,
         mpsc::{channel, Receiver, Sender},
         Arc, RwLock,
     },
@@ -39,7 +35,7 @@ use tarpc::{
     server::{self, Channel, Handler},
     transport,
 };
-use tokio::time::delay_for;
+use tokio::time::sleep;
 use tokio_serde::formats::Bincode;
 
 #[derive(Clone)]
@@ -66,7 +62,7 @@ impl BanksServer {
         }
     }
 
-    fn run(bank: &Bank, transaction_receiver: Receiver<TransactionInfo>) {
+    fn run(bank_forks: Arc<RwLock<BankForks>>, transaction_receiver: Receiver<TransactionInfo>) {
         while let Ok(info) = transaction_receiver.recv() {
             let mut transaction_infos = vec![info];
             while let Ok(info) = transaction_receiver.try_recv() {
@@ -76,23 +72,28 @@ impl BanksServer {
                 .into_iter()
                 .map(|info| deserialize(&info.wire_transaction).unwrap())
                 .collect();
+            let bank = bank_forks.read().unwrap().working_bank();
             let _ = bank.process_transactions(&transactions);
         }
     }
 
     /// Useful for unit-testing
-    fn new_loopback(bank_forks: Arc<RwLock<BankForks>>) -> Self {
+    fn new_loopback(
+        bank_forks: Arc<RwLock<BankForks>>,
+        block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+    ) -> Self {
         let (transaction_sender, transaction_receiver) = channel();
         let bank = bank_forks.read().unwrap().working_bank();
         let slot = bank.slot();
-        let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::new(
-            HashMap::default(),
-            0,
-            CommitmentSlots::new_from_slot(slot),
-        )));
+        {
+            // ensure that the commitment cache and bank are synced
+            let mut w_block_commitment_cache = block_commitment_cache.write().unwrap();
+            w_block_commitment_cache.set_all_slots(slot, slot);
+        }
+        let server_bank_forks = bank_forks.clone();
         Builder::new()
             .name("solana-bank-forks-client".to_string())
-            .spawn(move || Self::run(&bank, transaction_receiver))
+            .spawn(move || Self::run(server_bank_forks, transaction_receiver))
             .unwrap();
         Self::new(bank_forks, block_commitment_cache, transaction_sender)
     }
@@ -110,20 +111,33 @@ impl BanksServer {
 
     async fn poll_signature_status(
         self,
-        signature: Signature,
+        signature: &Signature,
+        blockhash: &Hash,
         last_valid_slot: Slot,
         commitment: CommitmentLevel,
     ) -> Option<transaction::Result<()>> {
-        let mut status = self.bank(commitment).get_signature_status(&signature);
+        let mut status = self
+            .bank(commitment)
+            .get_signature_status_with_blockhash(signature, blockhash);
         while status.is_none() {
-            delay_for(Duration::from_millis(200)).await;
+            sleep(Duration::from_millis(200)).await;
             let bank = self.bank(commitment);
             if bank.slot() > last_valid_slot {
                 break;
             }
-            status = bank.get_signature_status(&signature);
+            status = bank.get_signature_status_with_blockhash(signature, blockhash);
         }
         status
+    }
+}
+
+fn verify_transaction(transaction: &Transaction) -> transaction::Result<()> {
+    if let Err(err) = transaction.verify() {
+        Err(err)
+    } else if let Err(err) = transaction.verify_precompiles() {
+        Err(err)
+    } else {
+        Ok(())
     }
 }
 
@@ -160,11 +174,17 @@ impl Banks for BanksServer {
         _: Context,
         signature: Signature,
     ) -> Option<TransactionStatus> {
-        let bank = self.bank(CommitmentLevel::Recent);
+        let bank = self.bank(CommitmentLevel::Processed);
         let (slot, status) = bank.get_signature_status_slot(&signature)?;
         let r_block_commitment_cache = self.block_commitment_cache.read().unwrap();
 
-        let confirmations = if r_block_commitment_cache.root() >= slot {
+        let optimistically_confirmed_bank = self.bank(CommitmentLevel::Confirmed);
+        let optimistically_confirmed =
+            optimistically_confirmed_bank.get_signature_status_slot(&signature);
+
+        let confirmations = if r_block_commitment_cache.root() >= slot
+            && r_block_commitment_cache.highest_confirmed_root() >= slot
+        {
             None
         } else {
             r_block_commitment_cache
@@ -175,6 +195,13 @@ impl Banks for BanksServer {
             slot,
             confirmations,
             err: status.err(),
+            confirmation_status: if confirmations.is_none() {
+                Some(TransactionConfirmationStatus::Finalized)
+            } else if optimistically_confirmed.is_some() {
+                Some(TransactionConfirmationStatus::Confirmed)
+            } else {
+                Some(TransactionConfirmationStatus::Processed)
+            },
         })
     }
 
@@ -188,19 +215,23 @@ impl Banks for BanksServer {
         transaction: Transaction,
         commitment: CommitmentLevel,
     ) -> Option<transaction::Result<()>> {
+        if let Err(err) = verify_transaction(&transaction) {
+            return Some(Err(err));
+        }
+
         let blockhash = &transaction.message.recent_blockhash;
         let last_valid_slot = self
             .bank_forks
             .read()
             .unwrap()
             .root_bank()
-            .get_blockhash_last_valid_slot(&blockhash)
+            .get_blockhash_last_valid_slot(blockhash)
             .unwrap();
         let signature = transaction.signatures.get(0).cloned().unwrap_or_default();
         let info =
             TransactionInfo::new(signature, serialize(&transaction).unwrap(), last_valid_slot);
         self.transaction_sender.send(info).unwrap();
-        self.poll_signature_status(signature, last_valid_slot, commitment)
+        self.poll_signature_status(&signature, blockhash, last_valid_slot, commitment)
             .await
     }
 
@@ -216,9 +247,10 @@ impl Banks for BanksServer {
 }
 
 pub async fn start_local_server(
-    bank_forks: &Arc<RwLock<BankForks>>,
+    bank_forks: Arc<RwLock<BankForks>>,
+    block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
 ) -> UnboundedChannel<Response<BanksResponse>, ClientMessage<BanksRequest>> {
-    let banks_server = BanksServer::new_loopback(bank_forks.clone());
+    let banks_server = BanksServer::new_loopback(bank_forks, block_commitment_cache);
     let (client_transport, server_transport) = transport::channel::unbounded();
     let server = server::new(server::Config::default())
         .incoming(stream::once(future::ready(server_transport)))
@@ -240,19 +272,18 @@ pub async fn start_tcp_server(
         .filter_map(|r| future::ready(r.ok()))
         .map(server::BaseChannel::with_defaults)
         // Limit channels to 1 per IP.
-        .max_channels_per_key(1, |t| t.as_ref().peer_addr().unwrap().ip())
+        .max_channels_per_key(1, |t| {
+            t.as_ref()
+                .peer_addr()
+                .map(|x| x.ip())
+                .unwrap_or_else(|_| Ipv4Addr::new(0, 0, 0, 0).into())
+        })
         // serve is generated by the service attribute. It takes as input any type implementing
         // the generated Banks trait.
         .map(move |chan| {
             let (sender, receiver) = channel();
-            let exit_send_transaction_service = Arc::new(AtomicBool::new(false));
 
-            SendTransactionService::new(
-                tpu_addr,
-                &bank_forks,
-                &exit_send_transaction_service,
-                receiver,
-            );
+            SendTransactionService::new(tpu_addr, &bank_forks, receiver);
 
             let server =
                 BanksServer::new(bank_forks.clone(), block_commitment_cache.clone(), sender);

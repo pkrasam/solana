@@ -2,13 +2,16 @@
 //! validation pipeline in software.
 
 use crate::{
-    accounts_background_service::AccountsBackgroundService,
     accounts_hash_verifier::AccountsHashVerifier,
     broadcast_stage::RetransmitSlotsSender,
+    cache_block_time_service::CacheBlockTimeSender,
     cluster_info::ClusterInfo,
     cluster_info_vote_listener::{VerifiedVoteReceiver, VoteTracker},
     cluster_slots::ClusterSlots,
+    completed_data_sets_service::CompletedDataSetsSender,
+    consensus::Tower,
     ledger_cleanup_service::LedgerCleanupService,
+    optimistically_confirmed_bank_tracker::BankNotificationSender,
     poh_recorder::PohRecorder,
     replay_stage::{ReplayStage, ReplayStageConfig},
     retransmit_stage::RetransmitStage,
@@ -17,6 +20,7 @@ use crate::{
     shred_fetch_stage::ShredFetchStage,
     sigverify_shreds::ShredSigVerifier,
     sigverify_stage::SigVerifyStage,
+    snapshot_packager_service::PendingSnapshotPackage,
 };
 use crossbeam_channel::unbounded;
 use solana_ledger::{
@@ -25,14 +29,20 @@ use solana_ledger::{
     leader_schedule_cache::LeaderScheduleCache,
 };
 use solana_runtime::{
-    bank_forks::BankForks, commitment::BlockCommitmentCache,
-    snapshot_package::AccountsPackageSender, vote_sender_types::ReplayVoteSender,
+    accounts_background_service::{
+        ABSRequestHandler, ABSRequestSender, AccountsBackgroundService, SendDroppedBankCallback,
+        SnapshotRequestHandler,
+    },
+    bank_forks::{BankForks, SnapshotConfig},
+    commitment::BlockCommitmentCache,
+    vote_sender_types::ReplayVoteSender,
 };
 use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
 use std::{
+    boxed::Box,
     collections::HashSet,
     net::UdpSocket,
     sync::{
@@ -66,7 +76,10 @@ pub struct TvuConfig {
     pub shred_version: u16,
     pub halt_on_trusted_validators_accounts_hash_mismatch: bool,
     pub trusted_validators: Option<HashSet<Pubkey>>,
+    pub repair_validators: Option<HashSet<Pubkey>>,
     pub accounts_hash_fault_injection_slots: u64,
+    pub accounts_db_caching_enabled: bool,
+    pub test_hash_calculation: bool,
 }
 
 impl Tvu {
@@ -87,6 +100,7 @@ impl Tvu {
         ledger_signal_receiver: Receiver<bool>,
         subscriptions: &Arc<RpcSubscriptions>,
         poh_recorder: &Arc<Mutex<PohRecorder>>,
+        tower: Tower,
         leader_schedule_cache: &Arc<LeaderScheduleCache>,
         exit: &Arc<AtomicBool>,
         completed_slots_receiver: CompletedSlotsReceiver,
@@ -94,11 +108,14 @@ impl Tvu {
         cfg: Option<Arc<AtomicBool>>,
         transaction_status_sender: Option<TransactionStatusSender>,
         rewards_recorder_sender: Option<RewardsRecorderSender>,
-        snapshot_package_sender: Option<AccountsPackageSender>,
+        cache_block_time_sender: Option<CacheBlockTimeSender>,
+        snapshot_config_and_pending_package: Option<(SnapshotConfig, PendingSnapshotPackage)>,
         vote_tracker: Arc<VoteTracker>,
         retransmit_slots_sender: RetransmitSlotsSender,
         verified_vote_receiver: VerifiedVoteReceiver,
         replay_vote_sender: ReplayVoteSender,
+        completed_data_sets_sender: CompletedDataSetsSender,
+        bank_notification_sender: Option<BankNotificationSender>,
         tvu_config: TvuConfig,
     ) -> Self {
         let keypair: Arc<Keypair> = cluster_info.keypair.clone();
@@ -150,6 +167,8 @@ impl Tvu {
             cluster_slots.clone(),
             duplicate_slots_reset_sender,
             verified_vote_receiver,
+            tvu_config.repair_validators,
+            completed_data_sets_sender,
         );
 
         let (ledger_cleanup_slot_sender, ledger_cleanup_slot_receiver) = channel();
@@ -162,10 +181,15 @@ impl Tvu {
             }
         };
         info!("snapshot_interval_slots: {}", snapshot_interval_slots);
+        let (snapshot_config, pending_snapshot_package) = snapshot_config_and_pending_package
+            .map(|(snapshot_config, pending_snapshot_package)| {
+                (Some(snapshot_config), Some(pending_snapshot_package))
+            })
+            .unwrap_or((None, None));
         let (accounts_hash_sender, accounts_hash_receiver) = channel();
         let accounts_hash_verifier = AccountsHashVerifier::new(
             accounts_hash_receiver,
-            snapshot_package_sender,
+            pending_snapshot_package,
             exit,
             &cluster_info,
             tvu_config.trusted_validators.clone(),
@@ -173,6 +197,38 @@ impl Tvu {
             tvu_config.accounts_hash_fault_injection_slots,
             snapshot_interval_slots,
         );
+
+        let (snapshot_request_sender, snapshot_request_handler) = {
+            snapshot_config
+                .map(|snapshot_config| {
+                    let (snapshot_request_sender, snapshot_request_receiver) = unbounded();
+                    (
+                        Some(snapshot_request_sender),
+                        Some(SnapshotRequestHandler {
+                            snapshot_config,
+                            snapshot_request_receiver,
+                            accounts_package_sender: accounts_hash_sender,
+                        }),
+                    )
+                })
+                .unwrap_or((None, None))
+        };
+
+        let (pruned_banks_sender, pruned_banks_receiver) = unbounded();
+
+        // Before replay starts, set the callbacks in each of the banks in BankForks
+        for bank in bank_forks.read().unwrap().banks.values() {
+            bank.set_callback(Some(Box::new(SendDroppedBankCallback::new(
+                pruned_banks_sender.clone(),
+            ))));
+        }
+
+        let accounts_background_request_sender = ABSRequestSender::new(snapshot_request_sender);
+
+        let accounts_background_request_handler = ABSRequestHandler {
+            snapshot_request_handler,
+            pruned_banks_receiver,
+        };
 
         let replay_stage_config = ReplayStageConfig {
             my_pubkey: keypair.pubkey(),
@@ -182,10 +238,12 @@ impl Tvu {
             subscriptions: subscriptions.clone(),
             leader_schedule_cache: leader_schedule_cache.clone(),
             latest_root_senders: vec![ledger_cleanup_slot_sender],
-            accounts_hash_sender: Some(accounts_hash_sender),
+            accounts_background_request_sender,
             block_commitment_cache,
             transaction_status_sender,
             rewards_recorder_sender,
+            cache_block_time_sender,
+            bank_notification_sender,
         };
 
         let replay_stage = ReplayStage::new(
@@ -195,6 +253,7 @@ impl Tvu {
             cluster_info.clone(),
             ledger_signal_receiver,
             poh_recorder.clone(),
+            tower,
             vote_tracker,
             cluster_slots,
             retransmit_slots_sender,
@@ -211,7 +270,13 @@ impl Tvu {
             )
         });
 
-        let accounts_background_service = AccountsBackgroundService::new(bank_forks.clone(), &exit);
+        let accounts_background_service = AccountsBackgroundService::new(
+            bank_forks.clone(),
+            &exit,
+            accounts_background_request_handler,
+            tvu_config.accounts_db_caching_enabled,
+            tvu_config.test_hash_calculation,
+        );
 
         Tvu {
             fetch_stage,
@@ -244,9 +309,11 @@ pub mod tests {
     use crate::{
         banking_stage::create_test_recorder,
         cluster_info::{ClusterInfo, Node},
+        optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
     };
-    use serial_test_derive::serial;
+    use serial_test::serial;
     use solana_ledger::{
+        blockstore::BlockstoreSignals,
         create_new_tmp_ledger,
         genesis_utils::{create_genesis_config, GenesisConfigInfo},
     };
@@ -273,9 +340,13 @@ pub mod tests {
         let cref1 = Arc::new(cluster_info1);
 
         let (blockstore_path, _) = create_new_tmp_ledger!(&genesis_config);
-        let (blockstore, l_receiver, completed_slots_receiver) =
-            Blockstore::open_with_signal(&blockstore_path, None)
-                .expect("Expected to successfully open ledger");
+        let BlockstoreSignals {
+            blockstore,
+            ledger_signal_receiver,
+            completed_slots_receiver,
+            ..
+        } = Blockstore::open_with_signal(&blockstore_path, None, true)
+            .expect("Expected to successfully open ledger");
         let blockstore = Arc::new(blockstore);
         let bank = bank_forks.working_bank();
         let (exit, poh_recorder, poh_service, _entry_receiver) =
@@ -286,7 +357,9 @@ pub mod tests {
         let (retransmit_slots_sender, _retransmit_slots_receiver) = unbounded();
         let (_verified_vote_sender, verified_vote_receiver) = unbounded();
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let (completed_data_sets_sender, _completed_data_sets_receiver) = unbounded();
         let bank_forks = Arc::new(RwLock::new(bank_forks));
+        let tower = Tower::new_with_key(&target1_keypair.pubkey());
         let tvu = Tvu::new(
             &vote_keypair.pubkey(),
             vec![Arc::new(vote_keypair)],
@@ -301,13 +374,15 @@ pub mod tests {
                 }
             },
             blockstore,
-            l_receiver,
+            ledger_signal_receiver,
             &Arc::new(RpcSubscriptions::new(
                 &exit,
                 bank_forks.clone(),
                 block_commitment_cache.clone(),
+                OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
             )),
             &poh_recorder,
+            tower,
             &leader_schedule_cache,
             &exit,
             completed_slots_receiver,
@@ -316,10 +391,13 @@ pub mod tests {
             None,
             None,
             None,
+            None,
             Arc::new(VoteTracker::new(&bank)),
             retransmit_slots_sender,
             verified_vote_receiver,
             replay_vote_sender,
+            completed_data_sets_sender,
+            None,
             TvuConfig::default(),
         );
         exit.store(true, Ordering::Relaxed);

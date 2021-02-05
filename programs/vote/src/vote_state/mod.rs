@@ -6,18 +6,20 @@ use bincode::{deserialize, serialize_into, serialized_size, ErrorKind};
 use log::*;
 use serde_derive::{Deserialize, Serialize};
 use solana_sdk::{
-    account::{Account, KeyedAccount},
+    account::Account,
     account_utils::State,
     clock::{Epoch, Slot, UnixTimestamp},
     epoch_schedule::MAX_LEADER_SCHEDULE_EPOCH_OFFSET,
     hash::Hash,
     instruction::InstructionError,
+    keyed_account::KeyedAccount,
     pubkey::Pubkey,
     rent::Rent,
     slot_hashes::SlotHash,
     sysvar::clock::Clock,
 };
 use std::boxed::Box;
+use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
 
 mod vote_state_0_23_5;
@@ -29,14 +31,9 @@ pub const MAX_LOCKOUT_HISTORY: usize = 31;
 pub const INITIAL_LOCKOUT: usize = 2;
 
 // Maximum number of credits history to keep around
-//  smaller numbers makes
-pub const MAX_EPOCH_CREDITS_HISTORY: usize = 64;
+const MAX_EPOCH_CREDITS_HISTORY: usize = 64;
 
-// Frequency of timestamp Votes. In v0.22.0, this is approximately 30min with cluster clock
-// defaults, intended to limit block time drift to < 1hr
-pub const TIMESTAMP_SLOT_INTERVAL: u64 = 4500;
-
-#[frozen_abi(digest = "69hYtmmcuqPbhpc64ZaNJDidaUcg66CW6wzPFiuYZ3To")]
+#[frozen_abi(digest = "Ch2vVEwos2EjAVqSHCyJjnN2MNX1yrpapZTGhMSCjWUH")]
 #[derive(Serialize, Default, Deserialize, Debug, PartialEq, Eq, Clone, AbiExample)]
 pub struct Vote {
     /// A stack of votes starting with the oldest vote
@@ -154,7 +151,7 @@ impl<I> CircBuf<I> {
     }
 }
 
-#[frozen_abi(digest = "H7z93iz4PiRJqahQ9G1aJXao1huusBz47SA5WfP8g4yd")]
+#[frozen_abi(digest = "331ZmXrmsUcwbKhzR3C1UEU6uNwZr48ExE54JDKGWA4w")]
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq, Clone, AbiExample)]
 pub struct VoteState {
     /// the node that votes in this account
@@ -167,6 +164,9 @@ pub struct VoteState {
     pub commission: u8,
 
     pub votes: VecDeque<Lockout>,
+
+    // This usually the last Lockout which was popped from self.votes.
+    // However, it can be arbitrary slot, when being used inside Tower
     pub root_slot: Option<Slot>,
 
     /// the signer for vote transactions
@@ -215,7 +215,7 @@ impl VoteState {
     pub fn size_of() -> usize {
         // Upper limit on the size of the Vote State. Equal to
         // size_of(VoteState) when votes.len() is MAX_LOCKOUT_HISTORY
-        let vote_state = VoteStateVersions::Current(Box::new(Self::get_max_sized_vote_state()));
+        let vote_state = VoteStateVersions::new_current(Self::get_max_sized_vote_state());
         serialized_size(&vote_state).unwrap() as usize
     }
 
@@ -273,16 +273,18 @@ impl VoteState {
     }
 
     fn get_max_sized_vote_state() -> VoteState {
-        let mut vote_state = Self::default();
-        vote_state.votes = VecDeque::from(vec![Lockout::default(); MAX_LOCKOUT_HISTORY]);
-        vote_state.root_slot = Some(std::u64::MAX);
-        vote_state.epoch_credits = vec![(0, 0, 0); MAX_EPOCH_CREDITS_HISTORY];
         let mut authorized_voters = AuthorizedVoters::default();
         for i in 0..=MAX_LEADER_SCHEDULE_EPOCH_OFFSET {
-            authorized_voters.insert(i, Pubkey::new_rand());
+            authorized_voters.insert(i, solana_sdk::pubkey::new_rand());
         }
-        vote_state.authorized_voters = authorized_voters;
-        vote_state
+
+        VoteState {
+            votes: VecDeque::from(vec![Lockout::default(); MAX_LOCKOUT_HISTORY]),
+            root_slot: Some(std::u64::MAX),
+            epoch_credits: vec![(0, 0, 0); MAX_EPOCH_CREDITS_HISTORY],
+            authorized_voters,
+            ..Self::default()
+        }
     }
 
     fn check_slots_are_valid(
@@ -316,7 +318,7 @@ impl VoteState {
             return Err(VoteError::VoteTooOld);
         }
         if i != vote.slots.len() {
-            warn!(
+            info!(
                 "{} dropped vote {:?} failed to match slot:  {:?}",
                 self.node_pubkey, vote, slot_hashes,
             );
@@ -392,8 +394,7 @@ impl VoteState {
                 self.epoch_credits.last_mut().unwrap().0 = epoch;
             }
 
-            // if stakers do not claim before the epoch goes away they lose the
-            //  credits...
+            // Remove too old epoch_credits
             if self.epoch_credits.len() > MAX_EPOCH_CREDITS_HISTORY {
                 self.epoch_credits.remove(0);
             }
@@ -426,6 +427,12 @@ impl VoteState {
 
     pub fn last_voted_slot(&self) -> Option<Slot> {
         self.last_lockout().map(|v| v.slot)
+    }
+
+    // Upto MAX_LOCKOUT_HISTORY many recent unexpired
+    // vote slots pushed onto the stack.
+    pub fn tower(&self) -> Vec<Slot> {
+        self.votes.iter().map(|v| v.slot).collect()
     }
 
     fn current_epoch(&self) -> Epoch {
@@ -465,10 +472,7 @@ impl VoteState {
     where
         F: Fn(Pubkey) -> Result<(), InstructionError>,
     {
-        let epoch_authorized_voter = self.get_and_update_authorized_voter(current_epoch).expect(
-            "the clock epoch is monotonically increasing, so authorized voter must be known",
-        );
-
+        let epoch_authorized_voter = self.get_and_update_authorized_voter(current_epoch);
         verify(epoch_authorized_voter)?;
 
         // The offset in slots `n` on which the target_epoch
@@ -516,17 +520,16 @@ impl VoteState {
         Ok(())
     }
 
-    fn get_and_update_authorized_voter(&mut self, current_epoch: Epoch) -> Option<Pubkey> {
+    fn get_and_update_authorized_voter(&mut self, current_epoch: Epoch) -> Pubkey {
         let pubkey = self
             .authorized_voters
             .get_and_cache_authorized_voter_for_epoch(current_epoch)
             .expect(
-                "Internal functions should
-        only call this will monotonically increasing current_epoch",
+                "Internal functions should only call this will monotonically increasing current_epoch",
             );
         self.authorized_voters
             .purge_authorized_voters(current_epoch);
-        Some(pubkey)
+        pubkey
     }
 
     fn pop_expired_votes(&mut self, slot: Slot) {
@@ -556,7 +559,7 @@ impl VoteState {
         timestamp: UnixTimestamp,
     ) -> Result<(), VoteError> {
         if (slot < self.last_timestamp.slot || timestamp < self.last_timestamp.timestamp)
-            || ((slot == self.last_timestamp.slot || timestamp == self.last_timestamp.timestamp)
+            || (slot == self.last_timestamp.slot
                 && BlockTimestamp { slot, timestamp } != self.last_timestamp
                 && self.last_timestamp.slot != 0)
         {
@@ -596,7 +599,7 @@ pub fn authorize<S: std::hash::BuildHasher>(
         }
     }
 
-    vote_account.set_state(&VoteStateVersions::Current(Box::new(vote_state)))
+    vote_account.set_state(&VoteStateVersions::new_current(vote_state))
 }
 
 /// Update the node_pubkey, requires signature of the authorized voter
@@ -616,7 +619,7 @@ pub fn update_validator_identity<S: std::hash::BuildHasher>(
 
     vote_state.node_pubkey = *node_pubkey;
 
-    vote_account.set_state(&VoteStateVersions::Current(Box::new(vote_state)))
+    vote_account.set_state(&VoteStateVersions::new_current(vote_state))
 }
 
 /// Update the vote account's commission
@@ -633,7 +636,7 @@ pub fn update_commission<S: std::hash::BuildHasher>(
 
     vote_state.commission = commission;
 
-    vote_account.set_state(&VoteStateVersions::Current(Box::new(vote_state)))
+    vote_account.set_state(&VoteStateVersions::new_current(vote_state))
 }
 
 fn verify_authorized_signer<S: std::hash::BuildHasher>(
@@ -659,8 +662,13 @@ pub fn withdraw<S: std::hash::BuildHasher>(
 
     verify_authorized_signer(&vote_state.authorized_withdrawer, signers)?;
 
-    if vote_account.lamports()? < lamports {
-        return Err(InstructionError::InsufficientFunds);
+    match vote_account.lamports()?.cmp(&lamports) {
+        Ordering::Less => return Err(InstructionError::InsufficientFunds),
+        Ordering::Equal => {
+            // Deinitialize upon zero-balance
+            vote_account.set_state(&VoteStateVersions::new_current(VoteState::default()))?;
+        }
+        _ => (),
     }
     vote_account.try_account_ref_mut()?.lamports -= lamports;
     to_account.try_account_ref_mut()?.lamports += lamports;
@@ -685,9 +693,9 @@ pub fn initialize_account<S: std::hash::BuildHasher>(
     // node must agree to accept this vote account
     verify_authorized_signer(&vote_init.node_pubkey, signers)?;
 
-    vote_account.set_state(&VoteStateVersions::Current(Box::new(VoteState::new(
+    vote_account.set_state(&VoteStateVersions::new_current(VoteState::new(
         vote_init, clock,
-    ))))
+    )))
 }
 
 pub fn process_vote<S: std::hash::BuildHasher>(
@@ -704,9 +712,7 @@ pub fn process_vote<S: std::hash::BuildHasher>(
     }
 
     let mut vote_state = versioned.convert_to_current();
-    let authorized_voter = vote_state
-        .get_and_update_authorized_voter(clock.epoch)
-        .expect("the clock epoch is monotonically increasing, so authorized voter must be known");
+    let authorized_voter = vote_state.get_and_update_authorized_voter(clock.epoch);
     verify_authorized_signer(&authorized_voter, signers)?;
 
     vote_state.process_vote(vote, slot_hashes, clock.epoch)?;
@@ -714,10 +720,10 @@ pub fn process_vote<S: std::hash::BuildHasher>(
         vote.slots
             .iter()
             .max()
-            .ok_or_else(|| VoteError::EmptySlots)
+            .ok_or(VoteError::EmptySlots)
             .and_then(|slot| vote_state.process_timestamp(*slot, timestamp))?;
     }
-    vote_account.set_state(&VoteStateVersions::Current(Box::new(vote_state)))
+    vote_account.set_state(&VoteStateVersions::new_current(vote_state))
 }
 
 pub fn create_account_with_authorized(
@@ -739,7 +745,7 @@ pub fn create_account_with_authorized(
         &Clock::default(),
     );
 
-    let versioned = VoteStateVersions::Current(Box::new(vote_state));
+    let versioned = VoteStateVersions::new_current(vote_state);
     VoteState::to(&versioned, &mut vote_account).unwrap();
 
     vote_account
@@ -760,9 +766,10 @@ mod tests {
     use super::*;
     use crate::vote_state;
     use solana_sdk::{
-        account::{get_signers, next_keyed_account, Account},
+        account::Account,
         account_utils::StateMut,
         hash::hash,
+        keyed_account::{get_signers, next_keyed_account},
     };
     use std::cell::RefCell;
 
@@ -772,7 +779,7 @@ mod tests {
         pub fn new_for_test(auth_pubkey: &Pubkey) -> Self {
             Self::new(
                 &VoteInit {
-                    node_pubkey: Pubkey::new_rand(),
+                    node_pubkey: solana_sdk::pubkey::new_rand(),
                     authorized_voter: *auth_pubkey,
                     authorized_withdrawer: *auth_pubkey,
                     commission: 0,
@@ -784,11 +791,11 @@ mod tests {
 
     #[test]
     fn test_initialize_vote_account() {
-        let vote_account_pubkey = Pubkey::new_rand();
+        let vote_account_pubkey = solana_sdk::pubkey::new_rand();
         let vote_account = Account::new_ref(100, VoteState::size_of(), &id());
         let vote_account = KeyedAccount::new(&vote_account_pubkey, false, &vote_account);
 
-        let node_pubkey = Pubkey::new_rand();
+        let node_pubkey = solana_sdk::pubkey::new_rand();
         let node_account = RefCell::new(Account::default());
         let keyed_accounts = &[];
         let signers: HashSet<Pubkey> = get_signers(keyed_accounts);
@@ -840,12 +847,12 @@ mod tests {
     }
 
     fn create_test_account() -> (Pubkey, RefCell<Account>) {
-        let vote_pubkey = Pubkey::new_rand();
+        let vote_pubkey = solana_sdk::pubkey::new_rand();
         (
             vote_pubkey,
             RefCell::new(vote_state::create_account(
                 &vote_pubkey,
-                &Pubkey::new_rand(),
+                &solana_sdk::pubkey::new_rand(),
                 0,
                 100,
             )),
@@ -853,16 +860,16 @@ mod tests {
     }
 
     fn create_test_account_with_authorized() -> (Pubkey, Pubkey, Pubkey, RefCell<Account>) {
-        let vote_pubkey = Pubkey::new_rand();
-        let authorized_voter = Pubkey::new_rand();
-        let authorized_withdrawer = Pubkey::new_rand();
+        let vote_pubkey = solana_sdk::pubkey::new_rand();
+        let authorized_voter = solana_sdk::pubkey::new_rand();
+        let authorized_withdrawer = solana_sdk::pubkey::new_rand();
 
         (
             vote_pubkey,
             authorized_voter,
             authorized_withdrawer,
             RefCell::new(vote_state::create_account_with_authorized(
-                &Pubkey::new_rand(),
+                &solana_sdk::pubkey::new_rand(),
                 &authorized_voter,
                 &authorized_withdrawer,
                 0,
@@ -916,11 +923,11 @@ mod tests {
         vote_state
             .votes
             .resize(MAX_LOCKOUT_HISTORY, Lockout::default());
-        let versioned = VoteStateVersions::Current(Box::new(vote_state));
+        let versioned = VoteStateVersions::new_current(vote_state);
         assert!(VoteState::serialize(&versioned, &mut buffer[0..4]).is_err());
         VoteState::serialize(&versioned, &mut buffer).unwrap();
         assert_eq!(
-            VoteStateVersions::Current(Box::new(VoteState::deserialize(&buffer).unwrap())),
+            VoteStateVersions::new_current(VoteState::deserialize(&buffer).unwrap()),
             versioned
         );
     }
@@ -991,7 +998,7 @@ mod tests {
         let (vote_pubkey, _authorized_voter, authorized_withdrawer, vote_account) =
             create_test_account_with_authorized();
 
-        let node_pubkey = Pubkey::new_rand();
+        let node_pubkey = solana_sdk::pubkey::new_rand();
         let node_account = RefCell::new(Account::default());
         let authorized_withdrawer_account = RefCell::new(Account::default());
 
@@ -1119,7 +1126,7 @@ mod tests {
         // another voter, unsigned
         let keyed_accounts = &[KeyedAccount::new(&vote_pubkey, false, &vote_account)];
         let signers: HashSet<Pubkey> = get_signers(keyed_accounts);
-        let authorized_voter_pubkey = Pubkey::new_rand();
+        let authorized_voter_pubkey = solana_sdk::pubkey::new_rand();
         let res = authorize(
             &keyed_accounts[0],
             &authorized_voter_pubkey,
@@ -1189,7 +1196,7 @@ mod tests {
         // another voter
         let keyed_accounts = &[KeyedAccount::new(&vote_pubkey, true, &vote_account)];
         let signers: HashSet<Pubkey> = get_signers(keyed_accounts);
-        let authorized_withdrawer_pubkey = Pubkey::new_rand();
+        let authorized_withdrawer_pubkey = solana_sdk::pubkey::new_rand();
         let res = authorize(
             &keyed_accounts[0],
             &authorized_withdrawer_pubkey,
@@ -1264,7 +1271,7 @@ mod tests {
 
     #[test]
     fn test_vote_without_initialization() {
-        let vote_pubkey = Pubkey::new_rand();
+        let vote_pubkey = solana_sdk::pubkey::new_rand();
         let vote_account = RefCell::new(Account::new(100, VoteState::size_of(), &id()));
 
         let res = simulate_process_vote_unchecked(
@@ -1309,7 +1316,7 @@ mod tests {
 
     #[test]
     fn test_vote_double_lockout_after_expiration() {
-        let voter_pubkey = Pubkey::new_rand();
+        let voter_pubkey = solana_sdk::pubkey::new_rand();
         let mut vote_state = VoteState::new_for_test(&voter_pubkey);
 
         for i in 0..3 {
@@ -1337,7 +1344,7 @@ mod tests {
 
     #[test]
     fn test_expire_multiple_votes() {
-        let voter_pubkey = Pubkey::new_rand();
+        let voter_pubkey = solana_sdk::pubkey::new_rand();
         let mut vote_state = VoteState::new_for_test(&voter_pubkey);
 
         for i in 0..3 {
@@ -1368,7 +1375,7 @@ mod tests {
 
     #[test]
     fn test_vote_credits() {
-        let voter_pubkey = Pubkey::new_rand();
+        let voter_pubkey = solana_sdk::pubkey::new_rand();
         let mut vote_state = VoteState::new_for_test(&voter_pubkey);
 
         for i in 0..MAX_LOCKOUT_HISTORY {
@@ -1387,7 +1394,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_vote() {
-        let voter_pubkey = Pubkey::new_rand();
+        let voter_pubkey = solana_sdk::pubkey::new_rand();
         let mut vote_state = VoteState::new_for_test(&voter_pubkey);
         vote_state.process_slot_vote_unchecked(0);
         vote_state.process_slot_vote_unchecked(1);
@@ -1399,7 +1406,7 @@ mod tests {
 
     #[test]
     fn test_nth_recent_vote() {
-        let voter_pubkey = Pubkey::new_rand();
+        let voter_pubkey = solana_sdk::pubkey::new_rand();
         let mut vote_state = VoteState::new_for_test(&voter_pubkey);
         for i in 0..MAX_LOCKOUT_HISTORY {
             vote_state.process_slot_vote_unchecked(i as u64);
@@ -1430,9 +1437,9 @@ mod tests {
     /// check that two accounts with different data can be brought to the same state with one vote submission
     #[test]
     fn test_process_missed_votes() {
-        let account_a = Pubkey::new_rand();
+        let account_a = solana_sdk::pubkey::new_rand();
         let mut vote_state_a = VoteState::new_for_test(&account_a);
-        let account_b = Pubkey::new_rand();
+        let account_b = solana_sdk::pubkey::new_rand();
         let mut vote_state_b = VoteState::new_for_test(&account_b);
 
         // process some votes on account a
@@ -1572,8 +1579,10 @@ mod tests {
 
         assert_eq!(vote_state.commission_split(1), (0, 1, false));
 
-        let mut vote_state = VoteState::default();
-        vote_state.commission = std::u8::MAX;
+        let mut vote_state = VoteState {
+            commission: std::u8::MAX,
+            ..VoteState::default()
+        };
         assert_eq!(vote_state.commission_split(1), (1, 0, false));
 
         vote_state.commission = 99;
@@ -1599,7 +1608,7 @@ mod tests {
             &keyed_accounts[0],
             0,
             &KeyedAccount::new(
-                &Pubkey::new_rand(),
+                &solana_sdk::pubkey::new_rand(),
                 false,
                 &RefCell::new(Account::default()),
             ),
@@ -1614,7 +1623,7 @@ mod tests {
             &keyed_accounts[0],
             101,
             &KeyedAccount::new(
-                &Pubkey::new_rand(),
+                &solana_sdk::pubkey::new_rand(),
                 false,
                 &RefCell::new(Account::default()),
             ),
@@ -1627,21 +1636,26 @@ mod tests {
         let lamports = vote_account.borrow().lamports;
         let keyed_accounts = &[KeyedAccount::new(&vote_pubkey, true, &vote_account)];
         let signers: HashSet<Pubkey> = get_signers(keyed_accounts);
+        let pre_state: VoteStateVersions = vote_account.borrow().state().unwrap();
         let res = withdraw(
             &keyed_accounts[0],
             lamports,
-            &KeyedAccount::new(&Pubkey::new_rand(), false, &to_account),
+            &KeyedAccount::new(&solana_sdk::pubkey::new_rand(), false, &to_account),
             &signers,
         );
         assert_eq!(res, Ok(()));
         assert_eq!(vote_account.borrow().lamports, 0);
         assert_eq!(to_account.borrow().lamports, lamports);
+        let post_state: VoteStateVersions = vote_account.borrow().state().unwrap();
+        // State has been deinitialized since balance is zero
+        assert!(post_state.is_uninitialized());
 
-        // reset balance, verify that authorized_withdrawer works
+        // reset balance and restore state, verify that authorized_withdrawer works
         vote_account.borrow_mut().lamports = lamports;
+        vote_account.borrow_mut().set_state(&pre_state).unwrap();
 
         // authorize authorized_withdrawer
-        let authorized_withdrawer_pubkey = Pubkey::new_rand();
+        let authorized_withdrawer_pubkey = solana_sdk::pubkey::new_rand();
         let keyed_accounts = &[KeyedAccount::new(&vote_pubkey, true, &vote_account)];
         let signers: HashSet<Pubkey> = get_signers(keyed_accounts);
         let res = authorize(
@@ -1672,6 +1686,9 @@ mod tests {
         assert_eq!(res, Ok(()));
         assert_eq!(vote_account.borrow().lamports, 0);
         assert_eq!(withdrawer_account.borrow().lamports, lamports);
+        let post_state: VoteStateVersions = vote_account.borrow().state().unwrap();
+        // State has been deinitialized since balance is zero
+        assert!(post_state.is_uninitialized());
     }
 
     #[test]
@@ -1727,8 +1744,10 @@ mod tests {
     #[test]
     fn test_vote_process_timestamp() {
         let (slot, timestamp) = (15, 1_575_412_285);
-        let mut vote_state = VoteState::default();
-        vote_state.last_timestamp = BlockTimestamp { slot, timestamp };
+        let mut vote_state = VoteState {
+            last_timestamp: BlockTimestamp { slot, timestamp },
+            ..VoteState::default()
+        };
 
         assert_eq!(
             vote_state.process_timestamp(slot - 1, timestamp + 1),
@@ -1743,10 +1762,6 @@ mod tests {
             Err(VoteError::TimestampTooOld)
         );
         assert_eq!(
-            vote_state.process_timestamp(slot + 1, timestamp),
-            Err(VoteError::TimestampTooOld)
-        );
-        assert_eq!(
             vote_state.process_timestamp(slot, timestamp + 1),
             Err(VoteError::TimestampTooOld)
         );
@@ -1755,14 +1770,22 @@ mod tests {
             vote_state.last_timestamp,
             BlockTimestamp { slot, timestamp }
         );
+        assert_eq!(vote_state.process_timestamp(slot + 1, timestamp), Ok(()));
         assert_eq!(
-            vote_state.process_timestamp(slot + 1, timestamp + 1),
+            vote_state.last_timestamp,
+            BlockTimestamp {
+                slot: slot + 1,
+                timestamp
+            }
+        );
+        assert_eq!(
+            vote_state.process_timestamp(slot + 2, timestamp + 1),
             Ok(())
         );
         assert_eq!(
             vote_state.last_timestamp,
             BlockTimestamp {
-                slot: slot + 1,
+                slot: slot + 2,
                 timestamp: timestamp + 1
             }
         );
@@ -1774,7 +1797,7 @@ mod tests {
 
     #[test]
     fn test_get_and_update_authorized_voter() {
-        let original_voter = Pubkey::new_rand();
+        let original_voter = solana_sdk::pubkey::new_rand();
         let mut vote_state = VoteState::new(
             &VoteInit {
                 node_pubkey: original_voter,
@@ -1788,14 +1811,14 @@ mod tests {
         // If no new authorized voter was set, the same authorized voter
         // is locked into the next epoch
         assert_eq!(
-            vote_state.get_and_update_authorized_voter(1).unwrap(),
+            vote_state.get_and_update_authorized_voter(1),
             original_voter
         );
 
         // Try to get the authorized voter for epoch 5, implies
         // the authorized voter for epochs 1-4 were unchanged
         assert_eq!(
-            vote_state.get_and_update_authorized_voter(5).unwrap(),
+            vote_state.get_and_update_authorized_voter(5),
             original_voter
         );
 
@@ -1810,14 +1833,14 @@ mod tests {
         }
 
         // Set an authorized voter change at slot 7
-        let new_authorized_voter = Pubkey::new_rand();
+        let new_authorized_voter = solana_sdk::pubkey::new_rand();
         vote_state
             .set_new_authorized_voter(&new_authorized_voter, 5, 7, |_| Ok(()))
             .unwrap();
 
         // Try to get the authorized voter for epoch 6, unchanged
         assert_eq!(
-            vote_state.get_and_update_authorized_voter(6).unwrap(),
+            vote_state.get_and_update_authorized_voter(6),
             original_voter
         );
 
@@ -1825,7 +1848,7 @@ mod tests {
         // be the new authorized voter
         for i in 7..10 {
             assert_eq!(
-                vote_state.get_and_update_authorized_voter(i).unwrap(),
+                vote_state.get_and_update_authorized_voter(i),
                 new_authorized_voter
             );
         }
@@ -1834,7 +1857,7 @@ mod tests {
 
     #[test]
     fn test_set_new_authorized_voter() {
-        let original_voter = Pubkey::new_rand();
+        let original_voter = solana_sdk::pubkey::new_rand();
         let epoch_offset = 15;
         let mut vote_state = VoteState::new(
             &VoteInit {
@@ -1848,7 +1871,7 @@ mod tests {
 
         assert!(vote_state.prior_voters.last().is_none());
 
-        let new_voter = Pubkey::new_rand();
+        let new_voter = solana_sdk::pubkey::new_rand();
         // Set a new authorized voter
         vote_state
             .set_new_authorized_voter(&new_voter, 0, epoch_offset, |_| Ok(()))
@@ -1872,7 +1895,7 @@ mod tests {
             .unwrap();
 
         // Set a third and fourth authorized voter
-        let new_voter2 = Pubkey::new_rand();
+        let new_voter2 = solana_sdk::pubkey::new_rand();
         vote_state
             .set_new_authorized_voter(&new_voter2, 3, 3 + epoch_offset, |_| Ok(()))
             .unwrap();
@@ -1882,7 +1905,7 @@ mod tests {
             Some(&(new_voter, epoch_offset, 3 + epoch_offset))
         );
 
-        let new_voter3 = Pubkey::new_rand();
+        let new_voter3 = solana_sdk::pubkey::new_rand();
         vote_state
             .set_new_authorized_voter(&new_voter3, 6, 6 + epoch_offset, |_| Ok(()))
             .unwrap();
@@ -1901,31 +1924,22 @@ mod tests {
         // voters is correct
         for i in 9..epoch_offset {
             assert_eq!(
-                vote_state.get_and_update_authorized_voter(i).unwrap(),
+                vote_state.get_and_update_authorized_voter(i),
                 original_voter
             );
         }
         for i in epoch_offset..3 + epoch_offset {
-            assert_eq!(
-                vote_state.get_and_update_authorized_voter(i).unwrap(),
-                new_voter
-            );
+            assert_eq!(vote_state.get_and_update_authorized_voter(i), new_voter);
         }
         for i in 3 + epoch_offset..6 + epoch_offset {
-            assert_eq!(
-                vote_state.get_and_update_authorized_voter(i).unwrap(),
-                new_voter2
-            );
+            assert_eq!(vote_state.get_and_update_authorized_voter(i), new_voter2);
         }
         for i in 6 + epoch_offset..9 + epoch_offset {
-            assert_eq!(
-                vote_state.get_and_update_authorized_voter(i).unwrap(),
-                new_voter3
-            );
+            assert_eq!(vote_state.get_and_update_authorized_voter(i), new_voter3);
         }
         for i in 9 + epoch_offset..=10 + epoch_offset {
             assert_eq!(
-                vote_state.get_and_update_authorized_voter(i).unwrap(),
+                vote_state.get_and_update_authorized_voter(i),
                 original_voter
             );
         }
@@ -1933,7 +1947,7 @@ mod tests {
 
     #[test]
     fn test_authorized_voter_is_locked_within_epoch() {
-        let original_voter = Pubkey::new_rand();
+        let original_voter = solana_sdk::pubkey::new_rand();
         let mut vote_state = VoteState::new(
             &VoteInit {
                 node_pubkey: original_voter,
@@ -1947,7 +1961,7 @@ mod tests {
         // Test that it's not possible to set a new authorized
         // voter within the same epoch, even if none has been
         // explicitly set before
-        let new_voter = Pubkey::new_rand();
+        let new_voter = solana_sdk::pubkey::new_rand();
         assert_eq!(
             vote_state.set_new_authorized_voter(&new_voter, 1, 1, |_| Ok(())),
             Err(VoteError::TooSoonToReauthorize.into())
@@ -1984,16 +1998,24 @@ mod tests {
         for i in start_current_epoch..start_current_epoch + 2 * MAX_LEADER_SCHEDULE_EPOCH_OFFSET {
             vote_state.as_mut().map(|vote_state| {
                 vote_state.set_new_authorized_voter(
-                    &Pubkey::new_rand(),
+                    &solana_sdk::pubkey::new_rand(),
                     i,
                     i + MAX_LEADER_SCHEDULE_EPOCH_OFFSET,
                     |_| Ok(()),
                 )
             });
 
-            let versioned = VoteStateVersions::Current(Box::new(vote_state.take().unwrap()));
+            let versioned = VoteStateVersions::new_current(vote_state.take().unwrap());
             VoteState::serialize(&versioned, &mut max_sized_data).unwrap();
             vote_state = Some(versioned.convert_to_current());
         }
+    }
+
+    #[test]
+    fn test_default_vote_state_is_uninitialized() {
+        // The default `VoteState` is stored to de-initialize a zero-balance vote account,
+        // so must remain such that `VoteStateVersions::is_uninitialized()` returns true
+        // when called on a `VoteStateVersions` that stores it
+        assert!(VoteStateVersions::new_current(VoteState::default()).is_uninitialized());
     }
 }

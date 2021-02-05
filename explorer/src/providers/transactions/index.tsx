@@ -1,15 +1,14 @@
 import React from "react";
-import * as Sentry from "@sentry/react";
 import {
   TransactionSignature,
   Connection,
   SignatureResult,
 } from "@solana/web3.js";
-import { useCluster } from "../cluster";
+import { useCluster, Cluster } from "../cluster";
 import { DetailsProvider } from "./details";
 import * as Cache from "providers/cache";
 import { ActionType, FetchStatus } from "providers/cache";
-import { CACHED_STATUSES, isCached } from "./cached";
+import { reportError } from "utils/sentry";
 export { useTransactionDetails } from "./details";
 
 export type Confirmations = number | "max";
@@ -56,6 +55,7 @@ export function TransactionsProvider({ children }: TransactionsProviderProps) {
 export async function fetchTransactionStatus(
   dispatch: Dispatch,
   signature: TransactionSignature,
+  cluster: Cluster,
   url: string
 ) {
   dispatch({
@@ -67,48 +67,45 @@ export async function fetchTransactionStatus(
 
   let fetchStatus;
   let data;
-  if (isCached(url, signature)) {
-    const info = CACHED_STATUSES[signature];
+  try {
+    const connection = new Connection(url);
+    const { value } = await connection.getSignatureStatus(signature, {
+      searchTransactionHistory: true,
+    });
+
+    let info = null;
+    if (value !== null) {
+      let confirmations: Confirmations;
+      if (typeof value.confirmations === "number") {
+        confirmations = value.confirmations;
+      } else {
+        confirmations = "max";
+      }
+
+      let blockTime = null;
+      try {
+        blockTime = await connection.getBlockTime(value.slot);
+      } catch (error) {
+        if (cluster === Cluster.MainnetBeta && confirmations === "max") {
+          reportError(error, { slot: `${value.slot}` });
+        }
+      }
+      let timestamp: Timestamp = blockTime !== null ? blockTime : "unavailable";
+
+      info = {
+        slot: value.slot,
+        timestamp,
+        confirmations,
+        result: { err: value.err },
+      };
+    }
     data = { signature, info };
     fetchStatus = FetchStatus.Fetched;
-  } else {
-    try {
-      const connection = new Connection(url);
-      const { value } = await connection.getSignatureStatus(signature, {
-        searchTransactionHistory: true,
-      });
-
-      let info = null;
-      if (value !== null) {
-        let blockTime = null;
-        try {
-          blockTime = await connection.getBlockTime(value.slot);
-        } catch (error) {
-          Sentry.captureException(error, { tags: { slot: `${value.slot}` } });
-        }
-        let timestamp: Timestamp =
-          blockTime !== null ? blockTime : "unavailable";
-
-        let confirmations: Confirmations;
-        if (typeof value.confirmations === "number") {
-          confirmations = value.confirmations;
-        } else {
-          confirmations = "max";
-        }
-
-        info = {
-          slot: value.slot,
-          timestamp,
-          confirmations,
-          result: { err: value.err },
-        };
-      }
-      data = { signature, info };
-      fetchStatus = FetchStatus.Fetched;
-    } catch (error) {
-      Sentry.captureException(error, { tags: { url } });
-      fetchStatus = FetchStatus.FetchFailed;
+  } catch (error) {
+    if (cluster !== Cluster.Custom) {
+      reportError(error, { url });
     }
+    fetchStatus = FetchStatus.FetchFailed;
   }
 
   dispatch({
@@ -131,7 +128,7 @@ export function useTransactions() {
 }
 
 export function useTransactionStatus(
-  signature: TransactionSignature
+  signature: TransactionSignature | undefined
 ): Cache.CacheEntry<TransactionStatus> | undefined {
   const context = React.useContext(StateContext);
 
@@ -139,6 +136,10 @@ export function useTransactionStatus(
     throw new Error(
       `useTransactionStatus must be used within a TransactionsProvider`
     );
+  }
+
+  if (signature === undefined) {
+    return undefined;
   }
 
   return context.entries[signature];
@@ -152,8 +153,11 @@ export function useFetchTransactionStatus() {
     );
   }
 
-  const { url } = useCluster();
-  return (signature: TransactionSignature) => {
-    fetchTransactionStatus(dispatch, signature, url);
-  };
+  const { cluster, url } = useCluster();
+  return React.useCallback(
+    (signature: TransactionSignature) => {
+      fetchTransactionStatus(dispatch, signature, cluster, url);
+    },
+    [dispatch, cluster, url]
+  );
 }

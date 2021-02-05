@@ -15,11 +15,12 @@ import {
   Transaction,
 } from '../src';
 import {mockRpcEnabled} from './__mocks__/node-fetch';
+import {newAccountWithLamports} from './new-account-with-lamports';
 import {url} from './url';
 
 if (!mockRpcEnabled) {
   // Testing max commitment level takes around 20s to complete
-  jest.setTimeout(30000);
+  jest.setTimeout(60000);
 }
 
 test('createAccountWithSeed', async () => {
@@ -128,6 +129,73 @@ test('authorize', () => {
   expect(params).toEqual(StakeInstruction.decodeAuthorize(stakeInstruction));
 });
 
+test('authorize with custodian', () => {
+  const stakePubkey = new Account().publicKey;
+  const authorizedPubkey = new Account().publicKey;
+  const newAuthorizedPubkey = new Account().publicKey;
+  const stakeAuthorizationType = StakeAuthorizationLayout.Withdrawer;
+  const custodianPubkey = new Account().publicKey;
+  const params = {
+    stakePubkey,
+    authorizedPubkey,
+    newAuthorizedPubkey,
+    stakeAuthorizationType,
+    custodianPubkey,
+  };
+  const transaction = StakeProgram.authorize(params);
+  expect(transaction.instructions).toHaveLength(1);
+  const [stakeInstruction] = transaction.instructions;
+  expect(params).toEqual(StakeInstruction.decodeAuthorize(stakeInstruction));
+});
+
+test('authorizeWithSeed', () => {
+  const stakePubkey = new Account().publicKey;
+  const authorityBase = new Account().publicKey;
+  const authoritySeed = 'test string';
+  const authorityOwner = new Account().publicKey;
+  const newAuthorizedPubkey = new Account().publicKey;
+  const stakeAuthorizationType = StakeAuthorizationLayout.Staker;
+  const params = {
+    stakePubkey,
+    authorityBase,
+    authoritySeed,
+    authorityOwner,
+    newAuthorizedPubkey,
+    stakeAuthorizationType,
+  };
+  const transaction = StakeProgram.authorizeWithSeed(params);
+  expect(transaction.instructions).toHaveLength(1);
+  const [stakeInstruction] = transaction.instructions;
+  expect(params).toEqual(
+    StakeInstruction.decodeAuthorizeWithSeed(stakeInstruction),
+  );
+});
+
+test('authorizeWithSeed with custodian', () => {
+  const stakePubkey = new Account().publicKey;
+  const authorityBase = new Account().publicKey;
+  const authoritySeed = 'test string';
+  const authorityOwner = new Account().publicKey;
+  const newAuthorizedPubkey = new Account().publicKey;
+  const stakeAuthorizationType = StakeAuthorizationLayout.Staker;
+  const custodianPubkey = new Account().publicKey;
+  const params = {
+    stakePubkey,
+    authorityBase,
+    authoritySeed,
+    authorityOwner,
+    newAuthorizedPubkey,
+    stakeAuthorizationType,
+    custodianPubkey,
+  };
+  const transaction = StakeProgram.authorizeWithSeed(params);
+  expect(transaction.instructions).toHaveLength(1);
+  const [stakeInstruction] = transaction.instructions;
+  expect(params).toEqual(
+    StakeInstruction.decodeAuthorizeWithSeed(stakeInstruction),
+  );
+});
+
 test('split', () => {
   const stakePubkey = new Account().publicKey;
   const authorizedPubkey = new Account().publicKey;
@@ -163,6 +231,24 @@ test('withdraw', () => {
     authorizedPubkey,
     toPubkey,
     lamports: 123,
+  };
+  const transaction = StakeProgram.withdraw(params);
+  expect(transaction.instructions).toHaveLength(1);
+  const [stakeInstruction] = transaction.instructions;
+  expect(params).toEqual(StakeInstruction.decodeWithdraw(stakeInstruction));
+});
+
+test('withdraw with custodian', () => {
+  const stakePubkey = new Account().publicKey;
+  const authorizedPubkey = new Account().publicKey;
+  const toPubkey = new Account().publicKey;
+  const custodianPubkey = new Account().publicKey;
+  const params = {
+    stakePubkey,
+    authorizedPubkey,
+    toPubkey,
+    lamports: 123,
+    custodianPubkey,
   };
   const transaction = StakeProgram.withdraw(params);
   expect(transaction.instructions).toHaveLength(1);
@@ -242,19 +328,26 @@ test('live staking actions', async () => {
     return;
   }
 
-  const connection = new Connection(url, 'recent');
+  const connection = new Connection(url, 'singleGossip');
   const voteAccounts = await connection.getVoteAccounts();
   const voteAccount = voteAccounts.current.concat(voteAccounts.delinquent)[0];
   const votePubkey = new PublicKey(voteAccount.votePubkey);
 
-  const from = new Account();
-  const authorized = new Account();
-  await connection.requestAirdrop(from.publicKey, 2 * LAMPORTS_PER_SOL);
-  await connection.requestAirdrop(authorized.publicKey, 2 * LAMPORTS_PER_SOL);
+  const from = await newAccountWithLamports(connection, 2 * LAMPORTS_PER_SOL);
+  const authorized = await newAccountWithLamports(
+    connection,
+    2 * LAMPORTS_PER_SOL,
+  );
 
   const minimumAmount = await connection.getMinimumBalanceForRentExemption(
     StakeProgram.space,
-    'recent',
+  );
+
+  expect(await connection.getBalance(from.publicKey)).toEqual(
+    2 * LAMPORTS_PER_SOL,
+  );
+  expect(await connection.getBalance(authorized.publicKey)).toEqual(
+    2 * LAMPORTS_PER_SOL,
   );
 
   {
@@ -272,7 +365,7 @@ test('live staking actions', async () => {
       connection,
       createAndInitialize,
       [from, newStakeAccount],
-      {confirmations: 0, skipPreflight: true},
+      {commitment: 'singleGossip'},
     );
     expect(await connection.getBalance(newStakeAccount.publicKey)).toEqual(
       minimumAmount + 42,
@@ -284,8 +377,7 @@ test('live staking actions', async () => {
       votePubkey,
     });
     await sendAndConfirmTransaction(connection, delegation, [authorized], {
-      confirmations: 0,
-      skipPreflight: true,
+      commitment: 'singleGossip',
     });
   }
 
@@ -311,7 +403,7 @@ test('live staking actions', async () => {
     connection,
     createAndInitializeWithSeed,
     [from],
-    {confirmations: 0, skipPreflight: true},
+    {commitment: 'singleGossip'},
   );
   let originalStakeBalance = await connection.getBalance(newAccountPubkey);
   expect(originalStakeBalance).toEqual(3 * minimumAmount + 42);
@@ -322,8 +414,7 @@ test('live staking actions', async () => {
     votePubkey,
   });
   await sendAndConfirmTransaction(connection, delegation, [authorized], {
-    confirmations: 0,
-    skipPreflight: true,
+    commitment: 'singleGossip',
   });
 
   // Test that withdraw fails before deactivation
@@ -336,10 +427,39 @@ test('live staking actions', async () => {
   });
   await expect(
     sendAndConfirmTransaction(connection, withdraw, [authorized], {
-      confirmations: 0,
-      skipPreflight: true,
+      commitment: 'singleGossip',
     }),
   ).rejects.toThrow();
+
+  // Deactivate stake
+  let deactivate = StakeProgram.deactivate({
+    stakePubkey: newAccountPubkey,
+    authorizedPubkey: authorized.publicKey,
+  });
+  await sendAndConfirmTransaction(connection, deactivate, [authorized], {
+    commitment: 'singleGossip',
+  });
+
+  let stakeActivationState;
+  do {
+    stakeActivationState = await connection.getStakeActivation(
+      newAccountPubkey,
+    );
+  } while (stakeActivationState.state != 'inactive');
+
+  // Test that withdraw succeeds after deactivation
+  withdraw = StakeProgram.withdraw({
+    stakePubkey: newAccountPubkey,
+    authorizedPubkey: authorized.publicKey,
+    toPubkey: recipient.publicKey,
+    lamports: minimumAmount + 20,
+  });
+
+  await sendAndConfirmTransaction(connection, withdraw, [authorized], {
+    commitment: 'singleGossip',
+  });
+  const recipientBalance = await connection.getBalance(recipient.publicKey);
+  expect(recipientBalance).toEqual(minimumAmount + 20);
 
   // Split stake
   const newStake = new Account();
@@ -350,9 +470,10 @@ test('live staking actions', async () => {
     lamports: minimumAmount + 20,
   });
   await sendAndConfirmTransaction(connection, split, [authorized, newStake], {
-    confirmations: 0,
-    skipPreflight: true,
+    commitment: 'singleGossip',
   });
+  const balance = await connection.getBalance(newAccountPubkey);
+  expect(balance).toEqual(minimumAmount + 2);
 
   // Authorize to new account
   const newAuthorized = new Account();
@@ -365,8 +486,7 @@ test('live staking actions', async () => {
     stakeAuthorizationType: StakeAuthorizationLayout.Withdrawer,
   });
   await sendAndConfirmTransaction(connection, authorize, [authorized], {
-    confirmations: 0,
-    skipPreflight: true,
+    commitment: 'singleGossip',
   });
   authorize = StakeProgram.authorize({
     stakePubkey: newAccountPubkey,
@@ -375,47 +495,42 @@ test('live staking actions', async () => {
     stakeAuthorizationType: StakeAuthorizationLayout.Staker,
   });
   await sendAndConfirmTransaction(connection, authorize, [authorized], {
-    confirmations: 0,
-    skipPreflight: true,
+    commitment: 'singleGossip',
   });
 
-  // Test old authorized can't deactivate
-  let deactivateNotAuthorized = StakeProgram.deactivate({
+  // Test old authorized can't delegate
+  let delegateNotAuthorized = StakeProgram.delegate({
     stakePubkey: newAccountPubkey,
     authorizedPubkey: authorized.publicKey,
+    votePubkey,
   });
   await expect(
-    sendAndConfirmTransaction(
-      connection,
-      deactivateNotAuthorized,
-      [authorized],
-      {confirmations: 0, skipPreflight: true},
-    ),
+    sendAndConfirmTransaction(connection, delegateNotAuthorized, [authorized], {
+      commitment: 'singleGossip',
+    }),
   ).rejects.toThrow();
 
-  // Deactivate stake
-  let deactivate = StakeProgram.deactivate({
+  // Authorize a derived address
+  authorize = StakeProgram.authorize({
     stakePubkey: newAccountPubkey,
     authorizedPubkey: newAuthorized.publicKey,
+    newAuthorizedPubkey: newAccountPubkey,
+    stakeAuthorizationType: StakeAuthorizationLayout.Withdrawer,
   });
-  await sendAndConfirmTransaction(connection, deactivate, [newAuthorized], {
-    confirmations: 0,
-    skipPreflight: true,
+  await sendAndConfirmTransaction(connection, authorize, [newAuthorized], {
+    commitment: 'singleGossip',
   });
 
-  // Test that withdraw succeeds after deactivation
-  withdraw = StakeProgram.withdraw({
+  // Restore the previous authority using a derived address
+  authorize = StakeProgram.authorizeWithSeed({
     stakePubkey: newAccountPubkey,
-    authorizedPubkey: newAuthorized.publicKey,
-    toPubkey: recipient.publicKey,
-    lamports: minimumAmount + 20,
+    authorityBase: from.publicKey,
+    authoritySeed: seed,
+    authorityOwner: StakeProgram.programId,
+    newAuthorizedPubkey: newAuthorized.publicKey,
+    stakeAuthorizationType: StakeAuthorizationLayout.Withdrawer,
   });
-  await sendAndConfirmTransaction(connection, withdraw, [newAuthorized], {
-    confirmations: 0,
-    skipPreflight: true,
+  await sendAndConfirmTransaction(connection, authorize, [from], {
+    commitment: 'singleGossip',
   });
-  const balance = await connection.getBalance(newAccountPubkey);
-  expect(balance).toEqual(minimumAmount + 2);
-  const recipientBalance = await connection.getBalance(recipient.publicKey);
-  expect(recipientBalance).toEqual(minimumAmount + 20);
 });

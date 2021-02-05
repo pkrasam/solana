@@ -125,6 +125,7 @@ impl ClusterSlotsService {
         while let Ok(mut more) = completed_slots_receiver.try_recv() {
             slots.append(&mut more);
         }
+        #[allow(clippy::stable_sort_primitive)]
         slots.sort();
         if !slots.is_empty() {
             cluster_info.push_epoch_slots(&slots);
@@ -163,7 +164,7 @@ impl ClusterSlotsService {
         while let Ok(mut more) = completed_slots_receiver.try_recv() {
             slots.append(&mut more);
         }
-        slots.sort();
+        slots.sort_unstable();
         slots.dedup();
         if !slots.is_empty() {
             cluster_info.push_epoch_slots(&slots);
@@ -181,6 +182,7 @@ mod test {
         let node_info = Node::new_localhost_with_pubkey(&Pubkey::default());
         let cluster_info = ClusterInfo::new_with_invalid_keypair(node_info.info);
         ClusterSlotsService::update_lowest_slot(&Pubkey::default(), 5, &cluster_info);
+        cluster_info.flush_push_queue();
         let lowest = cluster_info
             .get_lowest_slot_for_node(&Pubkey::default(), None, |lowest_slot, _| {
                 lowest_slot.clone()

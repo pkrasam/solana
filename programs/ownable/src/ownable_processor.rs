@@ -3,8 +3,9 @@
 use crate::ownable_instruction::OwnableError;
 use bincode::serialize_into;
 use solana_sdk::{
-    account::{next_keyed_account, KeyedAccount},
     instruction::InstructionError,
+    keyed_account::{next_keyed_account, KeyedAccount},
+    process_instruction::InvokeContext,
     program_utils::limited_deserialize,
     pubkey::Pubkey,
 };
@@ -30,6 +31,7 @@ pub fn process_instruction(
     _program_id: &Pubkey,
     keyed_accounts: &[KeyedAccount],
     data: &[u8],
+    _invoke_context: &mut dyn InvokeContext,
 ) -> Result<(), InstructionError> {
     let new_owner_pubkey: Pubkey = limited_deserialize(data)?;
     let keyed_accounts_iter = &mut keyed_accounts.iter();
@@ -71,7 +73,7 @@ mod tests {
     fn create_bank(lamports: u64) -> (Bank, Keypair) {
         let (genesis_config, mint_keypair) = create_genesis_config(lamports);
         let mut bank = Bank::new(&genesis_config);
-        bank.add_builtin_program("ownable_program", crate::id(), process_instruction);
+        bank.add_builtin("ownable_program", crate::id(), process_instruction);
         (bank, mint_keypair)
     }
 
@@ -151,9 +153,9 @@ mod tests {
 
     #[test]
     fn test_ownable_missing_owner_signature() {
-        let mut account_owner_pubkey = Pubkey::new_rand();
+        let mut account_owner_pubkey = solana_sdk::pubkey::new_rand();
         let owner_pubkey = account_owner_pubkey;
-        let new_owner_pubkey = Pubkey::new_rand();
+        let new_owner_pubkey = solana_sdk::pubkey::new_rand();
         let account = Account::new_ref(1, 0, &system_program::id());
         let owner_keyed_account = KeyedAccount::new(&owner_pubkey, false, &account); // <-- Attack! Setting owner without the original owner's signature.
         let err = set_owner(
@@ -167,10 +169,10 @@ mod tests {
 
     #[test]
     fn test_ownable_incorrect_owner() {
-        let mut account_owner_pubkey = Pubkey::new_rand();
-        let new_owner_pubkey = Pubkey::new_rand();
+        let mut account_owner_pubkey = solana_sdk::pubkey::new_rand();
+        let new_owner_pubkey = solana_sdk::pubkey::new_rand();
         let account = Account::new_ref(1, 0, &system_program::id());
-        let mallory_pubkey = Pubkey::new_rand(); // <-- Attack! Signing with wrong pubkey
+        let mallory_pubkey = solana_sdk::pubkey::new_rand(); // <-- Attack! Signing with wrong pubkey
         let owner_keyed_account = KeyedAccount::new(&mallory_pubkey, true, &account);
         let err = set_owner(
             &mut account_owner_pubkey,

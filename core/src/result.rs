@@ -1,7 +1,7 @@
 //! The `result` module exposes a Result type that propagates one of many different Error types.
 
-use crate::cluster_info;
 use crate::poh_recorder;
+use crate::{cluster_info, duplicate_shred};
 use solana_ledger::block_error;
 use solana_ledger::blockstore;
 use solana_runtime::snapshot_utils;
@@ -20,6 +20,7 @@ pub enum Error {
     ReadyTimeoutError,
     RecvTimeoutError(std::sync::mpsc::RecvTimeoutError),
     CrossbeamSendError,
+    TryCrossbeamSendError,
     TryRecvError(std::sync::mpsc::TryRecvError),
     Serialize(std::boxed::Box<bincode::ErrorKind>),
     TransactionError(transaction::TransactionError),
@@ -30,6 +31,9 @@ pub enum Error {
     BlockstoreError(blockstore::BlockstoreError),
     FsExtra(fs_extra::error::Error),
     SnapshotError(snapshot_utils::SnapshotError),
+    WeightedIndexError(rand::distributions::weighted::WeightedError),
+    DuplicateNodeInstance,
+    DuplicateShredError(duplicate_shred::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -87,6 +91,11 @@ impl<T> std::convert::From<crossbeam_channel::SendError<T>> for Error {
         Error::CrossbeamSendError
     }
 }
+impl<T> std::convert::From<crossbeam_channel::TrySendError<T>> for Error {
+    fn from(_e: crossbeam_channel::TrySendError<T>) -> Error {
+        Error::TryCrossbeamSendError
+    }
+}
 impl<T> std::convert::From<std::sync::mpsc::SendError<T>> for Error {
     fn from(_e: std::sync::mpsc::SendError<T>) -> Error {
         Error::SendError
@@ -135,6 +144,16 @@ impl std::convert::From<blockstore::BlockstoreError> for Error {
 impl std::convert::From<snapshot_utils::SnapshotError> for Error {
     fn from(e: snapshot_utils::SnapshotError) -> Error {
         Error::SnapshotError(e)
+    }
+}
+impl std::convert::From<rand::distributions::weighted::WeightedError> for Error {
+    fn from(e: rand::distributions::weighted::WeightedError) -> Error {
+        Error::WeightedIndexError(e)
+    }
+}
+impl std::convert::From<duplicate_shred::Error> for Error {
+    fn from(e: duplicate_shred::Error) -> Error {
+        Error::DuplicateShredError(e)
     }
 }
 

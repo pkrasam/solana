@@ -3,7 +3,13 @@ import bs58 from "bs58";
 import { useHistory, useLocation } from "react-router-dom";
 import Select, { InputActionMeta, ActionMeta, ValueType } from "react-select";
 import StateManager from "react-select";
-import { PROGRAM_IDS, SYSVAR_IDS, ProgramName } from "utils/tx";
+import {
+  LOADER_IDS,
+  PROGRAM_IDS,
+  SYSVAR_IDS,
+  ProgramName,
+  LoaderName,
+} from "utils/tx";
 import { TokenRegistry } from "tokenRegistry";
 import { Cluster, useCluster } from "providers/cluster";
 
@@ -14,7 +20,10 @@ export function SearchBar() {
   const location = useLocation();
   const { cluster } = useCluster();
 
-  const onChange = ({ pathname }: ValueType<any>, meta: ActionMeta<any>) => {
+  const onChange = (
+    { pathname }: ValueType<any, false>,
+    meta: ActionMeta<any>
+  ) => {
     if (meta.action === "select-option") {
       history.push({ ...location, pathname });
       setSearch("");
@@ -34,12 +43,17 @@ export function SearchBar() {
             ref={(ref) => (selectRef.current = ref)}
             options={buildOptions(search, cluster)}
             noOptionsMessage={() => "No Results"}
-            placeholder="Search for accounts, transactions, programs, and tokens"
+            placeholder="Search for blocks, accounts, transactions, programs, and tokens"
             value={resetValue}
             inputValue={search}
             blurInputOnSelect
             onMenuClose={() => selectRef.current?.blur()}
             onChange={onChange}
+            styles={{
+              /* work around for https://github.com/JedWatson/react-select/issues/3857 */
+              placeholder: (style) => ({ ...style, pointerEvents: "none" }),
+              input: (style) => ({ ...style, width: "100%" }),
+            }}
             onInputChange={onInputChange}
             components={{ DropdownIndicator }}
             classNamePrefix="search-bar"
@@ -51,11 +65,13 @@ export function SearchBar() {
 }
 
 const SEARCHABLE_PROGRAMS: ProgramName[] = [
+  "Break Solana Program",
   "Config Program",
   "Stake Program",
   "System Program",
   "Vote Program",
-  "SPL Token",
+  "SPL Token Program",
+  "Memo Program",
 ];
 
 function buildProgramOptions(search: string) {
@@ -73,6 +89,31 @@ function buildProgramOptions(search: string) {
     return {
       label: "Programs",
       options: matchedPrograms.map(([id, name]) => ({
+        label: name,
+        value: [name, id],
+        pathname: "/address/" + id,
+      })),
+    };
+  }
+}
+
+const SEARCHABLE_LOADERS: LoaderName[] = ["BPF Loader", "BPF Loader 2"];
+
+function buildLoaderOptions(search: string) {
+  const matchedLoaders = Object.entries(LOADER_IDS).filter(
+    ([address, name]) => {
+      return (
+        SEARCHABLE_LOADERS.includes(name) &&
+        (name.toLowerCase().includes(search.toLowerCase()) ||
+          address.includes(search))
+      );
+    }
+  );
+
+  if (matchedLoaders.length > 0) {
+    return {
+      label: "Program Loaders",
+      options: matchedLoaders.map(([id, name]) => ({
         label: name,
         value: [name, id],
         pathname: "/address/" + id,
@@ -127,7 +168,8 @@ function buildTokenOptions(search: string, cluster: Cluster) {
   }
 }
 
-function buildOptions(search: string, cluster: Cluster) {
+function buildOptions(rawSearch: string, cluster: Cluster) {
+  const search = rawSearch.trim();
   if (search.length === 0) return [];
 
   const options = [];
@@ -135,6 +177,11 @@ function buildOptions(search: string, cluster: Cluster) {
   const programOptions = buildProgramOptions(search);
   if (programOptions) {
     options.push(programOptions);
+  }
+
+  const loaderOptions = buildLoaderOptions(search);
+  if (loaderOptions) {
+    options.push(loaderOptions);
   }
 
   const sysvarOptions = buildSysvarOptions(search);
@@ -145,6 +192,19 @@ function buildOptions(search: string, cluster: Cluster) {
   const tokenOptions = buildTokenOptions(search, cluster);
   if (tokenOptions) {
     options.push(tokenOptions);
+  }
+
+  if (!isNaN(Number(search))) {
+    options.push({
+      label: "Block",
+      options: [
+        {
+          label: `Slot #${search}`,
+          value: [search],
+          pathname: `/block/${search}`,
+        },
+      ],
+    });
   }
 
   // Prefer nice suggestions over raw suggestions
@@ -158,7 +218,7 @@ function buildOptions(search: string, cluster: Cluster) {
         options: [
           {
             label: search,
-            value: search,
+            value: [search],
             pathname: "/address/" + search,
           },
         ],
@@ -169,7 +229,7 @@ function buildOptions(search: string, cluster: Cluster) {
         options: [
           {
             label: search,
-            value: search,
+            value: [search],
             pathname: "/tx/" + search,
           },
         ],

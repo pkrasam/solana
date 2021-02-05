@@ -71,6 +71,10 @@ Operate a configured testnet
                                       - If set, disables the faucet keypair.  Nodes must be funded in genesis config
    --faucet-lamports NUM_LAMPORTS_TO_MINT
                                       - Override the default 500000000000000000 lamports minted in genesis
+   --extra-primordial-stakes NUM_EXTRA_PRIMORDIAL_STAKES
+                                      - Number of extra nodes to be initially staked in genesis.
+                                        Implies --wait-for-supermajority 1 --async-node-init and the supermajority
+                                        wait slot may be overridden with the corresponding flag
    --internal-nodes-stake-lamports NUM_LAMPORTS_PER_NODE
                                       - Amount to stake internal nodes.
    --internal-nodes-lamports NUM_LAMPORTS_PER_NODE
@@ -94,9 +98,9 @@ Operate a configured testnet
    --deploy-if-newer                  - Only deploy if newer software is
                                         available (requires -t or -T)
 
-   --operating-mode development|softlaunch
+   --cluster-type development|devnet|testnet|mainnet-beta
                                       - Specify whether or not to launch the cluster in "development" mode with all features enabled at epoch 0,
-                                        or "softlaunch" mode with some features disabled at epoch 0 (default: development)
+                                        or various other live clusters' feature set (default: development)
    --warp-slot WARP_SLOT              - Boot from a snapshot that has warped ahead to WARP_SLOT rather than a slot 0 genesis.
  sanity/start-specific options:
    -F                   - Discard validator nodes that didn't bootup successfully
@@ -192,24 +196,29 @@ build() {
   echo "Build took $SECONDS seconds"
 }
 
+SOLANA_HOME="\$HOME/solana"
+CARGO_BIN="\$HOME/.cargo/bin"
+
 startCommon() {
   declare ipAddress=$1
   test -d "$SOLANA_ROOT"
   if $skipSetup; then
+    # shellcheck disable=SC2029
     ssh "${sshOptions[@]}" "$ipAddress" "
       set -x;
-      mkdir -p ~/solana/config;
+      mkdir -p $SOLANA_HOME/config;
       rm -rf ~/config;
-      mv ~/solana/config ~;
-      rm -rf ~/solana;
-      mkdir -p ~/solana ~/.cargo/bin;
-      mv ~/config ~/solana/
+      mv $SOLANA_HOME/config ~;
+      rm -rf $SOLANA_HOME;
+      mkdir -p $SOLANA_HOME $CARGO_BIN;
+      mv ~/config $SOLANA_HOME/
     "
   else
+    # shellcheck disable=SC2029
     ssh "${sshOptions[@]}" "$ipAddress" "
       set -x;
-      rm -rf ~/solana;
-      mkdir -p ~/.cargo/bin
+      rm -rf $SOLANA_HOME;
+      mkdir -p $CARGO_BIN
     "
   fi
   [[ -z "$externalNodeSshKey" ]] || ssh-copy-id -f -i "$externalNodeSshKey" "${sshOptions[@]}" "solana@$ipAddress"
@@ -222,7 +231,7 @@ syncScripts() {
   rsync -vPrc -e "ssh ${sshOptions[*]}" \
     --exclude 'net/log*' \
     "$SOLANA_ROOT"/{fetch-perf-libs.sh,fetch-spl.sh,scripts,net,multinode-demo} \
-    "$ipAddress":~/solana/ > /dev/null
+    "$ipAddress":"$SOLANA_HOME"/ > /dev/null
 }
 
 # Deploy local binaries to bootstrap validator.  Other validators and clients later fetch the
@@ -233,11 +242,11 @@ deployBootstrapValidator() {
   echo "Deploying software to bootstrap validator ($ipAddress)"
   case $deployMethod in
   tar)
-    rsync -vPrc -e "ssh ${sshOptions[*]}" "$SOLANA_ROOT"/solana-release/bin/* "$ipAddress:~/.cargo/bin/"
+    rsync -vPrc -e "ssh ${sshOptions[*]}" "$SOLANA_ROOT"/solana-release/bin/* "$ipAddress:$CARGO_BIN/"
     rsync -vPrc -e "ssh ${sshOptions[*]}" "$SOLANA_ROOT"/solana-release/version.yml "$ipAddress:~/"
     ;;
   local)
-    rsync -vPrc -e "ssh ${sshOptions[*]}" "$SOLANA_ROOT"/farf/bin/* "$ipAddress:~/.cargo/bin/"
+    rsync -vPrc -e "ssh ${sshOptions[*]}" "$SOLANA_ROOT"/farf/bin/* "$ipAddress:$CARGO_BIN/"
     ssh "${sshOptions[@]}" -n "$ipAddress" "rm -f ~/version.yml; touch ~/version.yml"
     ;;
   skip)
@@ -282,9 +291,10 @@ startBootstrapLeader() {
          \"$genesisOptions\" \
          \"$maybeNoSnapshot $maybeSkipLedgerVerify $maybeLimitLedgerSize $maybeWaitForSupermajority\" \
          \"$gpuMode\" \
-         \"$GEOLOCATION_API_KEY\" \
          \"$maybeWarpSlot\" \
          \"$waitForNodeInit\" \
+         \"$extraPrimordialStakes\" \
+         \"$TMPFS_ACCOUNTS\" \
       "
 
   ) >> "$logFile" 2>&1 || {
@@ -353,9 +363,10 @@ startNode() {
          \"$genesisOptions\" \
          \"$maybeNoSnapshot $maybeSkipLedgerVerify $maybeLimitLedgerSize $maybeWaitForSupermajority\" \
          \"$gpuMode\" \
-         \"$GEOLOCATION_API_KEY\" \
          \"$maybeWarpSlot\" \
          \"$waitForNodeInit\" \
+         \"$extraPrimordialStakes\" \
+         \"$TMPFS_ACCOUNTS\" \
       "
   ) >> "$logFile" 2>&1 &
   declare pid=$!
@@ -494,11 +505,13 @@ prepareDeploy() {
   case $deployMethod in
   tar)
     if [[ -n $releaseChannel ]]; then
+      echo "Downloading release from channel: $releaseChannel"
       rm -f "$SOLANA_ROOT"/solana-release.tar.bz2
-      declare updateDownloadUrl=http://release.solana.com/"$releaseChannel"/solana-release-x86_64-unknown-linux-gnu.tar.bz2
+      declare updateDownloadUrl=https://release.solana.com/"$releaseChannel"/solana-release-x86_64-unknown-linux-gnu.tar.bz2
       (
         set -x
-        curl --retry 5 --retry-delay 2 --retry-connrefused \
+        curl -L -I "$updateDownloadUrl"
+        curl -L --retry 5 --retry-delay 2 --retry-connrefused \
           -o "$SOLANA_ROOT"/solana-release.tar.bz2 "$updateDownloadUrl"
       )
       tarballFilename="$SOLANA_ROOT"/solana-release.tar.bz2
@@ -506,7 +519,7 @@ prepareDeploy() {
     (
       set -x
       rm -rf "$SOLANA_ROOT"/solana-release
-      (cd "$SOLANA_ROOT"; tar jxv) < "$tarballFilename"
+      cd "$SOLANA_ROOT"; tar jfxv "$tarballFilename"
       cat "$SOLANA_ROOT"/solana-release/version.yml
     )
     ;;
@@ -712,8 +725,7 @@ checkPremptibleInstances() {
   # immediately after its successfully pinged.
   for ipAddress in "${validatorIpList[@]}"; do
     (
-      set -x
-      timeout 5s ping -c 1 "$ipAddress" | tr - _
+      timeout 5s ping -c 1 "$ipAddress" | tr - _ &>/dev/null
     ) || {
       cat <<EOF
 
@@ -761,6 +773,7 @@ clientDelayStart=0
 netLogDir=
 maybeWarpSlot=
 waitForNodeInit=true
+extraPrimordialStakes=0
 
 command=$1
 [[ -n $command ]] || usage
@@ -781,12 +794,12 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --faucet-lamports ]]; then
       genesisOptions="$genesisOptions $1 $2"
       shift 2
-    elif [[ $1 = --operating-mode ]]; then
+    elif [[ $1 = --cluster-type ]]; then
       case "$2" in
-        development|softlaunch)
+        development|devnet|testnet|mainnet-beta)
           ;;
         *)
-          echo "Unexpected operating mode: \"$2\""
+          echo "Unexpected cluster type: \"$2\""
           exit 1
           ;;
       esac
@@ -867,6 +880,9 @@ while [[ -n $1 ]]; do
     elif [[ $1 == --async-node-init ]]; then
       waitForNodeInit=false
       shift 1
+    elif [[ $1 == --extra-primordial-stakes ]]; then
+      extraPrimordialStakes=$2
+      shift 2
     else
       usage "Unknown long option: $1"
     fi
@@ -985,6 +1001,32 @@ else
   fi
 fi
 
+if [[ -n "$maybeWaitForSupermajority" && -n "$maybeWarpSlot" ]]; then
+  read -r _ waitSlot <<<"$maybeWaitForSupermajority"
+  read -r _ warpSlot <<<"$maybeWarpSlot"
+  if [[ $waitSlot -ne $warpSlot ]]; then
+    echo "Error: When specifying both --wait-for-supermajority and --warp-slot,"
+    echo "they must use the same slot. ($waitSlot != $warpSlot)"
+    exit 1
+  fi
+fi
+
+echo "net.sh: Primordial stakes: $extraPrimordialStakes"
+if [[ $extraPrimordialStakes -gt 0 ]]; then
+  # Extra primoridial stakes require that all of the validators start at
+  # the same time. Force async init and wait for supermajority here.
+  waitForNodeInit=false
+  if [[ -z "$maybeWaitForSupermajority" ]]; then
+    waitSlot=
+    if [[ -n "$maybeWarpSlot" ]]; then
+      read -r _ waitSlot <<<"$maybeWarpSlot"
+    else
+      waitSlot=1
+    fi
+    maybeWaitForSupermajority="--wait-for-supermajority $waitSlot"
+  fi
+fi
+
 checkPremptibleInstances
 
 case $command in
@@ -1060,7 +1102,7 @@ netem)
     remoteNetemConfigFile="$(basename "$netemConfigFile")"
     if [[ $netemCommand = "add" ]]; then
       for ipAddress in "${validatorIpList[@]}"; do
-        "$here"/scp.sh "$netemConfigFile" solana@"$ipAddress":~/solana
+        "$here"/scp.sh "$netemConfigFile" solana@"$ipAddress":"$SOLANA_HOME"
       done
     fi
     for i in "${!validatorIpList[@]}"; do

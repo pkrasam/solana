@@ -241,14 +241,15 @@ impl LedgerWallet {
         Ok(message)
     }
 
-    fn send_apdu(
+    fn _send_apdu(
         &self,
         command: u8,
         p1: u8,
         p2: u8,
         data: &[u8],
+        outdated_app: bool,
     ) -> Result<Vec<u8>, RemoteWalletError> {
-        self.write(command, p1, p2, data, self.outdated_app())?;
+        self.write(command, p1, p2, data, outdated_app)?;
         if p1 == P1_CONFIRM && is_last_part(p2) {
             println!(
                 "Waiting for your approval on {} {}",
@@ -263,8 +264,18 @@ impl LedgerWallet {
         }
     }
 
+    fn send_apdu(
+        &self,
+        command: u8,
+        p1: u8,
+        p2: u8,
+        data: &[u8],
+    ) -> Result<Vec<u8>, RemoteWalletError> {
+        self._send_apdu(command, p1, p2, data, self.outdated_app())
+    }
+
     fn get_firmware_version(&self) -> Result<FirmwareVersion, RemoteWalletError> {
-        if let Ok(version) = self.send_apdu(commands::GET_APP_CONFIGURATION, 0, 0, &[]) {
+        if let Ok(version) = self._send_apdu(commands::GET_APP_CONFIGURATION, 0, 0, &[], false) {
             if version.len() != 5 {
                 return Err(RemoteWalletError::Protocol("Version packet size mismatch"));
             }
@@ -274,7 +285,8 @@ impl LedgerWallet {
                 version[4].into(),
             ))
         } else {
-            let version = self.send_apdu(commands::DEPRECATED_GET_APP_CONFIGURATION, 0, 0, &[])?;
+            let version =
+                self._send_apdu(commands::DEPRECATED_GET_APP_CONFIGURATION, 0, 0, &[], true)?;
             if version.len() != 4 {
                 return Err(RemoteWalletError::Protocol("Version packet size mismatch"));
             }
@@ -327,6 +339,7 @@ impl RemoteWallet for LedgerWallet {
             .clone()
             .unwrap_or("Unknown")
             .to_string();
+        let host_device_path = dev_info.path().to_string_lossy().to_string();
         let version = self.get_firmware_version()?;
         self.version = version;
         let pubkey_result = self.get_pubkey(&DerivationPath::default(), false);
@@ -338,6 +351,7 @@ impl RemoteWallet for LedgerWallet {
             model,
             manufacturer,
             serial,
+            host_device_path,
             pubkey,
             error,
         })
@@ -509,31 +523,34 @@ pub fn get_ledger_from_info(
             return Err(device.error.clone().unwrap());
         }
     }
-    let mut matches: Vec<(Pubkey, String)> = matches
+    let mut matches: Vec<(String, String)> = matches
         .filter(|&device_info| device_info.error.is_none())
-        .map(|device_info| (device_info.pubkey, device_info.get_pretty_path()))
+        .map(|device_info| {
+            let query_item = format!("{} ({})", device_info.get_pretty_path(), device_info.model,);
+            (device_info.host_device_path.clone(), query_item)
+        })
         .collect();
     if matches.is_empty() {
         return Err(RemoteWalletError::NoDeviceFound);
     }
     matches.sort_by(|a, b| a.1.cmp(&b.1));
-    let (pubkeys, device_paths): (Vec<Pubkey>, Vec<String>) = matches.into_iter().unzip();
+    let (host_device_paths, items): (Vec<String>, Vec<String>) = matches.into_iter().unzip();
 
-    let wallet_base_pubkey = if pubkeys.len() > 1 {
+    let wallet_host_device_path = if host_device_paths.len() > 1 {
         let selection = Select::with_theme(&ColorfulTheme::default())
             .with_prompt(&format!(
                 "Multiple hardware wallets found. Please select a device for {:?}",
                 keypair_name
             ))
             .default(0)
-            .items(&device_paths[..])
+            .items(&items[..])
             .interact()
             .unwrap();
-        pubkeys[selection]
+        &host_device_paths[selection]
     } else {
-        pubkeys[0]
+        &host_device_paths[0]
     };
-    wallet_manager.get_ledger(&wallet_base_pubkey)
+    wallet_manager.get_ledger(wallet_host_device_path)
 }
 
 //

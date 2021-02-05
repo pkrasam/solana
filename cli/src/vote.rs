@@ -1,14 +1,18 @@
 use crate::{
     checks::{check_account_for_fee_with_commitment, check_unique_pubkeys},
     cli::{
-        generate_unique_signers, log_instruction_custom_error, CliCommand, CliCommandInfo,
-        CliConfig, CliError, ProcessResult, SignerIndex,
+        log_instruction_custom_error, CliCommand, CliCommandInfo, CliConfig, CliError,
+        ProcessResult,
     },
-    cli_output::{CliEpochVotingHistory, CliLockout, CliVoteAccount},
     spend_utils::{resolve_spend_tx_and_check_account_balance, SpendAmount},
 };
 use clap::{value_t_or_exit, App, Arg, ArgMatches, SubCommand};
-use solana_clap_utils::{commitment::commitment_arg, input_parsers::*, input_validators::*};
+use solana_clap_utils::{
+    input_parsers::*,
+    input_validators::*,
+    keypair::{DefaultSigner, SignerIndex},
+};
+use solana_cli_output::{CliEpochVotingHistory, CliLockout, CliVoteAccount};
 use solana_client::rpc_client::RpcClient;
 use solana_remote_wallet::remote_wallet::RemoteWalletManager;
 use solana_sdk::{
@@ -203,8 +207,7 @@ impl VoteSubCommands for App<'_, '_> {
                         .long("lamports")
                         .takes_value(false)
                         .help("Display balance in lamports instead of SOL"),
-                )
-                .arg(commitment_arg()),
+                ),
         )
         .subcommand(
             SubCommand::with_name("withdraw-from-vote-account")
@@ -246,7 +249,7 @@ impl VoteSubCommands for App<'_, '_> {
 
 pub fn parse_create_vote_account(
     matches: &ArgMatches<'_>,
-    default_signer_path: &str,
+    default_signer: &DefaultSigner,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let (vote_account, vote_account_pubkey) = signer_of(matches, "vote_account", wallet_manager)?;
@@ -258,10 +261,9 @@ pub fn parse_create_vote_account(
     let authorized_withdrawer = pubkey_of_signer(matches, "authorized_withdrawer", wallet_manager)?;
 
     let payer_provided = None;
-    let signer_info = generate_unique_signers(
+    let signer_info = default_signer.generate_unique_signers(
         vec![payer_provided, vote_account, identity_account],
         matches,
-        default_signer_path,
         wallet_manager,
     )?;
 
@@ -280,7 +282,7 @@ pub fn parse_create_vote_account(
 
 pub fn parse_vote_authorize(
     matches: &ArgMatches<'_>,
-    default_signer_path: &str,
+    default_signer: &DefaultSigner,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
     vote_authorize: VoteAuthorize,
 ) -> Result<CliCommandInfo, CliError> {
@@ -291,10 +293,9 @@ pub fn parse_vote_authorize(
     let (authorized, _) = signer_of(matches, "authorized", wallet_manager)?;
 
     let payer_provided = None;
-    let signer_info = generate_unique_signers(
+    let signer_info = default_signer.generate_unique_signers(
         vec![payer_provided, authorized],
         matches,
-        default_signer_path,
         wallet_manager,
     )?;
 
@@ -310,7 +311,7 @@ pub fn parse_vote_authorize(
 
 pub fn parse_vote_update_validator(
     matches: &ArgMatches<'_>,
-    default_signer_path: &str,
+    default_signer: &DefaultSigner,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let vote_account_pubkey =
@@ -321,10 +322,9 @@ pub fn parse_vote_update_validator(
         signer_of(matches, "authorized_withdrawer", wallet_manager)?;
 
     let payer_provided = None;
-    let signer_info = generate_unique_signers(
+    let signer_info = default_signer.generate_unique_signers(
         vec![payer_provided, authorized_withdrawer, new_identity_account],
         matches,
-        default_signer_path,
         wallet_manager,
     )?;
 
@@ -340,7 +340,7 @@ pub fn parse_vote_update_validator(
 
 pub fn parse_vote_update_commission(
     matches: &ArgMatches<'_>,
-    default_signer_path: &str,
+    default_signer: &DefaultSigner,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let vote_account_pubkey =
@@ -350,10 +350,9 @@ pub fn parse_vote_update_commission(
     let commission = value_t_or_exit!(matches, "commission", u8);
 
     let payer_provided = None;
-    let signer_info = generate_unique_signers(
+    let signer_info = default_signer.generate_unique_signers(
         vec![payer_provided, authorized_withdrawer],
         matches,
-        default_signer_path,
         wallet_manager,
     )?;
 
@@ -385,7 +384,7 @@ pub fn parse_vote_get_account_command(
 
 pub fn parse_withdraw_from_vote_account(
     matches: &ArgMatches<'_>,
-    default_signer_path: &str,
+    default_signer: &DefaultSigner,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let vote_account_pubkey =
@@ -398,10 +397,9 @@ pub fn parse_withdraw_from_vote_account(
         signer_of(matches, "authorized_withdrawer", wallet_manager)?;
 
     let payer_provided = None;
-    let signer_info = generate_unique_signers(
+    let signer_info = default_signer.generate_unique_signers(
         vec![payer_provided, withdraw_authority],
         matches,
-        default_signer_path,
         wallet_manager,
     )?;
 
@@ -494,9 +492,7 @@ pub fn process_create_vote_account(
         }
     }
 
-    let (recent_blockhash, fee_calculator, _) = rpc_client
-        .get_recent_blockhash_with_commitment(config.commitment)?
-        .value;
+    let (recent_blockhash, fee_calculator) = rpc_client.get_recent_blockhash()?;
 
     let (message, _) = resolve_spend_tx_and_check_account_balance(
         rpc_client,
@@ -509,11 +505,7 @@ pub fn process_create_vote_account(
     )?;
     let mut tx = Transaction::new_unsigned(message);
     tx.try_sign(&config.signers, recent_blockhash)?;
-    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-        &tx,
-        config.commitment,
-        config.send_transaction_config,
-    );
+    let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
     log_instruction_custom_error::<SystemError>(result, &config)
 }
 
@@ -536,9 +528,7 @@ pub fn process_vote_authorize(
         (&authorized.pubkey(), "authorized_account".to_string()),
         (new_authorized_pubkey, "new_authorized_pubkey".to_string()),
     )?;
-    let (recent_blockhash, fee_calculator, _) = rpc_client
-        .get_recent_blockhash_with_commitment(config.commitment)?
-        .value;
+    let (recent_blockhash, fee_calculator) = rpc_client.get_recent_blockhash()?;
     let ixs = vec![vote_instruction::authorize(
         vote_account_pubkey,   // vote account to update
         &authorized.pubkey(),  // current authorized
@@ -556,11 +546,7 @@ pub fn process_vote_authorize(
         &tx.message,
         config.commitment,
     )?;
-    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-        &tx,
-        config.commitment,
-        config.send_transaction_config,
-    );
+    let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
     log_instruction_custom_error::<VoteError>(result, &config)
 }
 
@@ -578,9 +564,7 @@ pub fn process_vote_update_validator(
         (vote_account_pubkey, "vote_account_pubkey".to_string()),
         (&new_identity_pubkey, "new_identity_account".to_string()),
     )?;
-    let (recent_blockhash, fee_calculator, _) = rpc_client
-        .get_recent_blockhash_with_commitment(config.commitment)?
-        .value;
+    let (recent_blockhash, fee_calculator) = rpc_client.get_recent_blockhash()?;
     let ixs = vec![vote_instruction::update_validator_identity(
         vote_account_pubkey,
         &authorized_withdrawer.pubkey(),
@@ -597,11 +581,7 @@ pub fn process_vote_update_validator(
         &tx.message,
         config.commitment,
     )?;
-    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-        &tx,
-        config.commitment,
-        config.send_transaction_config,
-    );
+    let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
     log_instruction_custom_error::<VoteError>(result, &config)
 }
 
@@ -613,9 +593,7 @@ pub fn process_vote_update_commission(
     withdraw_authority: SignerIndex,
 ) -> ProcessResult {
     let authorized_withdrawer = config.signers[withdraw_authority];
-    let (recent_blockhash, fee_calculator, _) = rpc_client
-        .get_recent_blockhash_with_commitment(config.commitment)?
-        .value;
+    let (recent_blockhash, fee_calculator) = rpc_client.get_recent_blockhash()?;
     let ixs = vec![vote_instruction::update_commission(
         vote_account_pubkey,
         &authorized_withdrawer.pubkey(),
@@ -632,11 +610,7 @@ pub fn process_vote_update_commission(
         &tx.message,
         config.commitment,
     )?;
-    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-        &tx,
-        config.commitment,
-        config.send_transaction_config,
-    );
+    let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
     log_instruction_custom_error::<VoteError>(result, &config)
 }
 
@@ -671,11 +645,11 @@ fn get_vote_account(
 pub fn process_show_vote_account(
     rpc_client: &RpcClient,
     config: &CliConfig,
-    vote_account_pubkey: &Pubkey,
+    vote_account_address: &Pubkey,
     use_lamports_unit: bool,
 ) -> ProcessResult {
     let (vote_account, vote_state) =
-        get_vote_account(rpc_client, vote_account_pubkey, config.commitment)?;
+        get_vote_account(rpc_client, vote_account_address, config.commitment)?;
 
     let epoch_schedule = rpc_client.get_epoch_schedule()?;
 
@@ -685,16 +659,27 @@ pub fn process_show_vote_account(
         for vote in &vote_state.votes {
             votes.push(vote.into());
         }
-        for (epoch, credits, prev_credits) in vote_state.epoch_credits() {
+        for (epoch, credits, prev_credits) in vote_state.epoch_credits().iter().copied() {
             let credits_earned = credits - prev_credits;
-            let slots_in_epoch = epoch_schedule.get_slots_in_epoch(*epoch);
+            let slots_in_epoch = epoch_schedule.get_slots_in_epoch(epoch);
             epoch_voting_history.push(CliEpochVotingHistory {
-                epoch: *epoch,
+                epoch,
                 slots_in_epoch,
                 credits_earned,
+                credits,
+                prev_credits,
             });
         }
     }
+
+    let epoch_rewards = match crate::stake::fetch_epoch_rewards(rpc_client, vote_account_address, 1)
+    {
+        Ok(rewards) => Some(rewards),
+        Err(error) => {
+            eprintln!("Failed to fetch epoch rewards: {:?}", error);
+            None
+        }
+    };
 
     let vote_account_data = CliVoteAccount {
         account_balance: vote_account.lamports,
@@ -708,6 +693,7 @@ pub fn process_show_vote_account(
         votes,
         epoch_voting_history,
         use_lamports_unit,
+        epoch_rewards,
     };
 
     Ok(config.output_format.formatted_string(&vote_account_data))
@@ -721,14 +707,10 @@ pub fn process_withdraw_from_vote_account(
     withdraw_amount: SpendAmount,
     destination_account_pubkey: &Pubkey,
 ) -> ProcessResult {
-    let (recent_blockhash, fee_calculator, _) = rpc_client
-        .get_recent_blockhash_with_commitment(config.commitment)?
-        .value;
+    let (recent_blockhash, fee_calculator) = rpc_client.get_recent_blockhash()?;
     let withdraw_authority = config.signers[withdraw_authority];
 
-    let current_balance = rpc_client
-        .get_balance_with_commitment(&vote_account_pubkey, config.commitment)?
-        .value;
+    let current_balance = rpc_client.get_balance(&vote_account_pubkey)?;
     let minimum_balance = rpc_client.get_minimum_balance_for_rent_exemption(VoteState::size_of())?;
 
     let lamports = match withdraw_amount {
@@ -761,11 +743,7 @@ pub fn process_withdraw_from_vote_account(
         &transaction.message,
         config.commitment,
     )?;
-    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-        &transaction,
-        config.commitment,
-        config.send_transaction_config,
-    );
+    let result = rpc_client.send_and_confirm_transaction_with_spinner(&transaction);
     log_instruction_custom_error::<VoteError>(result, &config)
 }
 
@@ -794,6 +772,10 @@ mod tests {
         let default_keypair = Keypair::new();
         let (default_keypair_file, mut tmp_file) = make_tmp_file();
         write_keypair(&default_keypair, tmp_file.as_file_mut()).unwrap();
+        let default_signer = DefaultSigner {
+            path: default_keypair_file.clone(),
+            arg_name: String::new(),
+        };
 
         let test_authorize_voter = test_commands.clone().get_matches_from(vec![
             "test",
@@ -803,7 +785,7 @@ mod tests {
             &pubkey2_string,
         ]);
         assert_eq!(
-            parse_command(&test_authorize_voter, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_authorize_voter, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::VoteAuthorize {
                     vote_account_pubkey: pubkey,
@@ -826,7 +808,7 @@ mod tests {
             &pubkey2_string,
         ]);
         assert_eq!(
-            parse_command(&test_authorize_voter, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_authorize_voter, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::VoteAuthorize {
                     vote_account_pubkey: pubkey,
@@ -856,7 +838,7 @@ mod tests {
             "10",
         ]);
         assert_eq!(
-            parse_command(&test_create_vote_account, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_create_vote_account, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::CreateVoteAccount {
                     vote_account: 1,
@@ -885,7 +867,7 @@ mod tests {
             &identity_keypair_file,
         ]);
         assert_eq!(
-            parse_command(&test_create_vote_account2, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_create_vote_account2, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::CreateVoteAccount {
                     vote_account: 1,
@@ -904,7 +886,7 @@ mod tests {
         );
 
         // test init with an authed voter
-        let authed = Pubkey::new_rand();
+        let authed = solana_sdk::pubkey::new_rand();
         let (keypair_file, mut tmp_file) = make_tmp_file();
         let keypair = Keypair::new();
         write_keypair(&keypair, tmp_file.as_file_mut()).unwrap();
@@ -918,7 +900,7 @@ mod tests {
             &authed.to_string(),
         ]);
         assert_eq!(
-            parse_command(&test_create_vote_account3, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_create_vote_account3, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::CreateVoteAccount {
                     vote_account: 1,
@@ -949,7 +931,7 @@ mod tests {
             &authed.to_string(),
         ]);
         assert_eq!(
-            parse_command(&test_create_vote_account4, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_create_vote_account4, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::CreateVoteAccount {
                     vote_account: 1,
@@ -975,7 +957,7 @@ mod tests {
             &keypair_file,
         ]);
         assert_eq!(
-            parse_command(&test_update_validator, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_update_validator, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::VoteUpdateValidator {
                     vote_account_pubkey: pubkey,
@@ -998,7 +980,7 @@ mod tests {
             &keypair_file,
         ]);
         assert_eq!(
-            parse_command(&test_update_commission, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_update_commission, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::VoteUpdateCommission {
                     vote_account_pubkey: pubkey,
@@ -1021,12 +1003,7 @@ mod tests {
             "42",
         ]);
         assert_eq!(
-            parse_command(
-                &test_withdraw_from_vote_account,
-                &default_keypair_file,
-                &mut None
-            )
-            .unwrap(),
+            parse_command(&test_withdraw_from_vote_account, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::WithdrawFromVoteAccount {
                     vote_account_pubkey: read_keypair_file(&keypair_file).unwrap().pubkey(),
@@ -1047,12 +1024,7 @@ mod tests {
             "ALL",
         ]);
         assert_eq!(
-            parse_command(
-                &test_withdraw_from_vote_account,
-                &default_keypair_file,
-                &mut None
-            )
-            .unwrap(),
+            parse_command(&test_withdraw_from_vote_account, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::WithdrawFromVoteAccount {
                     vote_account_pubkey: read_keypair_file(&keypair_file).unwrap().pubkey(),
@@ -1078,12 +1050,7 @@ mod tests {
             &withdraw_authority_file,
         ]);
         assert_eq!(
-            parse_command(
-                &test_withdraw_from_vote_account,
-                &default_keypair_file,
-                &mut None
-            )
-            .unwrap(),
+            parse_command(&test_withdraw_from_vote_account, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::WithdrawFromVoteAccount {
                     vote_account_pubkey: read_keypair_file(&keypair_file).unwrap().pubkey(),

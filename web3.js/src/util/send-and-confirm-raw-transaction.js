@@ -7,7 +7,7 @@ import type {ConfirmOptions} from '../connection';
 /**
  * Send and confirm a raw transaction
  *
- * If `confirmations` count is not specified, wait for transaction to be finalized.
+ * If `commitment` option is not specified, defaults to 'max' commitment.
  *
  * @param {Connection} connection
  * @param {Buffer} rawTransaction
@@ -19,31 +19,28 @@ export async function sendAndConfirmRawTransaction(
   rawTransaction: Buffer,
   options?: ConfirmOptions,
 ): Promise<TransactionSignature> {
-  const start = Date.now();
+  const sendOptions = options && {
+    skipPreflight: options.skipPreflight,
+    preflightCommitment: options.preflightCommitment || options.commitment,
+  };
+
   const signature = await connection.sendRawTransaction(
     rawTransaction,
-    options,
+    sendOptions,
   );
+
   const status = (
     await connection.confirmTransaction(
       signature,
-      options && options.confirmations,
+      options && options.commitment,
     )
   ).value;
 
-  if (status) {
-    if (status.err) {
-      throw new Error(
-        `Raw transaction ${signature} failed (${JSON.stringify(status)})`,
-      );
-    }
-    return signature;
+  if (status.err) {
+    throw new Error(
+      `Raw transaction ${signature} failed (${JSON.stringify(status)})`,
+    );
   }
 
-  const duration = (Date.now() - start) / 1000;
-  throw new Error(
-    `Raw transaction '${signature}' was not confirmed in ${duration.toFixed(
-      2,
-    )} seconds`,
-  );
+  return signature;
 }

@@ -48,6 +48,9 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --enable-rpc-transaction-history ]]; then
       args+=("$1")
       shift
+    elif [[ $1 = --enable-cpi-and-log-storage ]]; then
+      args+=("$1")
+      shift
     elif [[ $1 = --enable-rpc-bigtable-ledger-storage ]]; then
       args+=("$1")
       shift
@@ -61,6 +64,12 @@ while [[ -n $1 ]]; do
       no_restart=1
       shift
     elif [[ $1 == --wait-for-supermajority ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --expected-bank-hash ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --accounts ]]; then
       args+=("$1" "$2")
       shift 2
     else
@@ -90,6 +99,7 @@ ledger_dir="$SOLANA_CONFIG_DIR"/bootstrap-validator
 args+=(
   --enable-rpc-exit
   --enable-rpc-set-log-filter
+  --require-tower
   --ledger "$ledger_dir"
   --rpc-port 8899
   --snapshot-interval-slots 200

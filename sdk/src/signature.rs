@@ -1,4 +1,5 @@
 //! The `signature` module provides functionality for public, and private keys.
+#![cfg(feature = "full")]
 
 use crate::{pubkey::Pubkey, transaction::TransactionError};
 use ed25519_dalek::Signer as DalekSigner;
@@ -43,10 +44,24 @@ impl Keypair {
         self.0.to_bytes()
     }
 
+    pub fn from_base58_string(s: &str) -> Self {
+        Self::from_bytes(&bs58::decode(s).into_vec().unwrap()).unwrap()
+    }
+
+    pub fn to_base58_string(&self) -> String {
+        // Remove .iter() once we're rust 1.47+
+        bs58::encode(&self.0.to_bytes().iter()).into_string()
+    }
+
     pub fn secret(&self) -> &ed25519_dalek::SecretKey {
         &self.0.secret
     }
 }
+
+/// Number of bytes in a signature
+pub const SIGNATURE_BYTES: usize = 64;
+/// Maximum string length of a base58 encoded signature
+const MAX_BASE58_SIGNATURE_LEN: usize = 88;
 
 #[repr(transparent)]
 #[derive(
@@ -110,9 +125,9 @@ impl fmt::Display for Signature {
     }
 }
 
-impl Into<[u8; 64]> for Signature {
-    fn into(self) -> [u8; 64] {
-        <GenericArray<u8, U64> as Into<[u8; 64]>>::into(self.0)
+impl From<Signature> for [u8; 64] {
+    fn from(signature: Signature) -> Self {
+        signature.0.into()
     }
 }
 
@@ -128,6 +143,9 @@ impl FromStr for Signature {
     type Err = ParseSignatureError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() > MAX_BASE58_SIGNATURE_LEN {
+            return Err(ParseSignatureError::WrongSize);
+        }
         let bytes = bs58::decode(s)
             .into_vec()
             .map_err(|_| ParseSignatureError::Invalid)?;
@@ -323,9 +341,8 @@ pub fn read_keypair<R: Read>(reader: &mut R) -> Result<Keypair, Box<dyn error::E
     Ok(Keypair(dalek_keypair))
 }
 
-pub fn read_keypair_file(path: &str) -> Result<Keypair, Box<dyn error::Error>> {
-    assert!(path != "-");
-    let mut file = File::open(path.to_string())?;
+pub fn read_keypair_file<F: AsRef<Path>>(path: F) -> Result<Keypair, Box<dyn error::Error>> {
+    let mut file = File::open(path.as_ref())?;
     read_keypair(&mut file)
 }
 
@@ -339,12 +356,13 @@ pub fn write_keypair<W: Write>(
     Ok(serialized)
 }
 
-pub fn write_keypair_file(
+pub fn write_keypair_file<F: AsRef<Path>>(
     keypair: &Keypair,
-    outfile: &str,
+    outfile: F,
 ) -> Result<String, Box<dyn error::Error>> {
-    assert!(outfile != "-");
-    if let Some(outdir) = Path::new(outfile).parent() {
+    let outfile = outfile.as_ref();
+
+    if let Some(outdir) = outfile.parent() {
         fs::create_dir_all(outdir)?;
     }
 
@@ -382,7 +400,7 @@ pub fn keypair_from_seed_phrase_and_passphrase(
     seed_phrase: &str,
     passphrase: &str,
 ) -> Result<Keypair, Box<dyn error::Error>> {
-    const PBKDF2_ROUNDS: usize = 2048;
+    const PBKDF2_ROUNDS: u32 = 2048;
     const PBKDF2_BYTES: usize = 64;
 
     let salt = format!("mnemonic{}", passphrase);
@@ -510,6 +528,16 @@ mod tests {
         assert_eq!(
             signature_base58_str.parse::<Signature>(),
             Err(ParseSignatureError::Invalid)
+        );
+
+        // too long input string
+        // longest valid encoding
+        let mut too_long = bs58::encode(&[255u8; SIGNATURE_BYTES]).into_string();
+        // and one to grow on
+        too_long.push('1');
+        assert_eq!(
+            too_long.parse::<Signature>(),
+            Err(ParseSignatureError::WrongSize)
         );
     }
 

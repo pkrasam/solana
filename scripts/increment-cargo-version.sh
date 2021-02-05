@@ -16,22 +16,22 @@ EOF
 here="$(dirname "$0")"
 cd "$here"/..
 source ci/semver_bash/semver.sh
+source scripts/read-cargo-variable.sh
 
-readCargoVariable() {
-  declare variable="$1"
-  declare Cargo_toml="$2"
+ignores=(
+  .cache
+  .cargo
+  target
+  web3.js/examples
+)
 
-  while read -r name equals value _; do
-    if [[ $name = "$variable" && $equals = = ]]; then
-      echo "${value//\"/}"
-      return
-    fi
-  done < <(cat "$Cargo_toml")
-  echo "Unable to locate $variable in $Cargo_toml" 1>&2
-}
+not_paths=()
+for ignore in "${ignores[@]}"; do
+  not_paths+=(-not -path "*/$ignore/*")
+done
 
-# shellcheck disable=2207
-Cargo_tomls=($(find . -name Cargo.toml -not -path './web3.js/examples/*'))
+# shellcheck disable=2207,SC2068 # Don't want a positional arg if `not-paths` is empty
+Cargo_tomls=($(find . -mindepth 2 -name Cargo.toml ${not_paths[@]}))
 # shellcheck disable=2207
 markdownFiles=($(find . -name "*.md"))
 
@@ -77,6 +77,19 @@ minor)
   PATCH=0
   ;;
 dropspecial)
+  ;;
+check)
+  badTomls=()
+  for Cargo_toml in "${Cargo_tomls[@]}"; do
+    if ! grep "^version *= *\"$currentVersion\"$" "$Cargo_toml" &>/dev/null; then
+      badTomls+=("$Cargo_toml")
+    fi
+  done
+  if [[ ${#badTomls[@]} -ne 0 ]]; then
+    echo "Error: Incorrect crate version specified in: ${badTomls[*]}"
+    exit 1
+  fi
+  exit 0
   ;;
 -*)
   if [[ $1 =~ ^-[A-Za-z0-9]*$ ]]; then

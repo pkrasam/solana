@@ -6,31 +6,62 @@ import {
   useTransactionDetails,
 } from "providers/transactions";
 import { useFetchTransactionDetails } from "providers/transactions/details";
-import { useCluster, ClusterStatus } from "providers/cluster";
+import { useCluster, ClusterStatus, Cluster } from "providers/cluster";
 import {
   TransactionSignature,
   SystemProgram,
-  StakeProgram,
   SystemInstruction,
+  ParsedInstruction,
+  PartiallyDecodedInstruction,
+  SignatureResult,
+  ParsedTransaction,
+  ParsedInnerInstruction,
+  Transaction,
 } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 import { lamportsToSolString } from "utils";
 import { UnknownDetailsCard } from "components/instruction/UnknownDetailsCard";
 import { SystemDetailsCard } from "components/instruction/system/SystemDetailsCard";
 import { StakeDetailsCard } from "components/instruction/stake/StakeDetailsCard";
+import { BpfLoaderDetailsCard } from "components/instruction/bpf-loader/BpfLoaderDetailsCard";
 import { ErrorCard } from "components/common/ErrorCard";
 import { LoadingCard } from "components/common/LoadingCard";
 import { TableCardBody } from "components/common/TableCardBody";
 import { displayTimestamp } from "utils/date";
 import { InfoTooltip } from "components/common/InfoTooltip";
-import { isCached } from "providers/transactions/cached";
 import { Address } from "components/common/Address";
 import { Signature } from "components/common/Signature";
 import { intoTransactionInstruction } from "utils/tx";
 import { TokenDetailsCard } from "components/instruction/token/TokenDetailsCard";
 import { FetchStatus } from "providers/cache";
+import { SerumDetailsCard } from "components/instruction/SerumDetailsCard";
+import { Slot } from "components/common/Slot";
+import { isTokenSwapInstruction } from "components/instruction/token-swap/types";
+import { TokenSwapDetailsCard } from "components/instruction/TokenSwapDetailsCard";
+import { isSerumInstruction } from "components/instruction/serum/types";
+import { MemoDetailsCard } from "components/instruction/MemoDetailsCard";
 
-type Props = { signature: TransactionSignature };
-export function TransactionDetailsPage({ signature: raw }: Props) {
+const AUTO_REFRESH_INTERVAL = 2000;
+const ZERO_CONFIRMATION_BAILOUT = 5;
+export const INNER_INSTRUCTIONS_START_SLOT = 46915769;
+
+type SignatureProps = {
+  signature: TransactionSignature;
+};
+
+export const SignatureContext = React.createContext("");
+
+enum AutoRefresh {
+  Active,
+  Inactive,
+  BailedOut,
+}
+
+type AutoRefreshProps = {
+  autoRefresh: AutoRefresh;
+};
+
+export function TransactionDetailsPage({ signature: raw }: SignatureProps) {
   let signature: TransactionSignature | undefined;
 
   try {
@@ -39,6 +70,38 @@ export function TransactionDetailsPage({ signature: raw }: Props) {
       signature = raw;
     }
   } catch (err) {}
+
+  const status = useTransactionStatus(signature);
+  const [zeroConfirmationRetries, setZeroConfirmationRetries] = React.useState(
+    0
+  );
+
+  let autoRefresh = AutoRefresh.Inactive;
+
+  if (zeroConfirmationRetries >= ZERO_CONFIRMATION_BAILOUT) {
+    autoRefresh = AutoRefresh.BailedOut;
+  } else if (status?.data?.info && status.data.info.confirmations !== "max") {
+    autoRefresh = AutoRefresh.Active;
+  }
+
+  React.useEffect(() => {
+    if (
+      status?.status === FetchStatus.Fetched &&
+      status.data?.info &&
+      status.data.info.confirmations === 0
+    ) {
+      setZeroConfirmationRetries((retries) => retries + 1);
+    }
+  }, [status]);
+
+  React.useEffect(() => {
+    if (
+      status?.status === FetchStatus.Fetching &&
+      autoRefresh === AutoRefresh.BailedOut
+    ) {
+      setZeroConfirmationRetries(0);
+    }
+  }, [status, autoRefresh, setZeroConfirmationRetries]);
 
   return (
     <div className="container mt-n3">
@@ -52,28 +115,26 @@ export function TransactionDetailsPage({ signature: raw }: Props) {
         <ErrorCard text={`Signature "${raw}" is not valid`} />
       ) : (
         <>
-          <StatusCard signature={signature} />
-          <AccountsCard signature={signature} />
-          <InstructionsSection signature={signature} />
+          <StatusCard signature={signature} autoRefresh={autoRefresh} />
+          <AccountsCard signature={signature} autoRefresh={autoRefresh} />
+          <SignatureContext.Provider value={signature}>
+            <InstructionsSection signature={signature} />
+          </SignatureContext.Provider>
+          <ProgramLogSection signature={signature} />
         </>
       )}
     </div>
   );
 }
 
-function StatusCard({ signature }: Props) {
+function StatusCard({
+  signature,
+  autoRefresh,
+}: SignatureProps & AutoRefreshProps) {
   const fetchStatus = useFetchTransactionStatus();
   const status = useTransactionStatus(signature);
-  const fetchDetails = useFetchTransactionDetails();
   const details = useTransactionDetails(signature);
   const { firstAvailableBlock, status: clusterStatus } = useCluster();
-  const refresh = React.useCallback(
-    (signature: string) => {
-      fetchStatus(signature);
-      fetchDetails(signature);
-    },
-    [fetchStatus, fetchDetails]
-  );
 
   // Fetch transaction on load
   React.useEffect(() => {
@@ -82,7 +143,25 @@ function StatusCard({ signature }: Props) {
     }
   }, [signature, clusterStatus]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  if (!status || status.status === FetchStatus.Fetching) {
+  // Effect to set and clear interval for auto-refresh
+  React.useEffect(() => {
+    if (autoRefresh === AutoRefresh.Active) {
+      let intervalHandle: NodeJS.Timeout = setInterval(
+        () => fetchStatus(signature),
+        AUTO_REFRESH_INTERVAL
+      );
+
+      return () => {
+        clearInterval(intervalHandle);
+      };
+    }
+  }, [autoRefresh, fetchStatus, signature]);
+
+  if (
+    !status ||
+    (status.status === FetchStatus.Fetching &&
+      autoRefresh === AutoRefresh.Inactive)
+  ) {
     return <LoadingCard />;
   } else if (status.status === FetchStatus.FetchFailed) {
     return (
@@ -102,6 +181,7 @@ function StatusCard({ signature }: Props) {
   }
 
   const { info } = status.data;
+
   const renderResult = () => {
     let statusClass = "success";
     let statusText = "Success";
@@ -121,8 +201,14 @@ function StatusCard({ signature }: Props) {
   const transaction = details?.data?.transaction?.transaction;
   const blockhash = transaction?.message.recentBlockhash;
   const isNonce = (() => {
-    if (!transaction) return false;
-    const ix = intoTransactionInstruction(transaction, 0);
+    if (!transaction || transaction.message.instructions.length < 1) {
+      return false;
+    }
+
+    const ix = intoTransactionInstruction(
+      transaction,
+      transaction.message.instructions[0]
+    );
     return (
       ix &&
       SystemProgram.programId.equals(ix.programId) &&
@@ -134,13 +220,17 @@ function StatusCard({ signature }: Props) {
     <div className="card">
       <div className="card-header align-items-center">
         <h3 className="card-header-title">Overview</h3>
-        <button
-          className="btn btn-white btn-sm"
-          onClick={() => refresh(signature)}
-        >
-          <span className="fe fe-refresh-cw mr-2"></span>
-          Refresh
-        </button>
+        {autoRefresh === AutoRefresh.Active ? (
+          <span className="spinner-grow spinner-grow-sm"></span>
+        ) : (
+          <button
+            className="btn btn-white btn-sm"
+            onClick={() => fetchStatus(signature)}
+          >
+            <span className="fe fe-refresh-cw mr-2"></span>
+            Refresh
+          </button>
+        )}
       </div>
 
       <TableCardBody>
@@ -180,7 +270,9 @@ function StatusCard({ signature }: Props) {
 
         <tr>
           <td>Block</td>
-          <td className="text-lg-right">{info.slot}</td>
+          <td className="text-lg-right">
+            <Slot slot={info.slot} link />
+          </td>
         </tr>
 
         {blockhash && (
@@ -194,9 +286,7 @@ function StatusCard({ signature }: Props) {
                 </InfoTooltip>
               )}
             </td>
-            <td className="text-lg-right">
-              <code>{blockhash}</code>
-            </td>
+            <td className="text-lg-right">{blockhash}</td>
           </tr>
         )}
 
@@ -211,13 +301,15 @@ function StatusCard({ signature }: Props) {
   );
 }
 
-function AccountsCard({ signature }: Props) {
-  const { url } = useCluster();
+function AccountsCard({
+  signature,
+  autoRefresh,
+}: SignatureProps & AutoRefreshProps) {
   const details = useTransactionDetails(signature);
-  const fetchStatus = useFetchTransactionStatus();
   const fetchDetails = useFetchTransactionDetails();
-  const refreshStatus = () => fetchStatus(signature);
+  const fetchStatus = useFetchTransactionStatus();
   const refreshDetails = () => fetchDetails(signature);
+  const refreshStatus = () => fetchStatus(signature);
   const transaction = details?.data?.transaction?.transaction;
   const message = transaction?.message;
   const status = useTransactionStatus(signature);
@@ -231,27 +323,28 @@ function AccountsCard({ signature }: Props) {
 
   if (!status?.data?.info) {
     return null;
-  } else if (!details) {
+  } else if (autoRefresh === AutoRefresh.BailedOut) {
     return (
       <ErrorCard
-        retry={refreshStatus}
         text="Details are not available until the transaction reaches MAX confirmations"
+        retry={refreshStatus}
       />
     );
-  } else if (details.status === FetchStatus.Fetching) {
+  } else if (autoRefresh === AutoRefresh.Active) {
+    return (
+      <ErrorCard text="Details are not available until the transaction reaches MAX confirmations" />
+    );
+  } else if (!details || details.status === FetchStatus.Fetching) {
     return <LoadingCard />;
   } else if (details.status === FetchStatus.FetchFailed) {
-    return <ErrorCard retry={refreshDetails} text="Fetch Failed" />;
+    return <ErrorCard retry={refreshDetails} text="Failed to fetch details" />;
   } else if (!details.data?.transaction || !message) {
-    return <ErrorCard retry={refreshDetails} text="Not Found" />;
+    return <ErrorCard text="Details are not available" />;
   }
 
   const { meta } = details.data.transaction;
   if (!meta) {
-    if (isCached(url, signature)) {
-      return null;
-    }
-    return <ErrorCard retry={refreshDetails} text="Metadata Missing" />;
+    return <ErrorCard text="Transaction metadata is missing" />;
   }
 
   const accountRows = message.accountKeys.map((account, index) => {
@@ -317,57 +410,78 @@ function AccountsCard({ signature }: Props) {
   );
 }
 
-function InstructionsSection({ signature }: Props) {
+function InstructionsSection({ signature }: SignatureProps) {
   const status = useTransactionStatus(signature);
   const details = useTransactionDetails(signature);
+  const { cluster } = useCluster();
   const fetchDetails = useFetchTransactionDetails();
   const refreshDetails = () => fetchDetails(signature);
 
   if (!status?.data?.info || !details?.data?.transaction) return null;
 
+  const raw = details.data.raw?.transaction;
+
   const { transaction } = details.data.transaction;
+  const { meta } = details.data.transaction;
+
   if (transaction.message.instructions.length === 0) {
     return <ErrorCard retry={refreshDetails} text="No instructions found" />;
   }
 
+  const innerInstructions: {
+    [index: number]: (ParsedInstruction | PartiallyDecodedInstruction)[];
+  } = {};
+
+  if (
+    meta?.innerInstructions &&
+    (cluster !== Cluster.MainnetBeta ||
+      details.data.transaction.slot >= INNER_INSTRUCTIONS_START_SLOT)
+  ) {
+    meta.innerInstructions.forEach((parsed: ParsedInnerInstruction) => {
+      if (!innerInstructions[parsed.index]) {
+        innerInstructions[parsed.index] = [];
+      }
+
+      parsed.instructions.forEach((ix) => {
+        innerInstructions[parsed.index].push(ix);
+      });
+    });
+  }
+
   const result = status.data.info.result;
   const instructionDetails = transaction.message.instructions.map(
-    (next, index) => {
-      if ("parsed" in next) {
-        if (next.program === "spl-token") {
-          return (
-            <TokenDetailsCard
-              key={index}
-              tx={transaction}
-              ix={next}
-              result={result}
-              index={index}
-            />
-          );
-        }
+    (instruction, index) => {
+      let innerCards: JSX.Element[] = [];
 
-        const props = { ix: next, result, index };
-        return <UnknownDetailsCard key={index} {...props} />;
+      if (index in innerInstructions) {
+        innerInstructions[index].forEach((ix, childIndex) => {
+          if (typeof ix.programId === "string") {
+            ix.programId = new PublicKey(ix.programId);
+          }
+
+          let res = renderInstructionCard({
+            index,
+            ix,
+            result,
+            signature,
+            tx: transaction,
+            childIndex,
+            raw,
+          });
+
+          innerCards.push(res);
+        });
       }
 
-      const ix = intoTransactionInstruction(transaction, index);
-      if (!ix) {
-        return (
-          <ErrorCard
-            key={index}
-            text="Could not display this instruction, please report"
-          />
-        );
-      }
-
-      const props = { ix, result, index };
-      if (SystemProgram.programId.equals(ix.programId)) {
-        return <SystemDetailsCard key={index} {...props} />;
-      } else if (StakeProgram.programId.equals(ix.programId)) {
-        return <StakeDetailsCard key={index} {...props} />;
-      } else {
-        return <UnknownDetailsCard key={index} {...props} />;
-      }
+      return renderInstructionCard({
+        index,
+        ix: instruction,
+        result,
+        signature,
+        tx: transaction,
+        innerCards,
+        raw,
+      });
     }
   );
 
@@ -383,4 +497,126 @@ function InstructionsSection({ signature }: Props) {
       {instructionDetails}
     </>
   );
+}
+
+function ProgramLogSection({ signature }: SignatureProps) {
+  const details = useTransactionDetails(signature);
+  const logMessages = details?.data?.transaction?.meta?.logMessages;
+
+  if (!logMessages || logMessages.length < 1) {
+    return null;
+  }
+
+  return (
+    <>
+      <div className="container">
+        <div className="header">
+          <div className="header-body">
+            <h3 className="card-header-title">Program Log</h3>
+          </div>
+        </div>
+      </div>
+      <div className="card">
+        <ul className="log-messages">
+          {logMessages.map((message, key) => (
+            <li key={key}>{message.replace(/^Program log: /, "")}</li>
+          ))}
+        </ul>
+      </div>
+    </>
+  );
+}
+
+function renderInstructionCard({
+  ix,
+  tx,
+  result,
+  index,
+  signature,
+  innerCards,
+  childIndex,
+  raw,
+}: {
+  ix: ParsedInstruction | PartiallyDecodedInstruction;
+  tx: ParsedTransaction;
+  result: SignatureResult;
+  index: number;
+  signature: TransactionSignature;
+  innerCards?: JSX.Element[];
+  childIndex?: number;
+  raw?: Transaction;
+}) {
+  const key = `${index}-${childIndex}`;
+
+  if ("parsed" in ix) {
+    const props = {
+      tx,
+      ix,
+      result,
+      index,
+      innerCards,
+      childIndex,
+      key,
+    };
+
+    switch (ix.program) {
+      case "spl-token":
+        return <TokenDetailsCard {...props} />;
+      case "bpf-loader":
+        return <BpfLoaderDetailsCard {...props} />;
+      case "system":
+        return <SystemDetailsCard {...props} />;
+      case "stake":
+        return <StakeDetailsCard {...props} />;
+      case "spl-memo":
+        return <MemoDetailsCard {...props} />;
+      default:
+        return <UnknownDetailsCard {...props} />;
+    }
+  }
+
+  // TODO: There is a bug in web3, where inner instructions
+  // aren't getting coerced. This is a temporary fix.
+
+  if (typeof ix.programId === "string") {
+    ix.programId = new PublicKey(ix.programId);
+  }
+
+  ix.accounts = ix.accounts.map((account) => {
+    if (typeof account === "string") {
+      return new PublicKey(account);
+    }
+
+    return account;
+  });
+
+  // TODO: End hotfix
+
+  const transactionIx = intoTransactionInstruction(tx, ix);
+
+  if (!transactionIx) {
+    return (
+      <ErrorCard
+        key={key}
+        text="Could not display this instruction, please report"
+      />
+    );
+  }
+
+  const props = {
+    ix: transactionIx,
+    result,
+    index,
+    signature,
+    innerCards,
+    childIndex,
+  };
+
+  if (isSerumInstruction(transactionIx)) {
+    return <SerumDetailsCard key={key} {...props} />;
+  } else if (isTokenSwapInstruction(transactionIx)) {
+    return <TokenSwapDetailsCard key={key} {...props} />;
+  } else {
+    return <UnknownDetailsCard key={key} {...props} />;
+  }
 }

@@ -1,4 +1,7 @@
-use solana_runtime::bank::Bank;
+use solana_runtime::{
+    accounts_index::{AccountIndex, IndexKey},
+    bank::Bank,
+};
 use solana_sdk::pubkey::Pubkey;
 use solana_stake_program::stake_state::StakeState;
 use std::{collections::HashSet, sync::Arc};
@@ -18,7 +21,24 @@ pub fn calculate_non_circulating_supply(bank: &Arc<Bank>) -> NonCirculatingSuppl
     let withdraw_authority_list = withdraw_authority();
 
     let clock = bank.clock();
-    let stake_accounts = bank.get_program_accounts(Some(&solana_stake_program::id()));
+    let stake_accounts = if bank
+        .rc
+        .accounts
+        .accounts_db
+        .account_indexes
+        .contains(&AccountIndex::ProgramId)
+    {
+        bank.get_filtered_indexed_accounts(
+            &IndexKey::ProgramId(solana_stake_program::id()),
+            // The program-id account index checks for Account owner on inclusion. However, due to
+            // the current AccountsDB implementation, an account may remain in storage as a
+            // zero-lamport Account::Default() after being wiped and reinitialized in later
+            // updates. We include the redundant filter here to avoid returning these accounts.
+            |account| account.owner == solana_stake_program::id(),
+        )
+    } else {
+        bank.get_program_accounts(&solana_stake_program::id())
+    };
     for (pubkey, account) in stake_accounts.iter() {
         let stake_account = StakeState::from(&account).unwrap_or_default();
         match stake_account {
@@ -78,6 +98,27 @@ solana_sdk::pubkeys!(
         "3o6xgkJ9sTmDeQWyfj3sxwon18fXJB9PV5LDc8sfgR4a",
         "GumSE5HsMV5HCwBTv2D2D81yy9x17aDkvobkqAfTRgmo",
         "AzVV9ZZDxTgW4wWfJmsG6ytaHpQGSe1yz76Nyy84VbQF",
+        "8CUUMKYNGxdgYio5CLHRHyzMEhhVRMcqefgE6dLqnVRK",
+        "CQDYc4ET2mbFhVpgj41gXahL6Exn5ZoPcGAzSHuYxwmE",
+        "5PLJZLJiRR9vf7d1JCCg7UuWjtyN9nkab9uok6TqSyuP",
+        "7xJ9CLtEAcEShw9kW2gSoZkRWL566Dg12cvgzANJwbTr",
+        "BuCEvc9ze8UoAQwwsQLy8d447C8sA4zeVtVpc6m5wQeS",
+        "8ndGYFjav6NDXvzYcxs449Aub3AxYv4vYpk89zRDwgj7",
+        "8W58E8JVJjH1jCy5CeHJQgvwFXTyAVyesuXRZGbcSUGG",
+        "GNiz4Mq886bTNDT3pijGsu2gbw6it7sqrwncro45USeB",
+        "GhsotwFMH6XUrRLJCxcx62h7748N2Uq8mf87hUGkmPhg",
+        "Fgyh8EeYGZtbW8sS33YmNQnzx54WXPrJ5KWNPkCfWPot",
+        "8UVjvYyoqP6sqcctTso3xpCdCfgTMiv3VRh7vraC2eJk",
+        "BhvLngiqqKeZ8rpxch2uGjeCiC88zzewoWPRuoxpp1aS",
+        "63DtkW7zuARcd185EmHAkfF44bDcC2SiTSEj2spLP3iA",
+        "GvpCiTgq9dmEeojCDBivoLoZqc4AkbUDACpqPMwYLWKh",
+        "7Y8smnoUrYKGGuDq2uaFKVxJYhojgg7DVixHyAtGTYEV",
+        "DUS1KxwUhUyDKB4A81E8vdnTe3hSahd92Abtn9CXsEcj",
+        "F9MWFw8cnYVwsRq8Am1PGfFL3cQUZV37mbGoxZftzLjN",
+        "8vqrX3H2BYLaXVintse3gorPEM4TgTwTFZNN1Fm9TdYs",
+        "CUageMFi49kzoDqtdU8NvQ4Bq3sbtJygjKDAXJ45nmAi",
+        "5smrYwb1Hr2T8XMnvsqccTgXxuqQs14iuE8RbHFYf2Cf",
+        "xQadXQiUTCCFhfHjvQx1hyJK6KVWr1w2fD6DT3cdwj7",
     ]
 );
 
@@ -96,7 +137,9 @@ solana_sdk::pubkeys!(
 mod tests {
     use super::*;
     use solana_sdk::{
-        account::Account, epoch_schedule::EpochSchedule, genesis_config::GenesisConfig,
+        account::Account,
+        epoch_schedule::EpochSchedule,
+        genesis_config::{ClusterType, GenesisConfig},
     };
     use solana_stake_program::stake_state::{Authorized, Lockup, Meta, StakeState};
     use std::{collections::BTreeMap, sync::Arc};
@@ -112,7 +155,7 @@ mod tests {
         let num_genesis_accounts = 10;
         for _ in 0..num_genesis_accounts {
             accounts.insert(
-                Pubkey::new_rand(),
+                solana_sdk::pubkey::new_rand(),
                 Account::new(balance, 0, &Pubkey::default()),
             );
         }
@@ -124,7 +167,7 @@ mod tests {
 
         let num_stake_accounts = 3;
         for _ in 0..num_stake_accounts {
-            let pubkey = Pubkey::new_rand();
+            let pubkey = solana_sdk::pubkey::new_rand();
             let meta = Meta {
                 authorized: Authorized::auto(&pubkey),
                 lockup: Lockup {
@@ -147,6 +190,7 @@ mod tests {
         let genesis_config = GenesisConfig {
             accounts,
             epoch_schedule: EpochSchedule::new(slots_per_epoch),
+            cluster_type: ClusterType::MainnetBeta,
             ..GenesisConfig::default()
         };
         let mut bank = Arc::new(Bank::new(&genesis_config));

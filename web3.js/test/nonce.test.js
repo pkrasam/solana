@@ -2,7 +2,13 @@
 
 import bs58 from 'bs58';
 
-import {Account, Connection, SystemProgram, PublicKey} from '../src';
+import {
+  Account,
+  Connection,
+  SystemProgram,
+  Transaction,
+  PublicKey,
+} from '../src';
 import {NONCE_ACCOUNT_LENGTH} from '../src/nonce-account';
 import {mockRpc, mockRpcEnabled} from './__mocks__/node-fetch';
 import {mockGetRecentBlockhash} from './mockrpc/get-recent-blockhash';
@@ -14,7 +20,7 @@ if (!mockRpcEnabled) {
   jest.setTimeout(30000);
 }
 
-const expectedData = (authorizedPubkey: PublicKey): string => {
+const expectedData = (authorizedPubkey: PublicKey): [string, string] => {
   const expectedData = Buffer.alloc(NONCE_ACCOUNT_LENGTH);
   expectedData.writeInt32LE(0, 0); // Version, 4 bytes
   expectedData.writeInt32LE(1, 4); // State, 4 bytes
@@ -22,19 +28,19 @@ const expectedData = (authorizedPubkey: PublicKey): string => {
   const mockNonce = new Account();
   mockNonce.publicKey.toBuffer().copy(expectedData, 40); // Hash, 32 bytes
   expectedData.writeUInt16LE(5000, 72); // feeCalculator, 8 bytes
-  return expectedData.toString('base64');
+  return [expectedData.toString('base64'), 'base64'];
 };
 
 test('create and query nonce account', async () => {
   const from = new Account();
   const nonceAccount = new Account();
-  const connection = new Connection(url, 'recent');
+  const connection = new Connection(url, 'singleGossip');
 
   mockRpc.push([
     url,
     {
       method: 'getMinimumBalanceForRentExemption',
-      params: [NONCE_ACCOUNT_LENGTH, {commitment: 'recent'}],
+      params: [NONCE_ACCOUNT_LENGTH, {commitment: 'singleGossip'}],
     },
     {
       error: null,
@@ -64,13 +70,13 @@ test('create and query nonce account', async () => {
     minimumAmount * 2,
   );
   mockConfirmTransaction(signature);
-  await connection.confirmTransaction(signature, 0);
+  await connection.confirmTransaction(signature, 'singleGossip');
 
   mockRpc.push([
     url,
     {
       method: 'getBalance',
-      params: [from.publicKey.toBase58(), {commitment: 'recent'}],
+      params: [from.publicKey.toBase58(), {commitment: 'singleGossip'}],
     },
     {
       error: null,
@@ -99,12 +105,14 @@ test('create and query nonce account', async () => {
     },
   ]);
 
-  const transaction = SystemProgram.createNonceAccount({
-    fromPubkey: from.publicKey,
-    noncePubkey: nonceAccount.publicKey,
-    authorizedPubkey: from.publicKey,
-    lamports: minimumAmount,
-  });
+  const transaction = new Transaction().add(
+    SystemProgram.createNonceAccount({
+      fromPubkey: from.publicKey,
+      noncePubkey: nonceAccount.publicKey,
+      authorizedPubkey: from.publicKey,
+      lamports: minimumAmount,
+    }),
+  );
   const nonceSignature = await connection.sendTransaction(
     transaction,
     [from, nonceAccount],
@@ -113,13 +121,16 @@ test('create and query nonce account', async () => {
     },
   );
   mockConfirmTransaction(nonceSignature);
-  await connection.confirmTransaction(nonceSignature, 0);
+  await connection.confirmTransaction(nonceSignature, 'singleGossip');
 
   mockRpc.push([
     url,
     {
       method: 'getAccountInfo',
-      params: [nonceAccount.publicKey.toBase58(), {commitment: 'recent'}],
+      params: [
+        nonceAccount.publicKey.toBase58(),
+        {encoding: 'base64', commitment: 'singleGossip'},
+      ],
     },
     {
       error: null,
@@ -154,13 +165,13 @@ test('create and query nonce account with seed', async () => {
     seed,
     SystemProgram.programId,
   );
-  const connection = new Connection(url, 'recent');
+  const connection = new Connection(url, 'singleGossip');
 
   mockRpc.push([
     url,
     {
       method: 'getMinimumBalanceForRentExemption',
-      params: [NONCE_ACCOUNT_LENGTH, {commitment: 'recent'}],
+      params: [NONCE_ACCOUNT_LENGTH, {commitment: 'singleGossip'}],
     },
     {
       error: null,
@@ -190,13 +201,13 @@ test('create and query nonce account with seed', async () => {
     minimumAmount * 2,
   );
   mockConfirmTransaction(signature);
-  await connection.confirmTransaction(signature, 0);
+  await connection.confirmTransaction(signature, 'singleGossip');
 
   mockRpc.push([
     url,
     {
       method: 'getBalance',
-      params: [from.publicKey.toBase58(), {commitment: 'recent'}],
+      params: [from.publicKey.toBase58(), {commitment: 'singleGossip'}],
     },
     {
       error: null,
@@ -225,25 +236,30 @@ test('create and query nonce account with seed', async () => {
     },
   ]);
 
-  const transaction = SystemProgram.createNonceAccount({
-    fromPubkey: from.publicKey,
-    noncePubkey: noncePubkey,
-    basePubkey: from.publicKey,
-    seed,
-    authorizedPubkey: from.publicKey,
-    lamports: minimumAmount,
-  });
+  const transaction = new Transaction().add(
+    SystemProgram.createNonceAccount({
+      fromPubkey: from.publicKey,
+      noncePubkey: noncePubkey,
+      basePubkey: from.publicKey,
+      seed,
+      authorizedPubkey: from.publicKey,
+      lamports: minimumAmount,
+    }),
+  );
   const nonceSignature = await connection.sendTransaction(transaction, [from], {
     skipPreflight: true,
   });
   mockConfirmTransaction(nonceSignature);
-  await connection.confirmTransaction(nonceSignature, 0);
+  await connection.confirmTransaction(nonceSignature, 'singleGossip');
 
   mockRpc.push([
     url,
     {
       method: 'getAccountInfo',
-      params: [noncePubkey.toBase58(), {commitment: 'recent'}],
+      params: [
+        noncePubkey.toBase58(),
+        {encoding: 'base64', commitment: 'singleGossip'},
+      ],
     },
     {
       error: null,

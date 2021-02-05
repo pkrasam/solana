@@ -19,8 +19,8 @@ use crate::{
 use bincode::serialized_size;
 use indexmap::map::IndexMap;
 use itertools::Itertools;
-use rand::{self, seq::SliceRandom, thread_rng, RngCore};
-use solana_runtime::bloom::Bloom;
+use rand::{seq::SliceRandom, Rng};
+use solana_runtime::bloom::{AtomicBloom, Bloom};
 use solana_sdk::{hash::Hash, packet::PACKET_DATA_SIZE, pubkey::Pubkey, timing::timestamp};
 use std::{
     cmp,
@@ -35,14 +35,18 @@ pub const CRDS_GOSSIP_PUSH_FANOUT: usize = 6;
 pub const CRDS_GOSSIP_PUSH_MSG_TIMEOUT_MS: u64 = 30000;
 pub const CRDS_GOSSIP_PRUNE_MSG_TIMEOUT_MS: u64 = 500;
 pub const CRDS_GOSSIP_PRUNE_STAKE_THRESHOLD_PCT: f64 = 0.15;
-pub const CRDS_GOSSIP_PRUNE_MIN_INGRESS_NODES: usize = 2;
+pub const CRDS_GOSSIP_PRUNE_MIN_INGRESS_NODES: usize = 3;
+// Do not push to peers which have not been updated for this long.
+const PUSH_ACTIVE_TIMEOUT_MS: u64 = 60_000;
 
-#[derive(Clone)]
+// 10 minutes
+const MAX_PUSHED_TO_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+
 pub struct CrdsGossipPush {
     /// max bytes per message
     pub max_bytes: usize,
     /// active set of validators for push
-    active_set: IndexMap<Pubkey, Bloom<Pubkey>>,
+    active_set: IndexMap<Pubkey, AtomicBloom<Pubkey>>,
     /// push message queue
     push_messages: HashMap<CrdsValueLabel, Hash>,
     /// Cache that tracks which validators a message was received from
@@ -50,6 +54,8 @@ pub struct CrdsGossipPush {
     /// This cache represents a lagging view of which validators
     /// currently have this node in their `active_set`
     received_cache: HashMap<Pubkey, HashMap<Pubkey, (bool, u64)>>,
+    last_pushed_to: HashMap<Pubkey, u64>,
+    last_pushed_to_cleanup_ts: u64,
     pub num_active: usize,
     pub push_fanout: usize,
     pub msg_timeout: u64,
@@ -67,6 +73,8 @@ impl Default for CrdsGossipPush {
             active_set: IndexMap::new(),
             push_messages: HashMap::new(),
             received_cache: HashMap::new(),
+            last_pushed_to: HashMap::new(),
+            last_pushed_to_cleanup_ts: 0,
             num_active: CRDS_GOSSIP_NUM_ACTIVE,
             push_fanout: CRDS_GOSSIP_PUSH_FANOUT,
             msg_timeout: CRDS_GOSSIP_PUSH_MSG_TIMEOUT_MS,
@@ -119,7 +127,7 @@ impl CrdsGossipPush {
             .collect();
 
         let mut seed = [0; 32];
-        seed[0..8].copy_from_slice(&thread_rng().next_u64().to_le_bytes());
+        rand::thread_rng().fill(&mut seed[..]);
         let shuffle = weighted_shuffle(
             staked_peers.iter().map(|(_, stake)| *stake).collect_vec(),
             seed,
@@ -127,8 +135,12 @@ impl CrdsGossipPush {
 
         let mut keep = HashSet::new();
         let mut peer_stake_sum = 0;
+        keep.insert(*origin);
         for next in shuffle {
             let (next_peer, next_stake) = staked_peers[next];
+            if next_peer == *origin {
+                continue;
+            }
             keep.insert(next_peer);
             peer_stake_sum += next_stake;
             if peer_stake_sum >= prune_stake_threshold
@@ -163,12 +175,7 @@ impl CrdsGossipPush {
         now: u64,
     ) -> Result<Option<VersionedCrdsValue>, CrdsGossipError> {
         self.num_total += 1;
-        if now
-            > value
-                .wallclock()
-                .checked_add(self.msg_timeout)
-                .unwrap_or_else(|| 0)
-        {
+        if now > value.wallclock().checked_add(self.msg_timeout).unwrap_or(0) {
             return Err(CrdsGossipError::PushMessageTimeout);
         }
         if now + self.msg_timeout < value.wallclock() {
@@ -196,7 +203,7 @@ impl CrdsGossipPush {
     /// push pull responses
     pub fn push_pull_responses(&mut self, values: Vec<(CrdsValueLabel, Hash, u64)>, now: u64) {
         for (label, value_hash, wc) in values {
-            if now > wc.checked_add(self.msg_timeout).unwrap_or_else(|| 0) {
+            if now > wc.checked_add(self.msg_timeout).unwrap_or(0) {
                 continue;
             }
             self.push_messages.insert(label, value_hash);
@@ -209,62 +216,77 @@ impl CrdsGossipPush {
     /// The list of push messages is created such that all the randomly selected peers have not
     /// pruned the source addresses.
     pub fn new_push_messages(&mut self, crds: &Crds, now: u64) -> HashMap<Pubkey, Vec<CrdsValue>> {
-        let mut total_bytes: usize = 0;
-        let mut values = vec![];
-        let mut push_messages: HashMap<Pubkey, Vec<CrdsValue>> = HashMap::new();
         trace!("new_push_messages {}", self.push_messages.len());
-        for (label, hash) in &self.push_messages {
-            let res = crds.lookup_versioned(label);
-            if res.is_none() {
-                continue;
-            }
-            let version = res.unwrap();
-            if version.value_hash != *hash {
-                continue;
-            }
-            let value = &version.value;
-            if value.wallclock() > now || value.wallclock() + self.msg_timeout < now {
-                continue;
-            }
-            total_bytes += serialized_size(value).unwrap() as usize;
-            if total_bytes > self.max_bytes {
-                break;
-            }
-            values.push(value.clone());
+        let push_fanout = self.push_fanout.min(self.active_set.len());
+        if push_fanout == 0 {
+            return HashMap::default();
         }
-        trace!(
-            "new_push_messages {} {}",
-            values.len(),
-            self.active_set.len()
-        );
-        for v in values {
+        let mut num_pushes = 0;
+        let mut num_values = 0;
+        let mut total_bytes: usize = 0;
+        let mut labels = vec![];
+        let mut push_messages: HashMap<Pubkey, Vec<CrdsValue>> = HashMap::new();
+        let cutoff = now.saturating_sub(self.msg_timeout);
+        let lookup = |label, &hash| -> Option<&CrdsValue> {
+            let value = crds.lookup_versioned(label)?;
+            if value.value_hash != hash || value.value.wallclock() < cutoff {
+                None
+            } else {
+                Some(&value.value)
+            }
+        };
+        let mut push_value = |origin: Pubkey, value: &CrdsValue| {
             //use a consistent index for the same origin so
             //the active set learns the MST for that origin
-            let start = v.label().pubkey().as_ref()[0] as usize;
-            let max = self.push_fanout.min(self.active_set.len());
-            for i in start..(start + max) {
-                let ix = i % self.active_set.len();
-                if let Some((p, filter)) = self.active_set.get_index(ix) {
-                    if !filter.contains(&v.label().pubkey()) {
-                        trace!("new_push_messages insert {} {:?}", *p, v);
-                        push_messages.entry(*p).or_default().push(v.clone());
-                        self.num_pushes += 1;
-                    }
+            let start = origin.as_ref()[0] as usize;
+            for i in start..(start + push_fanout) {
+                let index = i % self.active_set.len();
+                let (peer, filter) = self.active_set.get_index(index).unwrap();
+                if !filter.contains(&origin) || value.should_force_push(peer) {
+                    trace!("new_push_messages insert {} {:?}", *peer, value);
+                    push_messages.entry(*peer).or_default().push(value.clone());
+                    num_pushes += 1;
                 }
-                self.push_messages.remove(&v.label());
             }
+        };
+        for (label, hash) in &self.push_messages {
+            match lookup(label, hash) {
+                None => labels.push(label.clone()),
+                Some(value) if value.wallclock() > now => continue,
+                Some(value) => {
+                    total_bytes += serialized_size(value).unwrap() as usize;
+                    if total_bytes > self.max_bytes {
+                        break;
+                    }
+                    num_values += 1;
+                    labels.push(label.clone());
+                    push_value(label.pubkey(), value);
+                }
+            }
+        }
+        self.num_pushes += num_pushes;
+        trace!("new_push_messages {} {}", num_values, self.active_set.len());
+        for label in labels {
+            self.push_messages.remove(&label);
+        }
+        for target_pubkey in push_messages.keys() {
+            *self.last_pushed_to.entry(*target_pubkey).or_insert(0) = now;
+        }
+        if now - self.last_pushed_to_cleanup_ts > MAX_PUSHED_TO_TIMEOUT_MS {
+            self.last_pushed_to
+                .retain(|_id, timestamp| now - *timestamp > MAX_PUSHED_TO_TIMEOUT_MS);
+            self.last_pushed_to_cleanup_ts = now;
         }
         push_messages
     }
 
     /// add the `from` to the peer's filter of nodes
-    pub fn process_prune_msg(&mut self, self_pubkey: &Pubkey, peer: &Pubkey, origins: &[Pubkey]) {
-        for origin in origins {
-            if origin == self_pubkey {
-                continue;
-            }
-            if let Some(p) = self.active_set.get_mut(peer) {
-                p.add(origin)
+    pub fn process_prune_msg(&self, self_pubkey: &Pubkey, peer: &Pubkey, origins: &[Pubkey]) {
+        if let Some(filter) = self.active_set.get(peer) {
+            for origin in origins {
+                if origin != self_pubkey {
+                    filter.add(origin);
+                }
             }
         }
     }
@@ -280,21 +302,29 @@ impl CrdsGossipPush {
         &mut self,
         crds: &Crds,
         stakes: &HashMap<Pubkey, u64>,
+        gossip_validators: Option<&HashSet<Pubkey>>,
         self_id: &Pubkey,
         self_shred_version: u16,
         network_size: usize,
         ratio: usize,
     ) {
+        let mut rng = rand::thread_rng();
         let need = Self::compute_need(self.num_active, self.active_set.len(), ratio);
         let mut new_items = HashMap::new();
 
-        let options: Vec<_> = self.push_options(crds, &self_id, self_shred_version, stakes);
+        let options: Vec<_> = self.push_options(
+            crds,
+            &self_id,
+            self_shred_version,
+            stakes,
+            gossip_validators,
+        );
         if options.is_empty() {
             return;
         }
 
         let mut seed = [0; 32];
-        seed[0..8].copy_from_slice(&thread_rng().next_u64().to_le_bytes());
+        rng.fill(&mut seed[..]);
         let mut shuffle = weighted_shuffle(
             options.iter().map(|weighted| weighted.0).collect_vec(),
             seed,
@@ -312,7 +342,7 @@ impl CrdsGossipPush {
                         continue;
                     }
                     let size = cmp::max(CRDS_GOSSIP_DEFAULT_BLOOM_ITEMS, network_size);
-                    let mut bloom = Bloom::random(size, 0.1, 1024 * 8 * 4);
+                    let bloom: AtomicBloom<_> = Bloom::random(size, 0.1, 1024 * 8 * 4).into();
                     bloom.add(&item.id);
                     new_items.insert(item.id, bloom);
                 }
@@ -320,7 +350,7 @@ impl CrdsGossipPush {
             }
         }
         let mut keys: Vec<Pubkey> = self.active_set.keys().cloned().collect();
-        keys.shuffle(&mut rand::thread_rng());
+        keys.shuffle(&mut rng);
         let num = keys.len() / ratio;
         for k in &keys[..num] {
             self.active_set.swap_remove(k);
@@ -336,22 +366,37 @@ impl CrdsGossipPush {
         self_id: &Pubkey,
         self_shred_version: u16,
         stakes: &HashMap<Pubkey, u64>,
+        gossip_validators: Option<&HashSet<Pubkey>>,
     ) -> Vec<(f32, &'a ContactInfo)> {
-        crds.table
-            .values()
-            .filter(|v| v.value.contact_info().is_some())
-            .map(|v| (v.value.contact_info().unwrap(), v))
-            .filter(|(info, _)| {
+        let now = timestamp();
+        let mut rng = rand::thread_rng();
+        let max_weight = u16::MAX as f32 - 1.0;
+        let active_cutoff = now.saturating_sub(PUSH_ACTIVE_TIMEOUT_MS);
+        crds.get_nodes()
+            .filter_map(|value| {
+                let info = value.value.contact_info().unwrap();
+                // Stop pushing to nodes which have not been active recently.
+                if value.local_timestamp < active_cutoff {
+                    // In order to mitigate eclipse attack, for staked nodes
+                    // continue retrying periodically.
+                    let stake = stakes.get(&info.id).unwrap_or(&0);
+                    if *stake == 0 || !rng.gen_ratio(1, 16) {
+                        return None;
+                    }
+                }
+                Some(info)
+            })
+            .filter(|info| {
                 info.id != *self_id
                     && ContactInfo::is_valid_address(&info.gossip)
-                    && (self_shred_version == 0
-                        || info.shred_version == 0
-                        || self_shred_version == info.shred_version)
+                    && self_shred_version == info.shred_version
+                    && gossip_validators.map_or(true, |gossip_validators| {
+                        gossip_validators.contains(&info.id)
+                    })
             })
-            .map(|(info, value)| {
-                let max_weight = f32::from(u16::max_value()) - 1.0;
-                let last_updated: u64 = value.local_timestamp;
-                let since = ((timestamp() - last_updated) / 1024) as u32;
+            .map(|info| {
+                let last_pushed_to: u64 = *self.last_pushed_to.get(&info.id).unwrap_or(&0);
+                let since = (now.saturating_sub(last_pushed_to) / 1024) as u32;
                 let stake = get_stake(&info.id, stakes);
                 let weight = get_weight(max_weight, since, stake);
                 (weight, info)
@@ -361,34 +406,34 @@ impl CrdsGossipPush {
 
     /// purge old pending push messages
     pub fn purge_old_pending_push_messages(&mut self, crds: &Crds, min_time: u64) {
-        let old_msgs: Vec<CrdsValueLabel> = self
-            .push_messages
-            .iter()
-            .filter_map(|(k, hash)| {
-                if let Some(versioned) = crds.lookup_versioned(k) {
-                    if versioned.value.wallclock() < min_time || versioned.value_hash != *hash {
-                        Some(k)
-                    } else {
-                        None
-                    }
-                } else {
-                    Some(k)
-                }
-            })
-            .cloned()
-            .collect();
-        for k in old_msgs {
-            self.push_messages.remove(&k);
-        }
+        self.push_messages.retain(|k, hash| {
+            matches!(crds.lookup_versioned(k), Some(versioned) if
+                         versioned.value.wallclock() >= min_time
+                         && versioned.value_hash == *hash)
+        });
     }
 
     /// purge received push message cache
     pub fn purge_old_received_cache(&mut self, min_time: u64) {
-        self.received_cache
-            .iter_mut()
-            .for_each(|v| v.1.retain(|_, v| v.1 > min_time));
+        self.received_cache.retain(|_, v| {
+            v.retain(|_, (_, t)| *t > min_time);
+            !v.is_empty()
+        });
+    }
 
-        self.received_cache.retain(|_, v| !v.is_empty());
+    // Only for tests and simulations.
+    pub(crate) fn mock_clone(&self) -> Self {
+        let mut active_set = IndexMap::<Pubkey, AtomicBloom<Pubkey>>::new();
+        for (k, v) in &self.active_set {
+            active_set.insert(*k, v.mock_clone());
+        }
+        Self {
+            active_set,
+            push_messages: self.push_messages.clone(),
+            received_cache: self.received_cache.clone(),
+            last_pushed_to: self.last_pushed_to.clone(),
+            ..*self
+        }
     }
 }
 
@@ -404,15 +449,15 @@ mod test {
         let mut push = CrdsGossipPush::default();
         let mut stakes = HashMap::new();
 
-        let self_id = Pubkey::new_rand();
-        let origin = Pubkey::new_rand();
+        let self_id = solana_sdk::pubkey::new_rand();
+        let origin = solana_sdk::pubkey::new_rand();
         stakes.insert(self_id, 100);
         stakes.insert(origin, 100);
 
         let value = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
             &origin, 0,
         )));
-        let low_staked_peers = (0..10).map(|_| Pubkey::new_rand());
+        let low_staked_peers = (0..10).map(|_| solana_sdk::pubkey::new_rand());
         let mut low_staked_set = HashSet::new();
         low_staked_peers.for_each(|p| {
             let _ = push.process_push_message(&mut crds, &p, value.clone(), 0);
@@ -426,7 +471,7 @@ mod test {
             "should not prune if min threshold has not been reached"
         );
 
-        let high_staked_peer = Pubkey::new_rand();
+        let high_staked_peer = solana_sdk::pubkey::new_rand();
         let high_stake = CrdsGossipPush::prune_stake_threshold(100, 100) + 10;
         stakes.insert(high_staked_peer, high_stake);
         let _ = push.process_push_message(&mut crds, &high_staked_peer, value, 0);
@@ -449,7 +494,7 @@ mod test {
         let mut crds = Crds::default();
         let mut push = CrdsGossipPush::default();
         let value = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-            &Pubkey::new_rand(),
+            &solana_sdk::pubkey::new_rand(),
             0,
         )));
         let label = value.label();
@@ -470,7 +515,7 @@ mod test {
     fn test_process_push_old_version() {
         let mut crds = Crds::default();
         let mut push = CrdsGossipPush::default();
-        let mut ci = ContactInfo::new_localhost(&Pubkey::new_rand(), 0);
+        let mut ci = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), 0);
         ci.wallclock = 1;
         let value = CrdsValue::new_unsigned(CrdsData::ContactInfo(ci.clone()));
 
@@ -493,7 +538,7 @@ mod test {
         let mut crds = Crds::default();
         let mut push = CrdsGossipPush::default();
         let timeout = push.msg_timeout;
-        let mut ci = ContactInfo::new_localhost(&Pubkey::new_rand(), 0);
+        let mut ci = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), 0);
 
         // push a version to far in the future
         ci.wallclock = timeout + 1;
@@ -515,7 +560,7 @@ mod test {
     fn test_process_push_update() {
         let mut crds = Crds::default();
         let mut push = CrdsGossipPush::default();
-        let mut ci = ContactInfo::new_localhost(&Pubkey::new_rand(), 0);
+        let mut ci = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), 0);
         ci.wallclock = 0;
         let value_old = CrdsValue::new_unsigned(CrdsData::ContactInfo(ci.clone()));
 
@@ -546,25 +591,26 @@ mod test {
     #[test]
     fn test_refresh_active_set() {
         solana_logger::setup();
+        let now = timestamp();
         let mut crds = Crds::default();
         let mut push = CrdsGossipPush::default();
         let value1 = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-            &Pubkey::new_rand(),
+            &solana_sdk::pubkey::new_rand(),
             0,
         )));
 
-        assert_eq!(crds.insert(value1.clone(), 0), Ok(None));
-        push.refresh_push_active_set(&crds, &HashMap::new(), &Pubkey::default(), 0, 1, 1);
+        assert_eq!(crds.insert(value1.clone(), now), Ok(None));
+        push.refresh_push_active_set(&crds, &HashMap::new(), None, &Pubkey::default(), 0, 1, 1);
 
         assert!(push.active_set.get(&value1.label().pubkey()).is_some());
         let value2 = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-            &Pubkey::new_rand(),
+            &solana_sdk::pubkey::new_rand(),
             0,
         )));
         assert!(push.active_set.get(&value2.label().pubkey()).is_none());
-        assert_eq!(crds.insert(value2.clone(), 0), Ok(None));
+        assert_eq!(crds.insert(value2.clone(), now), Ok(None));
         for _ in 0..30 {
-            push.refresh_push_active_set(&crds, &HashMap::new(), &Pubkey::default(), 0, 1, 1);
+            push.refresh_push_active_set(&crds, &HashMap::new(), None, &Pubkey::default(), 0, 1, 1);
             if push.active_set.get(&value2.label().pubkey()).is_some() {
                 break;
             }
@@ -573,29 +619,31 @@ mod test {
 
         for _ in 0..push.num_active {
             let value2 = CrdsValue::new_unsigned(CrdsData::ContactInfo(
-                ContactInfo::new_localhost(&Pubkey::new_rand(), 0),
+                ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), 0),
             ));
-            assert_eq!(crds.insert(value2.clone(), 0), Ok(None));
+            assert_eq!(crds.insert(value2.clone(), now), Ok(None));
         }
-        push.refresh_push_active_set(&crds, &HashMap::new(), &Pubkey::default(), 0, 1, 1);
+        push.refresh_push_active_set(&crds, &HashMap::new(), None, &Pubkey::default(), 0, 1, 1);
         assert_eq!(push.active_set.len(), push.num_active);
     }
     #[test]
     fn test_active_set_refresh_with_bank() {
+        solana_logger::setup();
         let time = timestamp() - 1024; //make sure there's at least a 1 second delay
         let mut crds = Crds::default();
-        let push = CrdsGossipPush::default();
+        let mut push = CrdsGossipPush::default();
         let mut stakes = HashMap::new();
         for i in 1..=100 {
             let peer = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-                &Pubkey::new_rand(),
+                &solana_sdk::pubkey::new_rand(),
                 time,
             )));
             let id = peer.label().pubkey();
             crds.insert(peer.clone(), time).unwrap();
             stakes.insert(id, i * 100);
+            push.last_pushed_to.insert(id, time);
         }
-        let mut options = push.push_options(&crds, &Pubkey::default(), 0, &stakes);
+        let mut options = push.push_options(&crds, &Pubkey::default(), 0, &stakes, None);
         assert!(!options.is_empty());
         options.sort_by(|(weight_l, _), (weight_r, _)| weight_r.partial_cmp(weight_l).unwrap());
         // check that the highest stake holder is also the heaviest weighted.
@@ -607,6 +655,7 @@ mod test {
 
     #[test]
     fn test_no_pushes_to_from_different_shred_versions() {
+        let now = timestamp();
         let mut crds = Crds::default();
         let stakes = HashMap::new();
         let node = CrdsGossipPush::default();
@@ -614,69 +663,127 @@ mod test {
         let gossip = socketaddr!("127.0.0.1:1234");
 
         let me = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo {
-            id: Pubkey::new_rand(),
+            id: solana_sdk::pubkey::new_rand(),
             shred_version: 123,
             gossip,
             ..ContactInfo::default()
         }));
         let spy = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo {
-            id: Pubkey::new_rand(),
+            id: solana_sdk::pubkey::new_rand(),
             shred_version: 0,
             gossip,
             ..ContactInfo::default()
         }));
         let node_123 = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo {
-            id: Pubkey::new_rand(),
+            id: solana_sdk::pubkey::new_rand(),
             shred_version: 123,
             gossip,
             ..ContactInfo::default()
         }));
         let node_456 = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo {
-            id: Pubkey::new_rand(),
+            id: solana_sdk::pubkey::new_rand(),
             shred_version: 456,
             gossip,
             ..ContactInfo::default()
         }));
 
-        crds.insert(me.clone(), 0).unwrap();
-        crds.insert(spy.clone(), 0).unwrap();
-        crds.insert(node_123.clone(), 0).unwrap();
-        crds.insert(node_456.clone(), 0).unwrap();
+        crds.insert(me.clone(), now).unwrap();
+        crds.insert(spy.clone(), now).unwrap();
+        crds.insert(node_123.clone(), now).unwrap();
+        crds.insert(node_456, now).unwrap();
 
-        // shred version 123 should ignore 456 nodes
+        // shred version 123 should ignore nodes with versions 0 and 456
         let options = node
-            .push_options(&crds, &me.label().pubkey(), 123, &stakes)
+            .push_options(&crds, &me.label().pubkey(), 123, &stakes, None)
             .iter()
             .map(|(_, c)| c.id)
             .collect::<Vec<_>>();
-        assert_eq!(options.len(), 2);
-        assert!(options.contains(&spy.pubkey()));
+        assert_eq!(options.len(), 1);
+        assert!(!options.contains(&spy.pubkey()));
         assert!(options.contains(&node_123.pubkey()));
 
-        // spy nodes will see all
+        // spy nodes should not push to people on different shred versions
         let options = node
-            .push_options(&crds, &spy.label().pubkey(), 0, &stakes)
+            .push_options(&crds, &spy.label().pubkey(), 0, &stakes, None)
             .iter()
             .map(|(_, c)| c.id)
             .collect::<Vec<_>>();
-        assert_eq!(options.len(), 3);
-        assert!(options.contains(&me.pubkey()));
-        assert!(options.contains(&node_123.pubkey()));
-        assert!(options.contains(&node_456.pubkey()));
+        assert!(options.is_empty());
     }
+
+    #[test]
+    fn test_pushes_only_to_allowed() {
+        let now = timestamp();
+        let mut crds = Crds::default();
+        let stakes = HashMap::new();
+        let node = CrdsGossipPush::default();
+        let gossip = socketaddr!("127.0.0.1:1234");
+
+        let me = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo {
+            id: solana_sdk::pubkey::new_rand(),
+            gossip,
+            ..ContactInfo::default()
+        }));
+        let node_123 = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo {
+            id: solana_sdk::pubkey::new_rand(),
+            gossip,
+            ..ContactInfo::default()
+        }));
+
+        crds.insert(me.clone(), 0).unwrap();
+        crds.insert(node_123.clone(), now).unwrap();
+
+        // Unknown pubkey in gossip_validators -- will push to nobody
+        let mut gossip_validators = HashSet::new();
+        let options = node.push_options(
+            &crds,
+            &me.label().pubkey(),
+            0,
+            &stakes,
+            Some(&gossip_validators),
+        );
+
+        assert!(options.is_empty());
+
+        // Unknown pubkey in gossip_validators -- will push to nobody
+        gossip_validators.insert(solana_sdk::pubkey::new_rand());
+        let options = node.push_options(
+            &crds,
+            &me.label().pubkey(),
+            0,
+            &stakes,
+            Some(&gossip_validators),
+        );
+        assert!(options.is_empty());
+
+        // node_123 pubkey in gossip_validators -- will push to it
+        gossip_validators.insert(node_123.pubkey());
+        let options = node.push_options(
+            &crds,
+            &me.label().pubkey(),
+            0,
+            &stakes,
+            Some(&gossip_validators),
+        );
+
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].1.id, node_123.pubkey());
+    }
+
     #[test]
     fn test_new_push_messages() {
+        let now = timestamp();
         let mut crds = Crds::default();
         let mut push = CrdsGossipPush::default();
         let peer = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-            &Pubkey::new_rand(),
+            &solana_sdk::pubkey::new_rand(),
             0,
         )));
-        assert_eq!(crds.insert(peer.clone(), 0), Ok(None));
-        push.refresh_push_active_set(&crds, &HashMap::new(), &Pubkey::default(), 0, 1, 1);
+        assert_eq!(crds.insert(peer.clone(), now), Ok(None));
+        push.refresh_push_active_set(&crds, &HashMap::new(), None, &Pubkey::default(), 0, 1, 1);
 
         let new_msg = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-            &Pubkey::new_rand(),
+            &solana_sdk::pubkey::new_rand(),
             0,
         )));
         let mut expected = HashMap::new();
@@ -690,27 +797,28 @@ mod test {
     }
     #[test]
     fn test_personalized_push_messages() {
+        let now = timestamp();
         let mut crds = Crds::default();
         let mut push = CrdsGossipPush::default();
         let peer_1 = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-            &Pubkey::new_rand(),
+            &solana_sdk::pubkey::new_rand(),
             0,
         )));
-        assert_eq!(crds.insert(peer_1.clone(), 0), Ok(None));
+        assert_eq!(crds.insert(peer_1.clone(), now), Ok(None));
         let peer_2 = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-            &Pubkey::new_rand(),
+            &solana_sdk::pubkey::new_rand(),
             0,
         )));
-        assert_eq!(crds.insert(peer_2.clone(), 0), Ok(None));
+        assert_eq!(crds.insert(peer_2.clone(), now), Ok(None));
         let peer_3 = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-            &Pubkey::new_rand(),
-            0,
+            &solana_sdk::pubkey::new_rand(),
+            now,
         )));
         assert_eq!(
-            push.process_push_message(&mut crds, &Pubkey::default(), peer_3.clone(), 0),
+            push.process_push_message(&mut crds, &Pubkey::default(), peer_3.clone(), now),
             Ok(None)
         );
-        push.refresh_push_active_set(&crds, &HashMap::new(), &Pubkey::default(), 0, 1, 1);
+        push.refresh_push_active_set(&crds, &HashMap::new(), None, &Pubkey::default(), 0, 1, 1);
 
         // push 3's contact info to 1 and 2 and 3
         let new_msg = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
@@ -721,22 +829,22 @@ mod test {
         expected.insert(peer_1.pubkey(), vec![new_msg.clone()]);
         expected.insert(peer_2.pubkey(), vec![new_msg]);
         assert_eq!(push.active_set.len(), 3);
-        assert_eq!(push.new_push_messages(&crds, 0), expected);
+        assert_eq!(push.new_push_messages(&crds, now), expected);
     }
     #[test]
     fn test_process_prune() {
         let mut crds = Crds::default();
-        let self_id = Pubkey::new_rand();
+        let self_id = solana_sdk::pubkey::new_rand();
         let mut push = CrdsGossipPush::default();
         let peer = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-            &Pubkey::new_rand(),
+            &solana_sdk::pubkey::new_rand(),
             0,
         )));
         assert_eq!(crds.insert(peer.clone(), 0), Ok(None));
-        push.refresh_push_active_set(&crds, &HashMap::new(), &Pubkey::default(), 0, 1, 1);
+        push.refresh_push_active_set(&crds, &HashMap::new(), None, &Pubkey::default(), 0, 1, 1);
 
         let new_msg = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-            &Pubkey::new_rand(),
+            &solana_sdk::pubkey::new_rand(),
             0,
         )));
         let expected = HashMap::new();
@@ -756,13 +864,13 @@ mod test {
         let mut crds = Crds::default();
         let mut push = CrdsGossipPush::default();
         let peer = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-            &Pubkey::new_rand(),
+            &solana_sdk::pubkey::new_rand(),
             0,
         )));
         assert_eq!(crds.insert(peer, 0), Ok(None));
-        push.refresh_push_active_set(&crds, &HashMap::new(), &Pubkey::default(), 0, 1, 1);
+        push.refresh_push_active_set(&crds, &HashMap::new(), None, &Pubkey::default(), 0, 1, 1);
 
-        let mut ci = ContactInfo::new_localhost(&Pubkey::new_rand(), 0);
+        let mut ci = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), 0);
         ci.wallclock = 1;
         let new_msg = CrdsValue::new_unsigned(CrdsData::ContactInfo(ci));
         let expected = HashMap::new();
@@ -778,7 +886,7 @@ mod test {
     fn test_purge_old_received_cache() {
         let mut crds = Crds::default();
         let mut push = CrdsGossipPush::default();
-        let mut ci = ContactInfo::new_localhost(&Pubkey::new_rand(), 0);
+        let mut ci = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), 0);
         ci.wallclock = 0;
         let value = CrdsValue::new_unsigned(CrdsData::ContactInfo(ci));
         let label = value.label();

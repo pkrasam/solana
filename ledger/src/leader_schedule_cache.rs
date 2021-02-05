@@ -260,8 +260,8 @@ mod tests {
     use crate::{
         blockstore::make_slot_entries,
         genesis_utils::{
-            create_genesis_config, create_genesis_config_with_leader, GenesisConfigInfo,
-            BOOTSTRAP_VALIDATOR_LAMPORTS,
+            bootstrap_validator_stake_lamports, create_genesis_config,
+            create_genesis_config_with_leader, GenesisConfigInfo,
         },
         get_tmp_ledger_path,
         staking_utils::tests::setup_vote_and_stake_accounts,
@@ -322,7 +322,7 @@ mod tests {
         LeaderScheduleCache::retain_latest(&mut cached_schedules, &mut order, MAX_SCHEDULES);
         assert_eq!(cached_schedules.len(), MAX_SCHEDULES);
         let mut keys: Vec<_> = cached_schedules.keys().cloned().collect();
-        keys.sort();
+        keys.sort_unstable();
         let expected: Vec<_> = (1..=MAX_SCHEDULES as u64).collect();
         let expected_order: VecDeque<_> = (1..=MAX_SCHEDULES as u64).collect();
         assert_eq!(expected, keys);
@@ -378,13 +378,10 @@ mod tests {
 
     #[test]
     fn test_next_leader_slot() {
-        let pubkey = Pubkey::new_rand();
-        let mut genesis_config = create_genesis_config_with_leader(
-            BOOTSTRAP_VALIDATOR_LAMPORTS,
-            &pubkey,
-            BOOTSTRAP_VALIDATOR_LAMPORTS,
-        )
-        .genesis_config;
+        let pubkey = solana_sdk::pubkey::new_rand();
+        let mut genesis_config =
+            create_genesis_config_with_leader(42, &pubkey, bootstrap_validator_stake_lamports())
+                .genesis_config;
         genesis_config.epoch_schedule = EpochSchedule::custom(
             DEFAULT_SLOTS_PER_EPOCH,
             DEFAULT_LEADER_SCHEDULE_SLOT_OFFSET,
@@ -419,7 +416,7 @@ mod tests {
 
         assert_eq!(
             cache.next_leader_slot(
-                &Pubkey::new_rand(), // not in leader_schedule
+                &solana_sdk::pubkey::new_rand(), // not in leader_schedule
                 0,
                 &bank,
                 None,
@@ -431,13 +428,10 @@ mod tests {
 
     #[test]
     fn test_next_leader_slot_blockstore() {
-        let pubkey = Pubkey::new_rand();
-        let mut genesis_config = create_genesis_config_with_leader(
-            BOOTSTRAP_VALIDATOR_LAMPORTS,
-            &pubkey,
-            BOOTSTRAP_VALIDATOR_LAMPORTS,
-        )
-        .genesis_config;
+        let pubkey = solana_sdk::pubkey::new_rand();
+        let mut genesis_config =
+            create_genesis_config_with_leader(42, &pubkey, bootstrap_validator_stake_lamports())
+                .genesis_config;
         genesis_config.epoch_schedule.warmup = false;
 
         let bank = Bank::new(&genesis_config);
@@ -501,7 +495,7 @@ mod tests {
 
             assert_eq!(
                 cache.next_leader_slot(
-                    &Pubkey::new_rand(), // not in leader_schedule
+                    &solana_sdk::pubkey::new_rand(), // not in leader_schedule
                     0,
                     &bank,
                     Some(&blockstore),
@@ -519,7 +513,7 @@ mod tests {
             mut genesis_config,
             mint_keypair,
             ..
-        } = create_genesis_config(10_000);
+        } = create_genesis_config(10_000 * bootstrap_validator_stake_lamports());
         genesis_config.epoch_schedule.warmup = false;
 
         let bank = Bank::new(&genesis_config);
@@ -533,7 +527,7 @@ mod tests {
             &mint_keypair,
             &vote_account,
             &validator_identity,
-            BOOTSTRAP_VALIDATOR_LAMPORTS,
+            bootstrap_validator_stake_lamports(),
         );
         let node_pubkey = validator_identity.pubkey();
 
@@ -605,7 +599,7 @@ mod tests {
         assert_eq!(bank.get_epoch_and_slot_index(96).0, 2);
         assert!(cache.slot_leader_at(96, Some(&bank)).is_none());
 
-        let bank2 = Bank::new_from_parent(&bank, &Pubkey::new_rand(), 95);
+        let bank2 = Bank::new_from_parent(&bank, &solana_sdk::pubkey::new_rand(), 95);
         assert!(bank2.epoch_vote_accounts(2).is_some());
 
         // Set root for a slot in epoch 1, so that epoch 2 is now confirmed

@@ -140,6 +140,10 @@ impl SyncClient for BankClient {
         Ok(self.bank.get_balance(pubkey))
     }
 
+    fn get_minimum_balance_for_rent_exemption(&self, data_len: usize) -> Result<u64> {
+        Ok(self.bank.get_minimum_balance_for_rent_exemption(data_len))
+    }
+
     fn get_recent_blockhash(&self) -> Result<(Hash, FeeCalculator)> {
         Ok(self.bank.last_blockhash_with_fee_calculator())
     }
@@ -313,7 +317,7 @@ mod tests {
         let bank_client = BankClient::new(bank);
 
         // Create 2-2 Multisig Transfer instruction.
-        let bob_pubkey = Pubkey::new_rand();
+        let bob_pubkey = solana_sdk::pubkey::new_rand();
         let mut transfer_instruction = system_instruction::transfer(&john_pubkey, &bob_pubkey, 42);
         transfer_instruction
             .accounts

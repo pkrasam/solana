@@ -59,7 +59,11 @@ impl Blockstore {
             meta.next_slots
                 .retain(|slot| *slot < from_slot || *slot > to_slot);
             if meta.next_slots.len() != original_len {
-                info!("purge_from_next_slots: adjusted meta for slot {}", slot);
+                info!(
+                    "purge_from_next_slots: meta for slot {} no longer refers to slots {:?}",
+                    slot,
+                    from_slot..=to_slot
+                );
                 self.put_meta_bytes(
                     slot,
                     &bincode::serialize(&meta).expect("couldn't update meta"),
@@ -91,7 +95,7 @@ impl Blockstore {
             .batch()
             .expect("Database Error: Failed to get write batch");
         // delete range cf is not inclusive
-        let to_slot = to_slot.checked_add(1).unwrap_or_else(|| std::u64::MAX);
+        let to_slot = to_slot.checked_add(1).unwrap_or(std::u64::MAX);
 
         let mut delete_range_timer = Measure::start("delete_range");
         let mut columns_purged = self
@@ -133,6 +137,14 @@ impl Blockstore {
             & self
                 .db
                 .delete_range_cf::<cf::Rewards>(&mut write_batch, from_slot, to_slot)
+                .is_ok()
+            & self
+                .db
+                .delete_range_cf::<cf::Blocktime>(&mut write_batch, from_slot, to_slot)
+                .is_ok()
+            & self
+                .db
+                .delete_range_cf::<cf::PerfSamples>(&mut write_batch, from_slot, to_slot)
                 .is_ok();
         let mut w_active_transaction_status_index =
             self.active_transaction_status_index.write().unwrap();
@@ -223,6 +235,14 @@ impl Blockstore {
             && self
                 .rewards_cf
                 .compact_range(from_slot, to_slot)
+                .unwrap_or(false)
+            && self
+                .blocktime_cf
+                .compact_range(from_slot, to_slot)
+                .unwrap_or(false)
+            && self
+                .perf_samples_cf
+                .compact_range(from_slot, to_slot)
                 .unwrap_or(false);
         compact_timer.stop();
         if !result {
@@ -253,21 +273,13 @@ impl Blockstore {
                 .cloned()
                 .flat_map(|entry| entry.transactions)
             {
-                batch.delete::<cf::TransactionStatus>((0, transaction.signatures[0], slot))?;
-                batch.delete::<cf::TransactionStatus>((1, transaction.signatures[0], slot))?;
-                for pubkey in transaction.message.account_keys {
-                    batch.delete::<cf::AddressSignatures>((
-                        0,
-                        pubkey,
-                        slot,
-                        transaction.signatures[0],
-                    ))?;
-                    batch.delete::<cf::AddressSignatures>((
-                        1,
-                        pubkey,
-                        slot,
-                        transaction.signatures[0],
-                    ))?;
+                if let Some(&signature) = transaction.signatures.get(0) {
+                    batch.delete::<cf::TransactionStatus>((0, signature, slot))?;
+                    batch.delete::<cf::TransactionStatus>((1, signature, slot))?;
+                    for pubkey in transaction.message.account_keys {
+                        batch.delete::<cf::AddressSignatures>((0, pubkey, slot, signature))?;
+                        batch.delete::<cf::AddressSignatures>((1, pubkey, slot, signature))?;
+                    }
                 }
             }
         }
@@ -312,7 +324,15 @@ impl Blockstore {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::{blockstore::tests::make_slot_entries_with_transactions, get_tmp_ledger_path};
+    use crate::{
+        blockstore::tests::make_slot_entries_with_transactions, entry::next_entry_mut,
+        get_tmp_ledger_path,
+    };
+    use bincode::serialize;
+    use solana_sdk::{
+        hash::{hash, Hash},
+        message::Message,
+    };
 
     // check that all columns are either empty or start at `min_slot`
     fn test_all_empty_or_min(blockstore: &Blockstore, min_slot: Slot) {
@@ -1110,6 +1130,32 @@ pub mod tests {
             let entry = status_entry_iterator.next().unwrap().0;
             assert_eq!(entry.0, 2); // Buffer entry, no index 0 or index 1 entries remaining
             drop(status_entry_iterator);
+        }
+        Blockstore::destroy(&blockstore_path).expect("Expected successful database destruction");
+    }
+
+    #[test]
+    fn test_purge_special_columns_exact_no_sigs() {
+        let blockstore_path = get_tmp_ledger_path!();
+        {
+            let blockstore = Blockstore::open(&blockstore_path).unwrap();
+
+            let slot = 1;
+            let mut entries: Vec<Entry> = vec![];
+            for x in 0..5 {
+                let mut tx = Transaction::new_unsigned(Message::default());
+                tx.signatures = vec![];
+                entries.push(next_entry_mut(&mut Hash::default(), 0, vec![tx]));
+                let mut tick = create_ticks(1, 0, hash(&serialize(&x).unwrap()));
+                entries.append(&mut tick);
+            }
+            let shreds = entries_to_test_shreds(entries, slot, slot - 1, true, 0);
+            blockstore.insert_shreds(shreds, None, false).unwrap();
+
+            let mut write_batch = blockstore.db.batch().unwrap();
+            blockstore
+                .purge_special_columns_exact(&mut write_batch, slot, slot + 1)
+                .unwrap();
         }
         Blockstore::destroy(&blockstore_path).expect("Expected successful database destruction");
     }

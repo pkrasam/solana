@@ -1,6 +1,5 @@
 use crate::{
     cli::{CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult},
-    cli_output::{CliValidatorInfo, CliValidatorInfoVec},
     spend_utils::{resolve_spend_tx_and_check_account_balance, SpendAmount},
 };
 use bincode::deserialize;
@@ -13,14 +12,14 @@ use solana_account_decoder::validator_info::{
 use solana_clap_utils::{
     input_parsers::pubkey_of,
     input_validators::{is_pubkey, is_url},
-    keypair::signer_from_path,
+    keypair::DefaultSigner,
 };
+use solana_cli_output::{CliValidatorInfo, CliValidatorInfoVec};
 use solana_client::rpc_client::RpcClient;
 use solana_config_program::{config_instruction, get_config_data, ConfigKeys, ConfigState};
 use solana_remote_wallet::remote_wallet::RemoteWalletManager;
 use solana_sdk::{
     account::Account,
-    commitment_config::CommitmentConfig,
     message::Message,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
@@ -212,7 +211,7 @@ impl ValidatorInfoSubCommands for App<'_, '_> {
 
 pub fn parse_validator_info_command(
     matches: &ArgMatches<'_>,
-    default_signer_path: &str,
+    default_signer: &DefaultSigner,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let info_pubkey = pubkey_of(matches, "info_pubkey");
@@ -224,12 +223,7 @@ pub fn parse_validator_info_command(
             force_keybase: matches.is_present("force"),
             info_pubkey,
         },
-        signers: vec![signer_from_path(
-            matches,
-            default_signer_path,
-            "keypair",
-            wallet_manager,
-        )?],
+        signers: vec![default_signer.signer_from_path(matches, wallet_manager)?],
     })
 }
 
@@ -271,10 +265,12 @@ pub fn process_set_validator_info(
     let all_config = rpc_client.get_program_accounts(&solana_config_program::id())?;
     let existing_account = all_config
         .iter()
-        .filter(|(_, account)| {
-            let key_list: ConfigKeys = deserialize(&account.data).map_err(|_| false).unwrap();
-            key_list.keys.contains(&(validator_info::id(), false))
-        })
+        .filter(
+            |(_, account)| match deserialize::<ConfigKeys>(&account.data) {
+                Ok(key_list) => key_list.keys.contains(&(validator_info::id(), false)),
+                Err(_) => false,
+            },
+        )
         .find(|(pubkey, account)| {
             let (validator_pubkey, _) = parse_validator_info(&pubkey, &account).unwrap();
             validator_pubkey == config.signers[0].pubkey()
@@ -291,9 +287,7 @@ pub fn process_set_validator_info(
     };
 
     // Check existence of validator-info account
-    let balance = rpc_client
-        .poll_get_balance_with_commitment(&info_pubkey, CommitmentConfig::default())
-        .unwrap_or(0);
+    let balance = rpc_client.get_balance(&info_pubkey).unwrap_or(0);
 
     let lamports =
         rpc_client.get_minimum_balance_for_rent_exemption(ValidatorInfo::max_space() as usize)?;
@@ -385,10 +379,10 @@ pub fn process_get_validator_info(
         all_config
             .into_iter()
             .filter(|(_, validator_info_account)| {
-                let key_list: ConfigKeys = deserialize(&validator_info_account.data)
-                    .map_err(|_| false)
-                    .unwrap();
-                key_list.keys.contains(&(validator_info::id(), false))
+                match deserialize::<ConfigKeys>(&validator_info_account.data) {
+                    Ok(key_list) => key_list.keys.contains(&(validator_info::id(), false)),
+                    Err(_) => false,
+                }
             })
             .collect()
     };
@@ -489,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_parse_validator_info() {
-        let pubkey = Pubkey::new_rand();
+        let pubkey = solana_sdk::pubkey::new_rand();
         let keys = vec![(validator_info::id(), false), (pubkey, true)];
         let config = ConfigKeys { keys };
 

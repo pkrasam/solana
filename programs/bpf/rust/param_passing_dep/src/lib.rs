@@ -1,6 +1,6 @@
 //! @brief Example Rust-based BPF program tests loop iteration
 
-extern crate solana_sdk;
+extern crate solana_program;
 
 #[derive(Debug)]
 pub struct Data<'a> {
@@ -27,8 +27,6 @@ impl<'a> TestDep {
 #[cfg(test)]
 mod test {
     use super::*;
-    // Pull in syscall stubs when building for non-BPF targets
-    solana_sdk::program_stubs!();
 
     #[test]
     fn test_dep() {

@@ -1,10 +1,9 @@
-use solana_client::{
-    pubsub_client::{PubsubClient, SlotInfoMessage},
-    rpc_client::RpcClient,
-};
+use solana_client::{pubsub_client::PubsubClient, rpc_client::RpcClient, rpc_response::SlotInfo};
 use solana_core::{
-    rpc_pubsub_service::PubSubService, rpc_subscriptions::RpcSubscriptions,
-    validator::TestValidator,
+    optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
+    rpc_pubsub_service::{PubSubConfig, PubSubService},
+    rpc_subscriptions::RpcSubscriptions,
+    test_validator::TestValidator,
 };
 use solana_runtime::{
     bank::Bank,
@@ -13,11 +12,13 @@ use solana_runtime::{
     genesis_utils::{create_genesis_config, GenesisConfigInfo},
 };
 use solana_sdk::{
-    commitment_config::CommitmentConfig, pubkey::Pubkey, rpc_port, signature::Signer,
+    commitment_config::CommitmentConfig,
+    native_token::sol_to_lamports,
+    rpc_port,
+    signature::{Keypair, Signer},
     system_transaction,
 };
 use std::{
-    fs::remove_dir_all,
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -32,31 +33,27 @@ use systemstat::Ipv4Addr;
 fn test_rpc_client() {
     solana_logger::setup();
 
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run();
-    let bob_pubkey = Pubkey::new_rand();
+    let alice = Keypair::new();
+    let test_validator = TestValidator::with_no_fees(alice.pubkey());
 
-    let client = RpcClient::new_socket(leader_data.rpc);
+    let bob_pubkey = solana_sdk::pubkey::new_rand();
+
+    let client = RpcClient::new(test_validator.rpc_url());
 
     assert_eq!(
         client.get_version().unwrap().solana_core,
-        solana_version::version!()
+        solana_version::semver!()
     );
 
     assert!(client.get_account(&bob_pubkey).is_err());
 
     assert_eq!(client.get_balance(&bob_pubkey).unwrap(), 0);
 
-    assert_eq!(client.get_balance(&alice.pubkey()).unwrap(), 1_000_000);
+    let original_alice_balance = client.get_balance(&alice.pubkey()).unwrap();
 
     let (blockhash, _fee_calculator) = client.get_recent_blockhash().unwrap();
 
-    let tx = system_transaction::transfer(&alice, &bob_pubkey, 20, blockhash);
+    let tx = system_transaction::transfer(&alice, &bob_pubkey, sol_to_lamports(20.0), blockhash);
     let signature = client.send_transaction(&tx).unwrap();
 
     let mut confirmed_tx = false;
@@ -77,11 +74,14 @@ fn test_rpc_client() {
 
     assert!(confirmed_tx);
 
-    assert_eq!(client.get_balance(&bob_pubkey).unwrap(), 20);
-    assert_eq!(client.get_balance(&alice.pubkey()).unwrap(), 999_980);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
+    assert_eq!(
+        client.get_balance(&bob_pubkey).unwrap(),
+        sol_to_lamports(20.0)
+    );
+    assert_eq!(
+        client.get_balance(&alice.pubkey()).unwrap(),
+        original_alice_balance - sol_to_lamports(20.0)
+    );
 }
 
 #[test]
@@ -94,18 +94,22 @@ fn test_slot_subscription() {
     let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
     let bank = Bank::new(&genesis_config);
     let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+    let optimistically_confirmed_bank =
+        OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
     let subscriptions = Arc::new(RpcSubscriptions::new(
         &exit,
         bank_forks,
         Arc::new(RwLock::new(BlockCommitmentCache::default())),
+        optimistically_confirmed_bank,
     ));
-    let pubsub_service = PubSubService::new(&subscriptions, pubsub_addr, &exit);
+    let pubsub_service =
+        PubSubService::new(PubSubConfig::default(), &subscriptions, pubsub_addr, &exit);
     std::thread::sleep(Duration::from_millis(400));
 
     let (mut client, receiver) =
         PubsubClient::slot_subscribe(&format!("ws://0.0.0.0:{}/", pubsub_addr.port())).unwrap();
 
-    let mut errors: Vec<(SlotInfoMessage, SlotInfoMessage)> = Vec::new();
+    let mut errors: Vec<(SlotInfo, SlotInfo)> = Vec::new();
 
     for i in 0..3 {
         subscriptions.notify_slot(i + 1, i, i);
@@ -114,7 +118,7 @@ fn test_slot_subscription() {
 
         match maybe_actual {
             Ok(actual) => {
-                let expected = SlotInfoMessage {
+                let expected = SlotInfo {
                     slot: i + 1,
                     parent: i,
                     root: i,

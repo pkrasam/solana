@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 use crate::{
     pubkey::Pubkey,
     signature::{Signature, Signer, SignerError},
@@ -45,6 +46,10 @@ impl<T: Signer> Signers for [&T] {
 }
 
 impl Signers for [Box<dyn Signer>] {
+    default_keypairs_impl!();
+}
+
+impl Signers for Vec<Box<dyn Signer>> {
     default_keypairs_impl!();
 }
 

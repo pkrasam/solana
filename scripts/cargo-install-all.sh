@@ -2,6 +2,9 @@
 #
 # |cargo install| of the top-level crate will not install binaries for
 # other workspace crates or native program crates.
+here="$(dirname "$0")"
+cargo="$(readlink -f "${here}/../cargo")"
+
 set -e
 
 usage() {
@@ -46,7 +49,6 @@ fi
 
 installDir="$(mkdir -p "$installDir"; cd "$installDir"; pwd)"
 mkdir -p "$installDir/bin/deps"
-cargo=cargo
 
 echo "Install location: $installDir ($buildVariant)"
 
@@ -75,6 +77,8 @@ else
 
 
   BINS=(
+    cargo-build-bpf
+    cargo-test-bpf
     solana
     solana-bench-exchange
     solana-bench-tps
@@ -91,6 +95,7 @@ else
     solana-stake-monitor
     solana-stake-o-matic
     solana-sys-tuner
+    solana-test-validator
     solana-tokens
     solana-validator
     solana-watchtower
@@ -106,13 +111,16 @@ for bin in "${BINS[@]}"; do
   binArgs+=(--bin "$bin")
 done
 
+mkdir -p "$installDir/bin"
+
 (
   set -x
   # shellcheck disable=SC2086 # Don't want to double quote $rust_version
-  $cargo $maybeRustVersion build $maybeReleaseFlag "${binArgs[@]}"
+  "$cargo" $maybeRustVersion build $maybeReleaseFlag "${binArgs[@]}"
+  # shellcheck disable=SC2086 # Don't want to double quote $rust_version
+  "$cargo" $maybeRustVersion install spl-token-cli --root "$installDir"
 )
 
-mkdir -p "$installDir/bin"
 for bin in "${BINS[@]}"; do
   cp -fv "target/$buildVariant/$bin" "$installDir"/bin
 done
@@ -121,9 +129,16 @@ if [[ -d target/perf-libs ]]; then
   cp -a target/perf-libs "$installDir"/bin/perf-libs
 fi
 
+mkdir -p "$installDir"/bin/sdk/bpf
+cp -a sdk/bpf/* "$installDir"/bin/sdk/bpf
+
 (
   set -x
-  cp -fv target/$buildVariant/deps/libsolana*program.* "$installDir/bin/deps"
+  # deps dir can be empty
+  shopt -s nullglob
+  for dep in target/"$buildVariant"/deps/libsolana*program.*; do
+    cp -fv "$dep" "$installDir/bin/deps"
+  done
 )
 
 echo "Done after $SECONDS seconds"

@@ -1,14 +1,20 @@
 //! Defines a Transaction type to package an atomic sequence of instructions.
 
+#![cfg(feature = "full")]
+
 use crate::sanitize::{Sanitize, SanitizeError};
+use crate::secp256k1_instruction::verify_eth_addresses;
 use crate::{
     hash::Hash,
     instruction::{CompiledInstruction, Instruction, InstructionError},
     message::Message,
+    program_utils::limited_deserialize,
     pubkey::Pubkey,
     short_vec,
     signature::{Signature, SignerError},
     signers::Signers,
+    system_instruction::SystemInstruction,
+    system_program,
 };
 use std::result;
 use thiserror::Error;
@@ -97,7 +103,7 @@ impl From<SanitizeError> for TransactionError {
 }
 
 /// An atomic transaction
-#[frozen_abi(digest = "GoxM5ZMMjM2FSuY1VtuMhs1j8u9kMuYsH3dpYcSVVnTe")]
+#[frozen_abi(digest = "2Kr1C1pRytLsmUbg8p2nLoZyrjrEQCriAYLTCYvwj1Fo")]
 #[derive(Debug, PartialEq, Default, Eq, Clone, Serialize, Deserialize, AbiExample)]
 pub struct Transaction {
     /// A set of digital signatures of `account_keys`, `program_ids`, `recent_blockhash`, and `instructions`, signed by the first
@@ -330,6 +336,28 @@ impl Transaction {
         }
     }
 
+    pub fn verify_precompiles(&self) -> Result<()> {
+        for instruction in &self.message().instructions {
+            // The Transaction may not be sanitized at this point
+            if instruction.program_id_index as usize >= self.message().account_keys.len() {
+                return Err(TransactionError::AccountNotFound);
+            }
+            let program_id = &self.message().account_keys[instruction.program_id_index as usize];
+            if crate::secp256k1_program::check_id(program_id) {
+                let instruction_datas: Vec<_> = self
+                    .message()
+                    .instructions
+                    .iter()
+                    .map(|instruction| instruction.data.as_ref())
+                    .collect();
+                let data = &instruction.data;
+                let e = verify_eth_addresses(data, &instruction_datas);
+                e.map_err(|_| TransactionError::InvalidAccountIndex)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Get the positions of the pubkeys in `account_keys` associated with signing keypairs
     pub fn get_signing_keypair_positions(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<usize>>> {
         if self.message.account_keys.len() < self.message.header.num_required_signatures as usize {
@@ -372,6 +400,31 @@ impl Transaction {
     }
 }
 
+pub fn uses_durable_nonce(tx: &Transaction) -> Option<&CompiledInstruction> {
+    let message = tx.message();
+    message
+        .instructions
+        .get(0)
+        .filter(|maybe_ix| {
+            let prog_id_idx = maybe_ix.program_id_index as usize;
+            match message.account_keys.get(prog_id_idx) {
+                Some(program_id) => system_program::check_id(&program_id),
+                _ => false,
+            }
+        } && matches!(limited_deserialize(&maybe_ix.data), Ok(SystemInstruction::AdvanceNonceAccount))
+        )
+}
+
+pub fn get_nonce_pubkey_from_instruction<'a>(
+    ix: &CompiledInstruction,
+    tx: &'a Transaction,
+) -> Option<&'a Pubkey> {
+    ix.accounts.get(0).and_then(|idx| {
+        let idx = *idx as usize;
+        tx.message().account_keys.get(idx)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,10 +446,10 @@ mod tests {
     #[test]
     fn test_refs() {
         let key = Keypair::new();
-        let key1 = Pubkey::new_rand();
-        let key2 = Pubkey::new_rand();
-        let prog1 = Pubkey::new_rand();
-        let prog2 = Pubkey::new_rand();
+        let key1 = solana_sdk::pubkey::new_rand();
+        let key2 = solana_sdk::pubkey::new_rand();
+        let prog1 = solana_sdk::pubkey::new_rand();
+        let prog2 = solana_sdk::pubkey::new_rand();
         let instructions = vec![
             CompiledInstruction::new(3, &(), vec![0, 1]),
             CompiledInstruction::new(4, &(), vec![0, 2]),
@@ -463,7 +516,7 @@ mod tests {
     fn test_sanitize_txs() {
         let key = Keypair::new();
         let id0 = Pubkey::default();
-        let program_id = Pubkey::new_rand();
+        let program_id = solana_sdk::pubkey::new_rand();
         let ix = Instruction::new(
             program_id,
             &0,
@@ -559,7 +612,7 @@ mod tests {
     fn test_transaction_minimum_serialized_size() {
         let alice_keypair = Keypair::new();
         let alice_pubkey = alice_keypair.pubkey();
-        let bob_pubkey = Pubkey::new_rand();
+        let bob_pubkey = solana_sdk::pubkey::new_rand();
         let ix = system_instruction::transfer(&alice_pubkey, &bob_pubkey, 42);
 
         let expected_data_size = size_of::<u32>() + size_of::<u64>();
@@ -637,7 +690,7 @@ mod tests {
     #[should_panic]
     fn test_partial_sign_mismatched_key() {
         let keypair = Keypair::new();
-        let fee_payer = Pubkey::new_rand();
+        let fee_payer = solana_sdk::pubkey::new_rand();
         let ix = Instruction::new(
             Pubkey::default(),
             &0,
@@ -719,7 +772,7 @@ mod tests {
         let program_id = Pubkey::default();
         let keypair0 = Keypair::new();
         let id0 = keypair0.pubkey();
-        let id1 = Pubkey::new_rand();
+        let id1 = solana_sdk::pubkey::new_rand();
         let ix = Instruction::new(
             program_id,
             &0,
@@ -770,7 +823,7 @@ mod tests {
         assert_eq!(tx.signatures[1], presigner_sig);
 
         // Wrong key should error, not panic
-        let another_pubkey = Pubkey::new_rand();
+        let another_pubkey = solana_sdk::pubkey::new_rand();
         let ix = Instruction::new(
             program_id,
             &0,
@@ -788,5 +841,100 @@ mod tests {
             tx.signatures,
             vec![Signature::default(), Signature::default()]
         );
+    }
+
+    fn nonced_transfer_tx() -> (Pubkey, Pubkey, Transaction) {
+        let from_keypair = Keypair::new();
+        let from_pubkey = from_keypair.pubkey();
+        let nonce_keypair = Keypair::new();
+        let nonce_pubkey = nonce_keypair.pubkey();
+        let instructions = [
+            system_instruction::advance_nonce_account(&nonce_pubkey, &nonce_pubkey),
+            system_instruction::transfer(&from_pubkey, &nonce_pubkey, 42),
+        ];
+        let message = Message::new(&instructions, Some(&nonce_pubkey));
+        let tx = Transaction::new(&[&from_keypair, &nonce_keypair], message, Hash::default());
+        (from_pubkey, nonce_pubkey, tx)
+    }
+
+    #[test]
+    fn tx_uses_nonce_ok() {
+        let (_, _, tx) = nonced_transfer_tx();
+        assert!(uses_durable_nonce(&tx).is_some());
+    }
+
+    #[test]
+    fn tx_uses_nonce_empty_ix_fail() {
+        assert!(uses_durable_nonce(&Transaction::default()).is_none());
+    }
+
+    #[test]
+    fn tx_uses_nonce_bad_prog_id_idx_fail() {
+        let (_, _, mut tx) = nonced_transfer_tx();
+        tx.message.instructions.get_mut(0).unwrap().program_id_index = 255u8;
+        assert!(uses_durable_nonce(&tx).is_none());
+    }
+
+    #[test]
+    fn tx_uses_nonce_first_prog_id_not_nonce_fail() {
+        let from_keypair = Keypair::new();
+        let from_pubkey = from_keypair.pubkey();
+        let nonce_keypair = Keypair::new();
+        let nonce_pubkey = nonce_keypair.pubkey();
+        let instructions = [
+            system_instruction::transfer(&from_pubkey, &nonce_pubkey, 42),
+            system_instruction::advance_nonce_account(&nonce_pubkey, &nonce_pubkey),
+        ];
+        let message = Message::new(&instructions, Some(&from_pubkey));
+        let tx = Transaction::new(&[&from_keypair, &nonce_keypair], message, Hash::default());
+        assert!(uses_durable_nonce(&tx).is_none());
+    }
+
+    #[test]
+    fn tx_uses_nonce_wrong_first_nonce_ix_fail() {
+        let from_keypair = Keypair::new();
+        let from_pubkey = from_keypair.pubkey();
+        let nonce_keypair = Keypair::new();
+        let nonce_pubkey = nonce_keypair.pubkey();
+        let instructions = [
+            system_instruction::withdraw_nonce_account(
+                &nonce_pubkey,
+                &nonce_pubkey,
+                &from_pubkey,
+                42,
+            ),
+            system_instruction::transfer(&from_pubkey, &nonce_pubkey, 42),
+        ];
+        let message = Message::new(&instructions, Some(&nonce_pubkey));
+        let tx = Transaction::new(&[&from_keypair, &nonce_keypair], message, Hash::default());
+        assert!(uses_durable_nonce(&tx).is_none());
+    }
+
+    #[test]
+    fn get_nonce_pub_from_ix_ok() {
+        let (_, nonce_pubkey, tx) = nonced_transfer_tx();
+        let nonce_ix = uses_durable_nonce(&tx).unwrap();
+        assert_eq!(
+            get_nonce_pubkey_from_instruction(&nonce_ix, &tx),
+            Some(&nonce_pubkey),
+        );
+    }
+
+    #[test]
+    fn get_nonce_pub_from_ix_no_accounts_fail() {
+        let (_, _, tx) = nonced_transfer_tx();
+        let nonce_ix = uses_durable_nonce(&tx).unwrap();
+        let mut nonce_ix = nonce_ix.clone();
+        nonce_ix.accounts.clear();
+        assert_eq!(get_nonce_pubkey_from_instruction(&nonce_ix, &tx), None,);
+    }
+
+    #[test]
+    fn get_nonce_pub_from_ix_bad_acc_idx_fail() {
+        let (_, _, tx) = nonced_transfer_tx();
+        let nonce_ix = uses_durable_nonce(&tx).unwrap();
+        let mut nonce_ix = nonce_ix.clone();
+        nonce_ix.accounts[0] = 255u8;
+        assert_eq!(get_nonce_pubkey_from_instruction(&nonce_ix, &tx), None,);
     }
 }

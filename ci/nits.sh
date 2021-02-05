@@ -19,6 +19,7 @@ declare prints=(
 # Parts of the tree that are expected to be print free
 declare print_free_tree=(
   ':core/src/**.rs'
+  ':^core/src/validator.rs'
   ':faucet/src/**.rs'
   ':ledger/src/**.rs'
   ':metrics/src/**.rs'
@@ -26,6 +27,9 @@ declare print_free_tree=(
   ':runtime/src/**.rs'
   ':sdk/bpf/rust/rust-utils/**.rs'
   ':sdk/**.rs'
+  ':^sdk/cargo-build-bpf/**.rs'
+  ':^sdk/program/src/program_option.rs'
+  ':^sdk/program/src/program_stubs.rs'
   ':programs/**.rs'
   ':^**bin**.rs'
   ':^**bench**.rs'

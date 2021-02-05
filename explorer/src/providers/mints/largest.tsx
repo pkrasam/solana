@@ -1,16 +1,20 @@
 import React from "react";
-import * as Sentry from "@sentry/react";
-import { useCluster } from "providers/cluster";
+import { useCluster, Cluster } from "providers/cluster";
 import * as Cache from "providers/cache";
 import { ActionType, FetchStatus } from "providers/cache";
 import {
   PublicKey,
   Connection,
   TokenAccountBalancePair,
+  ParsedAccountData,
 } from "@solana/web3.js";
+import { TokenAccountInfo, TokenAccount } from "validators/accounts/token";
+import { ParsedInfo } from "validators";
+import { coerce } from "superstruct";
+import { reportError } from "utils/sentry";
 
 type LargestAccounts = {
-  largest: TokenAccountBalancePair[];
+  largest: TokenAccountBalancePairWithOwner[];
 };
 
 type State = Cache.State<LargestAccounts>;
@@ -38,9 +42,17 @@ export function LargestAccountsProvider({ children }: ProviderProps) {
   );
 }
 
+type OptionalOwner = {
+  owner?: PublicKey;
+};
+
+export type TokenAccountBalancePairWithOwner = TokenAccountBalancePair &
+  OptionalOwner;
+
 async function fetchLargestAccounts(
   dispatch: Dispatch,
   pubkey: PublicKey,
+  cluster: Cluster,
   url: string
 ) {
   dispatch({
@@ -58,9 +70,38 @@ async function fetchLargestAccounts(
         await new Connection(url, "single").getTokenLargestAccounts(pubkey)
       ).value,
     };
+
+    data.largest = await Promise.all(
+      data.largest.map(
+        async (account): Promise<TokenAccountBalancePairWithOwner> => {
+          try {
+            const accountInfo = (
+              await new Connection(url, "single").getParsedAccountInfo(
+                account.address
+              )
+            ).value;
+            if (accountInfo && "parsed" in accountInfo.data) {
+              const info = coerceParsedAccountInfo(accountInfo.data);
+              return {
+                ...account,
+                owner: info.owner,
+              };
+            }
+          } catch (error) {
+            if (cluster !== Cluster.Custom) {
+              reportError(error, { url });
+            }
+          }
+          return account;
+        }
+      )
+    );
+
     fetchStatus = FetchStatus.Fetched;
   } catch (error) {
-    Sentry.captureException(error, { tags: { url } });
+    if (cluster !== Cluster.Custom) {
+      reportError(error, { url });
+    }
     fetchStatus = FetchStatus.FetchFailed;
   }
   dispatch({
@@ -80,10 +121,13 @@ export function useFetchTokenLargestAccounts() {
     );
   }
 
-  const { url } = useCluster();
-  return (pubkey: PublicKey) => {
-    fetchLargestAccounts(dispatch, pubkey, url);
-  };
+  const { cluster, url } = useCluster();
+  return React.useCallback(
+    (pubkey: PublicKey) => {
+      fetchLargestAccounts(dispatch, pubkey, cluster, url);
+    },
+    [dispatch, cluster, url]
+  );
 }
 
 export function useTokenLargestTokens(
@@ -98,4 +142,16 @@ export function useTokenLargestTokens(
   }
 
   return context.entries[address];
+}
+
+function coerceParsedAccountInfo(
+  parsedData: ParsedAccountData
+): TokenAccountInfo {
+  try {
+    const data = coerce(parsedData.parsed, ParsedInfo);
+    const parsed = coerce(data, TokenAccount);
+    return coerce(parsed.info, TokenAccountInfo);
+  } catch (error) {
+    throw error;
+  }
 }

@@ -11,6 +11,7 @@ use solana_remote_wallet::{
     remote_wallet::{maybe_wallet_manager, RemoteWalletError, RemoteWalletManager},
 };
 use solana_sdk::{
+    hash::Hash,
     pubkey::Pubkey,
     signature::{
         keypair_from_seed, keypair_from_seed_phrase_and_passphrase, read_keypair,
@@ -24,6 +25,90 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
+
+pub struct SignOnly {
+    pub blockhash: Hash,
+    pub present_signers: Vec<(Pubkey, Signature)>,
+    pub absent_signers: Vec<Pubkey>,
+    pub bad_signers: Vec<Pubkey>,
+}
+
+impl SignOnly {
+    pub fn has_all_signers(&self) -> bool {
+        self.absent_signers.is_empty() && self.bad_signers.is_empty()
+    }
+
+    pub fn presigner_of(&self, pubkey: &Pubkey) -> Option<Presigner> {
+        presigner_from_pubkey_sigs(pubkey, &self.present_signers)
+    }
+}
+pub type CliSigners = Vec<Box<dyn Signer>>;
+pub type SignerIndex = usize;
+pub struct CliSignerInfo {
+    pub signers: CliSigners,
+}
+
+impl CliSignerInfo {
+    pub fn index_of(&self, pubkey: Option<Pubkey>) -> Option<usize> {
+        if let Some(pubkey) = pubkey {
+            self.signers
+                .iter()
+                .position(|signer| signer.pubkey() == pubkey)
+        } else {
+            Some(0)
+        }
+    }
+    pub fn index_of_or_none(&self, pubkey: Option<Pubkey>) -> Option<usize> {
+        if let Some(pubkey) = pubkey {
+            self.signers
+                .iter()
+                .position(|signer| signer.pubkey() == pubkey)
+        } else {
+            None
+        }
+    }
+}
+
+pub struct DefaultSigner {
+    pub arg_name: String,
+    pub path: String,
+}
+
+impl DefaultSigner {
+    pub fn generate_unique_signers(
+        &self,
+        bulk_signers: Vec<Option<Box<dyn Signer>>>,
+        matches: &ArgMatches<'_>,
+        wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    ) -> Result<CliSignerInfo, Box<dyn error::Error>> {
+        let mut unique_signers = vec![];
+
+        // Determine if the default signer is needed
+        if bulk_signers.iter().any(|signer| signer.is_none()) {
+            let default_signer = self.signer_from_path(matches, wallet_manager)?;
+            unique_signers.push(default_signer);
+        }
+
+        for signer in bulk_signers.into_iter() {
+            if let Some(signer) = signer {
+                if !unique_signers.iter().any(|s| s == &signer) {
+                    unique_signers.push(signer);
+                }
+            }
+        }
+        Ok(CliSignerInfo {
+            signers: unique_signers,
+        })
+    }
+
+    pub fn signer_from_path(
+        &self,
+        matches: &ArgMatches,
+        wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    ) -> Result<Box<dyn Signer>, Box<dyn std::error::Error>> {
+        signer_from_path(matches, &self.path, &self.arg_name, wallet_manager)
+    }
+}
 
 pub enum KeypairUrl {
     Ask,
@@ -78,7 +163,7 @@ pub fn signer_from_path(
         KeypairUrl::Filepath(path) => match read_keypair_file(&path) {
             Err(e) => Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("could not find keypair file: {} error: {}", path, e),
+                format!("could not read keypair file \"{}\". Run \"solana-keygen new\" to create a keypair file: {}", path, e),
             )
             .into()),
             Ok(file) => Ok(Box::new(file)),
@@ -149,7 +234,7 @@ pub fn resolve_signer_from_path(
         KeypairUrl::Filepath(path) => match read_keypair_file(&path) {
             Err(e) => Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("could not find keypair file: {} error: {}", path, e),
+                format!("could not read keypair file \"{}\". Run \"solana-keygen new\" to create a keypair file: {}", path, e),
             )
             .into()),
             Ok(_) => Ok(Some(path.to_string())),
@@ -222,7 +307,24 @@ pub fn keypair_from_seed_phrase(
         keypair_from_seed_phrase_and_passphrase(&seed_phrase, &passphrase)?
     } else {
         let sanitized = sanitize_seed_phrase(seed_phrase);
-        let mnemonic = Mnemonic::from_phrase(&sanitized, Language::English)?;
+        let parse_language_fn = || {
+            for language in &[
+                Language::English,
+                Language::ChineseSimplified,
+                Language::ChineseTraditional,
+                Language::Japanese,
+                Language::Spanish,
+                Language::Korean,
+                Language::French,
+                Language::Italian,
+            ] {
+                if let Ok(mnemonic) = Mnemonic::from_phrase(&sanitized, *language) {
+                    return Ok(mnemonic);
+                }
+            }
+            Err("Can't get mnemonic from seed phrases")
+        };
+        let mnemonic = parse_language_fn()?;
         let passphrase = prompt_passphrase(&passphrase_prompt)?;
         let seed = Seed::new(&mnemonic, &passphrase);
         keypair_from_seed(seed.as_bytes())?

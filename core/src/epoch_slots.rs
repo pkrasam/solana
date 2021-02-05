@@ -24,6 +24,15 @@ impl Sanitize for Uncompressed {
         if self.num >= MAX_SLOTS_PER_ENTRY {
             return Err(SanitizeError::ValueOutOfBounds);
         }
+        if self.slots.len() % 8 != 0 {
+            // Uncompressed::new() ensures the length is always a multiple of 8
+            return Err(SanitizeError::ValueOutOfBounds);
+        }
+        if self.slots.len() != self.slots.capacity() {
+            // A BitVec<u8> with a length that's a multiple of 8 will always have len() equal to
+            // capacity(), assuming no bit manipulation
+            return Err(SanitizeError::ValueOutOfBounds);
+        }
         Ok(())
     }
 }
@@ -107,7 +116,7 @@ impl Uncompressed {
     pub fn to_slots(&self, min_slot: Slot) -> Vec<Slot> {
         let mut rv = vec![];
         let start = if min_slot < self.first_slot {
-            0 as usize
+            0
         } else {
             (min_slot - self.first_slot) as usize
         };
@@ -132,7 +141,7 @@ impl Uncompressed {
             if *s < self.first_slot {
                 return i;
             }
-            if *s - self.first_slot >= self.slots.capacity() {
+            if *s - self.first_slot >= self.slots.len() {
                 return i;
             }
             self.slots.set(*s - self.first_slot, true);
@@ -393,6 +402,14 @@ mod tests {
         o.num = MAX_SLOTS_PER_ENTRY;
         assert_eq!(o.sanitize(), Err(SanitizeError::ValueOutOfBounds));
 
+        let mut o = slots.clone();
+        o.slots = BitVec::new_fill(false, 7); // Length not a multiple of 8
+        assert_eq!(o.sanitize(), Err(SanitizeError::ValueOutOfBounds));
+
+        let mut o = slots.clone();
+        o.slots = BitVec::with_capacity(8); // capacity() not equal to len()
+        assert_eq!(o.sanitize(), Err(SanitizeError::ValueOutOfBounds));
+
         let compressed = Flate2::deflate(slots).unwrap();
         assert!(compressed.sanitize().is_ok());
 
@@ -451,6 +468,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::same_item_push)]
     fn test_epoch_slots_fill_uncompressed_random_range() {
         use rand::Rng;
         for _ in 0..10 {
@@ -469,6 +487,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::same_item_push)]
     fn test_epoch_slots_fill_compressed_random_range() {
         use rand::Rng;
         for _ in 0..10 {
@@ -489,6 +508,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::same_item_push)]
     fn test_epoch_slots_fill_random_range() {
         use rand::Rng;
         for _ in 0..10 {

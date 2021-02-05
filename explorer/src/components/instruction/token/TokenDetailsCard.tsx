@@ -1,5 +1,4 @@
 import React from "react";
-import * as Sentry from "@sentry/react";
 import { coerce } from "superstruct";
 import {
   SignatureResult,
@@ -11,14 +10,30 @@ import {
 import { UnknownDetailsCard } from "../UnknownDetailsCard";
 import { InstructionCard } from "../InstructionCard";
 import { Address } from "components/common/Address";
-import { IX_STRUCTS, TokenInstructionType, IX_TITLES } from "./types";
+import {
+  IX_STRUCTS,
+  TokenInstructionType,
+  IX_TITLES,
+  TokenAmountUi,
+} from "./types";
 import { ParsedInfo } from "validators";
+import {
+  useTokenAccountInfo,
+  useMintAccountInfo,
+  useFetchAccountInfo,
+} from "providers/accounts";
+import { normalizeTokenAmount } from "utils";
+import { reportError } from "utils/sentry";
+import { useCluster } from "providers/cluster";
+import { TokenRegistry } from "tokenRegistry";
 
 type DetailsProps = {
   tx: ParsedTransaction;
   ix: ParsedInstruction;
   result: SignatureResult;
   index: number;
+  innerCards?: JSX.Element[];
+  childIndex?: number;
 };
 
 export function TokenDetailsCard(props: DetailsProps) {
@@ -30,10 +45,8 @@ export function TokenDetailsCard(props: DetailsProps) {
     const coerced = coerce(info, IX_STRUCTS[type] as any);
     return <TokenInstruction title={title} info={coerced} {...props} />;
   } catch (err) {
-    Sentry.captureException(err, {
-      tags: {
-        signature: props.tx.signatures[0],
-      },
+    reportError(err, {
+      signature: props.tx.signatures[0],
     });
     return <UnknownDetailsCard {...props} />;
   }
@@ -45,26 +58,136 @@ type InfoProps = {
   result: SignatureResult;
   index: number;
   title: string;
+  innerCards?: JSX.Element[];
+  childIndex?: number;
 };
 
 function TokenInstruction(props: InfoProps) {
-  const attributes = [];
+  const { mintAddress: infoMintAddress, tokenAddress } = React.useMemo(() => {
+    let mintAddress: string | undefined;
+    let tokenAddress: string | undefined;
+
+    // No sense fetching accounts if we don't need to convert an amount
+    if (!("amount" in props.info)) return {};
+
+    if ("mint" in props.info && props.info.mint instanceof PublicKey) {
+      mintAddress = props.info.mint.toBase58();
+    } else if (
+      "account" in props.info &&
+      props.info.account instanceof PublicKey
+    ) {
+      tokenAddress = props.info.account.toBase58();
+    } else if (
+      "source" in props.info &&
+      props.info.source instanceof PublicKey
+    ) {
+      tokenAddress = props.info.source.toBase58();
+    }
+    return {
+      mintAddress,
+      tokenAddress,
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const tokenInfo = useTokenAccountInfo(tokenAddress);
+  const mintAddress = infoMintAddress || tokenInfo?.mint.toBase58();
+  const mintInfo = useMintAccountInfo(mintAddress);
+  const { cluster } = useCluster();
+  const fetchAccountInfo = useFetchAccountInfo();
+
+  React.useEffect(() => {
+    if (tokenAddress && !tokenInfo) {
+      fetchAccountInfo(new PublicKey(tokenAddress));
+    }
+  }, [fetchAccountInfo, tokenAddress]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  React.useEffect(() => {
+    if (mintAddress && !mintInfo) {
+      fetchAccountInfo(new PublicKey(mintAddress));
+    }
+  }, [fetchAccountInfo, mintAddress]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const attributes: JSX.Element[] = [];
+  let decimals = mintInfo?.decimals;
+  let tokenSymbol = "";
+
+  if ("tokenAmount" in props.info) {
+    decimals = props.info.tokenAmount.decimals;
+  }
+
+  if (mintAddress) {
+    const tokenDetails = TokenRegistry.get(mintAddress, cluster);
+
+    if (tokenDetails && "symbol" in tokenDetails) {
+      tokenSymbol = tokenDetails.symbol;
+    }
+
+    attributes.push(
+      <tr key={mintAddress}>
+        <td>Token</td>
+        <td className="text-lg-right">
+          <Address pubkey={new PublicKey(mintAddress)} alignRight link />
+        </td>
+      </tr>
+    );
+  }
+
   for (let key in props.info) {
-    const value = props.info[key];
+    let value = props.info[key];
     if (value === undefined) continue;
 
+    // Flatten lists of public keys
+    if (Array.isArray(value) && value.every((v) => v instanceof PublicKey)) {
+      for (let i = 0; i < value.length; i++) {
+        let publicKey = value[i];
+        let label = `${key.charAt(0).toUpperCase() + key.slice(1)} - #${i + 1}`;
+
+        attributes.push(
+          <tr key={key + i}>
+            <td>{label}</td>
+            <td className="text-lg-right">
+              <Address pubkey={publicKey} alignRight link />
+            </td>
+          </tr>
+        );
+      }
+      continue;
+    }
+
+    if (key === "tokenAmount") {
+      key = "amount";
+      value = (value as TokenAmountUi).amount;
+    }
+
     let tag;
+    let labelSuffix = "";
     if (value instanceof PublicKey) {
       tag = <Address pubkey={value} alignRight link />;
+    } else if (key === "amount") {
+      let amount;
+      if (decimals === undefined) {
+        labelSuffix = " (raw)";
+        amount = new Intl.NumberFormat("en-US").format(value);
+      } else {
+        amount = new Intl.NumberFormat("en-US", {
+          minimumFractionDigits: decimals,
+          maximumFractionDigits: decimals,
+        }).format(normalizeTokenAmount(value, decimals));
+      }
+      tag = (
+        <>
+          {amount} {tokenSymbol}
+        </>
+      );
     } else {
       tag = <>{value}</>;
     }
 
-    key = key.charAt(0).toUpperCase() + key.slice(1);
+    let label = key.charAt(0).toUpperCase() + key.slice(1) + labelSuffix;
 
     attributes.push(
       <tr key={key}>
-        <td>{key}</td>
+        <td>{label}</td>
         <td className="text-lg-right">{tag}</td>
       </tr>
     );
@@ -76,6 +199,8 @@ function TokenInstruction(props: InfoProps) {
       index={props.index}
       result={props.result}
       title={props.title}
+      innerCards={props.innerCards}
+      childIndex={props.childIndex}
     >
       {attributes}
     </InstructionCard>

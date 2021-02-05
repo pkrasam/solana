@@ -3,8 +3,9 @@ import {
   PublicKey,
   ConfirmedSignatureInfo,
   ParsedInstruction,
+  PartiallyDecodedInstruction,
 } from "@solana/web3.js";
-import { FetchStatus } from "providers/cache";
+import { CacheEntry, FetchStatus } from "providers/cache";
 import {
   useAccountHistories,
   useFetchAccountHistory,
@@ -12,19 +13,47 @@ import {
 import {
   useAccountOwnedTokens,
   TokenInfoWithPubkey,
+  TOKEN_PROGRAM_ID,
 } from "providers/accounts/tokens";
 import { ErrorCard } from "components/common/ErrorCard";
 import { LoadingCard } from "components/common/LoadingCard";
 import { Signature } from "components/common/Signature";
 import { Address } from "components/common/Address";
-import { useTransactionDetails } from "providers/transactions";
-import { useFetchTransactionDetails } from "providers/transactions/details";
+import { Slot } from "components/common/Slot";
+import {
+  Details,
+  useFetchTransactionDetails,
+  useTransactionDetailsCache,
+} from "providers/transactions/details";
 import { coerce } from "superstruct";
 import { ParsedInfo } from "validators";
 import {
   TokenInstructionType,
   IX_TITLES,
 } from "components/instruction/token/types";
+import { reportError } from "utils/sentry";
+import { intoTransactionInstruction, displayAddress } from "utils/tx";
+import {
+  isTokenSwapInstruction,
+  parseTokenSwapInstructionTitle,
+} from "components/instruction/token-swap/types";
+import {
+  isSerumInstruction,
+  parseSerumInstructionTitle,
+} from "components/instruction/serum/types";
+import { INNER_INSTRUCTIONS_START_SLOT } from "pages/TransactionDetailsPage";
+import { useCluster, Cluster } from "providers/cluster";
+import { Link } from "react-router-dom";
+import { Location } from "history";
+import { useQuery } from "utils/url";
+
+const TRUNCATE_TOKEN_LENGTH = 10;
+const ALL_TOKENS = "";
+
+type InstructionType = {
+  name: string;
+  innerInstructions: (ParsedInstruction | PartiallyDecodedInstruction)[];
+};
 
 export function TokenHistoryCard({ pubkey }: { pubkey: PublicKey }) {
   const address = pubkey.toBase58();
@@ -37,22 +66,58 @@ export function TokenHistoryCard({ pubkey }: { pubkey: PublicKey }) {
   const tokens = ownedTokens.data?.tokens;
   if (tokens === undefined || tokens.length === 0) return null;
 
+  if (tokens.length > 25) {
+    return (
+      <ErrorCard text="Token transaction history is not available for accounts with over 25 token accounts" />
+    );
+  }
+
   return <TokenHistoryTable tokens={tokens} />;
 }
+
+const useQueryFilter = (): string => {
+  const query = useQuery();
+  const filter = query.get("filter");
+  return filter || "";
+};
+
+type FilterProps = {
+  filter: string;
+  toggle: () => void;
+  show: boolean;
+  tokens: TokenInfoWithPubkey[];
+};
 
 function TokenHistoryTable({ tokens }: { tokens: TokenInfoWithPubkey[] }) {
   const accountHistories = useAccountHistories();
   const fetchAccountHistory = useFetchAccountHistory();
+  const transactionDetailsCache = useTransactionDetailsCache();
+  const [showDropdown, setDropdown] = React.useState(false);
+  const filter = useQueryFilter();
 
-  const fetchHistories = (refresh?: boolean) => {
-    tokens.forEach((token) => {
-      fetchAccountHistory(token.pubkey, refresh);
-    });
-  };
+  const filteredTokens = React.useMemo(
+    () =>
+      tokens.filter((token) => {
+        if (filter === ALL_TOKENS) {
+          return true;
+        }
+        return token.info.mint.toBase58() === filter;
+      }),
+    [tokens, filter]
+  );
+
+  const fetchHistories = React.useCallback(
+    (refresh?: boolean) => {
+      filteredTokens.forEach((token) => {
+        fetchAccountHistory(token.pubkey, refresh);
+      });
+    },
+    [filteredTokens, fetchAccountHistory]
+  );
 
   // Fetch histories on load
   React.useEffect(() => {
-    tokens.forEach((token) => {
+    filteredTokens.forEach((token) => {
       const address = token.pubkey.toBase58();
       if (!accountHistories[address]) {
         fetchAccountHistory(token.pubkey, true);
@@ -60,23 +125,43 @@ function TokenHistoryTable({ tokens }: { tokens: TokenInfoWithPubkey[] }) {
     });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const fetchedFullHistory = tokens.every((token) => {
+  const allFoundOldest = filteredTokens.every((token) => {
     const history = accountHistories[token.pubkey.toBase58()];
     return history?.data?.foundOldest === true;
   });
 
-  const fetching = tokens.some((token) => {
+  const allFetchedSome = filteredTokens.every((token) => {
+    const history = accountHistories[token.pubkey.toBase58()];
+    return history?.data !== undefined;
+  });
+
+  // Find the oldest slot which we know we have the full history for
+  let oldestSlot: number | undefined = allFoundOldest ? 0 : undefined;
+
+  if (!allFoundOldest && allFetchedSome) {
+    filteredTokens.forEach((token) => {
+      const history = accountHistories[token.pubkey.toBase58()];
+      if (history?.data?.foundOldest === false) {
+        const earliest =
+          history.data.fetched[history.data.fetched.length - 1].slot;
+        if (!oldestSlot) oldestSlot = earliest;
+        oldestSlot = Math.max(oldestSlot, earliest);
+      }
+    });
+  }
+
+  const fetching = filteredTokens.some((token) => {
     const history = accountHistories[token.pubkey.toBase58()];
     return history?.status === FetchStatus.Fetching;
   });
 
-  const failed = tokens.some((token) => {
+  const failed = filteredTokens.some((token) => {
     const history = accountHistories[token.pubkey.toBase58()];
     return history?.status === FetchStatus.FetchFailed;
   });
 
   const sigSet = new Set();
-  const mintAndTxs = tokens
+  const mintAndTxs = filteredTokens
     .map((token) => ({
       mint: token.info.mint,
       history: accountHistories[token.pubkey.toBase58()],
@@ -94,7 +179,16 @@ function TokenHistoryTable({ tokens }: { tokens: TokenInfoWithPubkey[] }) {
       if (sigSet.has(tx.signature)) return false;
       sigSet.add(tx.signature);
       return true;
+    })
+    .filter(({ tx }) => {
+      return oldestSlot !== undefined && tx.slot >= oldestSlot;
     });
+
+  React.useEffect(() => {
+    if (!fetching && mintAndTxs.length < 1 && !allFoundOldest) {
+      fetchHistories();
+    }
+  }, [fetching, mintAndTxs, allFoundOldest, fetchHistories]);
 
   if (mintAndTxs.length === 0) {
     if (fetching) {
@@ -126,6 +220,12 @@ function TokenHistoryTable({ tokens }: { tokens: TokenInfoWithPubkey[] }) {
     <div className="card">
       <div className="card-header align-items-center">
         <h3 className="card-header-title">Token History</h3>
+        <FilterDropdown
+          filter={filter}
+          toggle={() => setDropdown((show) => !show)}
+          show={showDropdown}
+          tokens={tokens}
+        ></FilterDropdown>
         <button
           className="btn btn-white btn-sm"
           disabled={fetching}
@@ -158,14 +258,19 @@ function TokenHistoryTable({ tokens }: { tokens: TokenInfoWithPubkey[] }) {
           </thead>
           <tbody className="list">
             {mintAndTxs.map(({ mint, tx }) => (
-              <TokenTransactionRow key={tx.signature} mint={mint} tx={tx} />
+              <TokenTransactionRow
+                key={tx.signature}
+                mint={mint}
+                tx={tx}
+                details={transactionDetailsCache[tx.signature]}
+              />
             ))}
           </tbody>
         </table>
       </div>
 
       <div className="card-footer">
-        {fetchedFullHistory ? (
+        {allFoundOldest ? (
           <div className="text-muted text-center">Fetched full history</div>
         ) : (
           <button
@@ -188,105 +293,307 @@ function TokenHistoryTable({ tokens }: { tokens: TokenInfoWithPubkey[] }) {
   );
 }
 
-function TokenTransactionRow({
-  mint,
-  tx,
-}: {
-  mint: PublicKey;
-  tx: ConfirmedSignatureInfo;
-}) {
-  const details = useTransactionDetails(tx.signature);
-  const fetchDetails = useFetchTransactionDetails();
+const FilterDropdown = ({ filter, toggle, show, tokens }: FilterProps) => {
+  const { cluster } = useCluster();
 
-  // Fetch details on load
-  React.useEffect(() => {
-    if (!details) fetchDetails(tx.signature);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const instructions =
-    details?.data?.transaction?.transaction.message.instructions;
-  if (instructions) {
-    const tokenInstructions = instructions.filter(
-      (ix) => "parsed" in ix && ix.program === "spl-token"
-    ) as ParsedInstruction[];
-    if (tokenInstructions.length > 0) {
-      return (
-        <>
-          {tokenInstructions.map((ix, index) => {
-            const parsed = coerce(ix.parsed, ParsedInfo);
-            const { type: rawType } = parsed;
-            const type = coerce(rawType, TokenInstructionType);
-            const typeName = IX_TITLES[type];
-
-            let statusText;
-            let statusClass;
-            if (tx.err) {
-              statusClass = "warning";
-              statusText = "Failed";
-            } else {
-              statusClass = "success";
-              statusText = "Success";
-            }
-
-            return (
-              <tr key={index}>
-                <td className="w-1 text-monospace">
-                  {tx.slot.toLocaleString("en-US")}
-                </td>
-
-                <td>
-                  <span className={`badge badge-soft-${statusClass}`}>
-                    {statusText}
-                  </span>
-                </td>
-
-                <td>
-                  <Address pubkey={mint} link truncate />
-                </td>
-
-                <td>{typeName}</td>
-
-                <td>
-                  <Signature signature={tx.signature} link />
-                </td>
-              </tr>
-            );
-          })}
-        </>
-      );
+  const buildLocation = (location: Location, filter: string) => {
+    const params = new URLSearchParams(location.search);
+    if (filter === ALL_TOKENS) {
+      params.delete("filter");
+    } else {
+      params.set("filter", filter);
     }
-  }
+    return {
+      ...location,
+      search: params.toString(),
+    };
+  };
 
-  let statusText;
-  let statusClass;
-  if (tx.err) {
-    statusClass = "warning";
-    statusText = "Failed";
-  } else {
-    statusClass = "success";
-    statusText = "Success";
-  }
+  const filterOptions: string[] = [ALL_TOKENS];
+  const nameLookup: { [mint: string]: string } = {};
+
+  tokens.forEach((token) => {
+    const pubkey = token.info.mint.toBase58();
+    filterOptions.push(pubkey);
+    nameLookup[pubkey] = formatTokenName(pubkey, cluster);
+  });
 
   return (
-    <tr key={tx.signature}>
-      <td className="w-1 text-monospace">{tx.slot.toLocaleString("en-US")}</td>
-
-      <td>
-        <span className={`badge badge-soft-${statusClass}`}>{statusText}</span>
-      </td>
-
-      <td>
-        <Address pubkey={mint} link />
-      </td>
-
-      <td>
-        <span className="spinner-grow spinner-grow-sm mr-2"></span>
-        Loading
-      </td>
-
-      <td>
-        <Signature signature={tx.signature} link />
-      </td>
-    </tr>
+    <div className="dropdown mr-2">
+      <small className="mr-2">Filter:</small>
+      <button
+        className="btn btn-white btn-sm dropdown-toggle"
+        type="button"
+        onClick={toggle}
+      >
+        {filter === ALL_TOKENS ? "All Tokens" : nameLookup[filter]}
+      </button>
+      <div
+        className={`token-filter dropdown-menu-right dropdown-menu${
+          show ? " show" : ""
+        }`}
+      >
+        {filterOptions.map((filterOption) => {
+          return (
+            <Link
+              key={filterOption}
+              to={(location: Location) => buildLocation(location, filterOption)}
+              className={`dropdown-item${
+                filterOption === filter ? " active" : ""
+              }`}
+              onClick={toggle}
+            >
+              {filterOption === ALL_TOKENS
+                ? "All Tokens"
+                : formatTokenName(filterOption, cluster)}
+            </Link>
+          );
+        })}
+      </div>
+    </div>
   );
+};
+
+function instructionTypeName(
+  ix: ParsedInstruction,
+  tx: ConfirmedSignatureInfo
+): string {
+  try {
+    const parsed = coerce(ix.parsed, ParsedInfo);
+    const { type: rawType } = parsed;
+    const type = coerce(rawType, TokenInstructionType);
+    return IX_TITLES[type];
+  } catch (err) {
+    reportError(err, { signature: tx.signature });
+    return "Unknown";
+  }
+}
+
+const TokenTransactionRow = React.memo(
+  ({
+    mint,
+    tx,
+    details,
+  }: {
+    mint: PublicKey;
+    tx: ConfirmedSignatureInfo;
+    details: CacheEntry<Details> | undefined;
+  }) => {
+    const fetchDetails = useFetchTransactionDetails();
+    const { cluster } = useCluster();
+
+    // Fetch details on load
+    React.useEffect(() => {
+      if (!details) fetchDetails(tx.signature);
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+    let statusText: string;
+    let statusClass: string;
+    if (tx.err) {
+      statusClass = "warning";
+      statusText = "Failed";
+    } else {
+      statusClass = "success";
+      statusText = "Success";
+    }
+
+    const instructions =
+      details?.data?.transaction?.transaction.message.instructions;
+    if (!instructions)
+      return (
+        <tr key={tx.signature}>
+          <td className="w-1">
+            <Slot slot={tx.slot} link />
+          </td>
+
+          <td>
+            <span className={`badge badge-soft-${statusClass}`}>
+              {statusText}
+            </span>
+          </td>
+
+          <td>
+            <Address pubkey={mint} link truncate />
+          </td>
+
+          <td>
+            <span className="spinner-grow spinner-grow-sm mr-2"></span>
+            Loading
+          </td>
+
+          <td>
+            <Signature signature={tx.signature} link />
+          </td>
+        </tr>
+      );
+
+    let tokenInstructionNames: InstructionType[] = [];
+
+    if (details?.data?.transaction) {
+      const transaction = details.data.transaction;
+
+      tokenInstructionNames = instructions
+        .map((ix, index): InstructionType | undefined => {
+          let name = "Unknown";
+
+          const innerInstructions: (
+            | ParsedInstruction
+            | PartiallyDecodedInstruction
+          )[] = [];
+
+          if (
+            transaction.meta?.innerInstructions &&
+            (cluster !== Cluster.MainnetBeta ||
+              transaction.slot >= INNER_INSTRUCTIONS_START_SLOT)
+          ) {
+            transaction.meta.innerInstructions.forEach((ix) => {
+              if (ix.index === index) {
+                ix.instructions.forEach((inner) => {
+                  innerInstructions.push(inner);
+                });
+              }
+            });
+          }
+
+          let transactionInstruction;
+          if (transaction?.transaction) {
+            transactionInstruction = intoTransactionInstruction(
+              transaction.transaction,
+              ix
+            );
+          }
+
+          if ("parsed" in ix) {
+            if (ix.program === "spl-token") {
+              name = instructionTypeName(ix, tx);
+            } else {
+              return undefined;
+            }
+          } else if (
+            transactionInstruction &&
+            isSerumInstruction(transactionInstruction)
+          ) {
+            try {
+              name = parseSerumInstructionTitle(transactionInstruction);
+            } catch (error) {
+              reportError(error, { signature: tx.signature });
+              return undefined;
+            }
+          } else if (
+            transactionInstruction &&
+            isTokenSwapInstruction(transactionInstruction)
+          ) {
+            try {
+              name = parseTokenSwapInstructionTitle(transactionInstruction);
+            } catch (error) {
+              reportError(error, { signature: tx.signature });
+              return undefined;
+            }
+          } else {
+            if (
+              ix.accounts.findIndex((account) =>
+                account.equals(TOKEN_PROGRAM_ID)
+              ) >= 0
+            ) {
+              name = "Unknown (Inner)";
+            } else {
+              return undefined;
+            }
+          }
+
+          return {
+            name: name,
+            innerInstructions: innerInstructions,
+          };
+        })
+        .filter((name) => name !== undefined) as InstructionType[];
+    }
+
+    return (
+      <>
+        {tokenInstructionNames.map((instructionType, index) => {
+          return (
+            <tr key={index}>
+              <td className="w-1">
+                <Slot slot={tx.slot} link />
+              </td>
+
+              <td>
+                <span className={`badge badge-soft-${statusClass}`}>
+                  {statusText}
+                </span>
+              </td>
+
+              <td className="forced-truncate">
+                <Address pubkey={mint} link truncateUnknown />
+              </td>
+
+              <td>
+                <InstructionDetails instructionType={instructionType} tx={tx} />
+              </td>
+
+              <td className="forced-truncate">
+                <Signature signature={tx.signature} link truncate />
+              </td>
+            </tr>
+          );
+        })}
+      </>
+    );
+  }
+);
+
+function InstructionDetails({
+  instructionType,
+  tx,
+}: {
+  instructionType: InstructionType;
+  tx: ConfirmedSignatureInfo;
+}) {
+  const [expanded, setExpanded] = React.useState(false);
+
+  let instructionTypes = instructionType.innerInstructions
+    .map((ix) => {
+      if ("parsed" in ix && ix.program === "spl-token") {
+        return instructionTypeName(ix, tx);
+      }
+      return undefined;
+    })
+    .filter((type) => type !== undefined);
+
+  return (
+    <>
+      <p className="tree">
+        {instructionTypes.length > 0 && (
+          <span
+            onClick={(e) => {
+              e.preventDefault();
+              setExpanded(!expanded);
+            }}
+            className={`c-pointer fe mr-2 ${
+              expanded ? "fe-minus-square" : "fe-plus-square"
+            }`}
+          ></span>
+        )}
+        {instructionType.name}
+      </p>
+      {expanded && (
+        <ul className="tree">
+          {instructionTypes.map((type, index) => {
+            return <li key={index}>{type}</li>;
+          })}
+        </ul>
+      )}
+    </>
+  );
+}
+
+function formatTokenName(pubkey: string, cluster: Cluster): string {
+  let display = displayAddress(pubkey, cluster);
+
+  if (display === pubkey) {
+    display = display.slice(0, TRUNCATE_TOKEN_LENGTH) + "\u2026";
+  }
+
+  return display;
 }

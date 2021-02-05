@@ -1,22 +1,20 @@
 use crate::{
     cluster_info_vote_listener::SlotVoteTracker,
     cluster_slots::SlotPubkeys,
-    pubkey_references::PubkeyReferences,
     replay_stage::SUPERMINORITY_THRESHOLD,
     {consensus::Stake, consensus::VotedStakes},
 };
 use solana_ledger::blockstore_processor::{ConfirmationProgress, ConfirmationTiming};
-use solana_runtime::{bank::Bank, bank_forks::BankForks};
-use solana_sdk::{account::Account, clock::Slot, hash::Hash, pubkey::Pubkey};
+use solana_runtime::{bank::Bank, bank_forks::BankForks, vote_account::ArcVoteAccount};
+use solana_sdk::{clock::Slot, hash::Hash, pubkey::Pubkey};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    rc::Rc,
     sync::{Arc, RwLock},
 };
 
 type VotedSlot = Slot;
 type ExpirationSlot = Slot;
-pub(crate) type LockoutIntervals = BTreeMap<ExpirationSlot, Vec<(VotedSlot, Rc<Pubkey>)>>;
+pub(crate) type LockoutIntervals = BTreeMap<ExpirationSlot, Vec<(VotedSlot, Pubkey)>>;
 
 #[derive(Default)]
 pub(crate) struct ReplaySlotStats(ConfirmationTiming);
@@ -61,6 +59,9 @@ impl ReplaySlotStats {
             ),
             ("total_entries", num_entries as i64, i64),
             ("total_shreds", num_shreds as i64, i64),
+            ("load_us", self.execute_timings.load_us, i64),
+            ("execute_us", self.execute_timings.execute_us, i64),
+            ("store_us", self.execute_timings.store_us, i64),
         );
     }
 }
@@ -125,9 +126,7 @@ impl ForkProgress {
                 (
                     true,
                     info.stake,
-                    vec![Rc::new(info.validator_vote_pubkey)]
-                        .into_iter()
-                        .collect(),
+                    vec![info.validator_vote_pubkey].into_iter().collect(),
                     {
                         if info.total_epoch_stake == 0 {
                             true
@@ -168,7 +167,7 @@ impl ForkProgress {
         num_dropped_blocks_on_fork: u64,
     ) -> Self {
         let validator_fork_info = {
-            if bank.collector_id() == my_pubkey && bank.slot() > 0 {
+            if bank.collector_id() == my_pubkey {
                 let stake = bank.epoch_vote_account_stake(voting_pubkey);
                 Some(ValidatorStakeInfo::new(
                     *voting_pubkey,
@@ -209,8 +208,8 @@ pub(crate) struct ForkStats {
 
 #[derive(Clone, Default)]
 pub(crate) struct PropagatedStats {
-    pub(crate) propagated_validators: HashSet<Rc<Pubkey>>,
-    pub(crate) propagated_node_ids: HashSet<Rc<Pubkey>>,
+    pub(crate) propagated_validators: HashSet<Pubkey>,
+    pub(crate) propagated_node_ids: HashSet<Pubkey>,
     pub(crate) propagated_validators_stake: u64,
     pub(crate) is_propagated: bool,
     pub(crate) is_leader_slot: bool,
@@ -221,25 +220,13 @@ pub(crate) struct PropagatedStats {
 }
 
 impl PropagatedStats {
-    pub fn add_vote_pubkey(
-        &mut self,
-        vote_pubkey: &Pubkey,
-        all_pubkeys: &mut PubkeyReferences,
-        stake: u64,
-    ) {
-        if !self.propagated_validators.contains(vote_pubkey) {
-            let cached_pubkey = all_pubkeys.get_or_insert(vote_pubkey);
-            self.propagated_validators.insert(cached_pubkey);
+    pub fn add_vote_pubkey(&mut self, vote_pubkey: Pubkey, stake: u64) {
+        if self.propagated_validators.insert(vote_pubkey) {
             self.propagated_validators_stake += stake;
         }
     }
 
-    pub fn add_node_pubkey(
-        &mut self,
-        node_pubkey: &Pubkey,
-        all_pubkeys: &mut PubkeyReferences,
-        bank: &Bank,
-    ) {
+    pub fn add_node_pubkey(&mut self, node_pubkey: &Pubkey, bank: &Bank) {
         if !self.propagated_node_ids.contains(node_pubkey) {
             let node_vote_accounts = bank
                 .epoch_vote_accounts_for_node_id(&node_pubkey)
@@ -248,7 +235,6 @@ impl PropagatedStats {
             if let Some(node_vote_accounts) = node_vote_accounts {
                 self.add_node_pubkey_internal(
                     node_pubkey,
-                    all_pubkeys,
                     node_vote_accounts,
                     bank.epoch_vote_accounts(bank.epoch())
                         .expect("Epoch stakes for bank's own epoch must exist"),
@@ -260,18 +246,16 @@ impl PropagatedStats {
     fn add_node_pubkey_internal(
         &mut self,
         node_pubkey: &Pubkey,
-        all_pubkeys: &mut PubkeyReferences,
         vote_account_pubkeys: &[Pubkey],
-        epoch_vote_accounts: &HashMap<Pubkey, (u64, Account)>,
+        epoch_vote_accounts: &HashMap<Pubkey, (u64, ArcVoteAccount)>,
     ) {
-        let cached_pubkey = all_pubkeys.get_or_insert(node_pubkey);
-        self.propagated_node_ids.insert(cached_pubkey);
+        self.propagated_node_ids.insert(*node_pubkey);
         for vote_account_pubkey in vote_account_pubkeys.iter() {
             let stake = epoch_vote_accounts
                 .get(vote_account_pubkey)
                 .map(|(stake, _)| *stake)
                 .unwrap_or(0);
-            self.add_vote_pubkey(vote_account_pubkey, all_pubkeys, stake);
+            self.add_vote_pubkey(*vote_account_pubkey, stake);
         }
     }
 }
@@ -400,79 +384,53 @@ mod test {
     #[test]
     fn test_add_vote_pubkey() {
         let mut stats = PropagatedStats::default();
-        let mut all_pubkeys = PubkeyReferences::default();
-        let mut vote_pubkey = Pubkey::new_rand();
-        all_pubkeys.get_or_insert(&vote_pubkey);
+        let mut vote_pubkey = solana_sdk::pubkey::new_rand();
 
         // Add a vote pubkey, the number of references in all_pubkeys
         // should be 2
-        stats.add_vote_pubkey(&vote_pubkey, &mut all_pubkeys, 1);
+        stats.add_vote_pubkey(vote_pubkey, 1);
         assert!(stats.propagated_validators.contains(&vote_pubkey));
         assert_eq!(stats.propagated_validators_stake, 1);
-        assert_eq!(
-            Rc::strong_count(&all_pubkeys.get_or_insert(&vote_pubkey)),
-            3
-        );
 
         // Adding it again should change no state since the key already existed
-        stats.add_vote_pubkey(&vote_pubkey, &mut all_pubkeys, 1);
+        stats.add_vote_pubkey(vote_pubkey, 1);
         assert!(stats.propagated_validators.contains(&vote_pubkey));
         assert_eq!(stats.propagated_validators_stake, 1);
 
         // Adding another pubkey should succeed
-        vote_pubkey = Pubkey::new_rand();
-        stats.add_vote_pubkey(&vote_pubkey, &mut all_pubkeys, 2);
+        vote_pubkey = solana_sdk::pubkey::new_rand();
+        stats.add_vote_pubkey(vote_pubkey, 2);
         assert!(stats.propagated_validators.contains(&vote_pubkey));
         assert_eq!(stats.propagated_validators_stake, 3);
-        assert_eq!(
-            Rc::strong_count(&all_pubkeys.get_or_insert(&vote_pubkey)),
-            3
-        );
     }
 
     #[test]
     fn test_add_node_pubkey_internal() {
         let num_vote_accounts = 10;
         let staked_vote_accounts = 5;
-        let vote_account_pubkeys: Vec<_> = std::iter::repeat_with(Pubkey::new_rand)
+        let vote_account_pubkeys: Vec<_> = std::iter::repeat_with(solana_sdk::pubkey::new_rand)
             .take(num_vote_accounts)
             .collect();
         let epoch_vote_accounts: HashMap<_, _> = vote_account_pubkeys
             .iter()
             .skip(num_vote_accounts - staked_vote_accounts)
-            .map(|pubkey| (*pubkey, (1, Account::default())))
+            .map(|pubkey| (*pubkey, (1, ArcVoteAccount::default())))
             .collect();
 
         let mut stats = PropagatedStats::default();
-        let mut all_pubkeys = PubkeyReferences::default();
-        let mut node_pubkey = Pubkey::new_rand();
-        all_pubkeys.get_or_insert(&node_pubkey);
+        let mut node_pubkey = solana_sdk::pubkey::new_rand();
 
         // Add a vote pubkey, the number of references in all_pubkeys
         // should be 2
-        stats.add_node_pubkey_internal(
-            &node_pubkey,
-            &mut all_pubkeys,
-            &vote_account_pubkeys,
-            &epoch_vote_accounts,
-        );
+        stats.add_node_pubkey_internal(&node_pubkey, &vote_account_pubkeys, &epoch_vote_accounts);
         assert!(stats.propagated_node_ids.contains(&node_pubkey));
         assert_eq!(
             stats.propagated_validators_stake,
             staked_vote_accounts as u64
         );
-        assert_eq!(
-            Rc::strong_count(&all_pubkeys.get_or_insert(&node_pubkey)),
-            3
-        );
 
         // Adding it again should not change any state
-        stats.add_node_pubkey_internal(
-            &node_pubkey,
-            &mut all_pubkeys,
-            &vote_account_pubkeys,
-            &epoch_vote_accounts,
-        );
+        stats.add_node_pubkey_internal(&node_pubkey, &vote_account_pubkeys, &epoch_vote_accounts);
         assert!(stats.propagated_node_ids.contains(&node_pubkey));
         assert_eq!(
             stats.propagated_validators_stake,
@@ -481,48 +439,30 @@ mod test {
 
         // Adding another pubkey with same vote accounts should succeed, but stake
         // shouldn't increase
-        node_pubkey = Pubkey::new_rand();
-        stats.add_node_pubkey_internal(
-            &node_pubkey,
-            &mut all_pubkeys,
-            &vote_account_pubkeys,
-            &epoch_vote_accounts,
-        );
+        node_pubkey = solana_sdk::pubkey::new_rand();
+        stats.add_node_pubkey_internal(&node_pubkey, &vote_account_pubkeys, &epoch_vote_accounts);
         assert!(stats.propagated_node_ids.contains(&node_pubkey));
         assert_eq!(
             stats.propagated_validators_stake,
             staked_vote_accounts as u64
         );
-        assert_eq!(
-            Rc::strong_count(&all_pubkeys.get_or_insert(&node_pubkey)),
-            3
-        );
 
         // Adding another pubkey with different vote accounts should succeed
         // and increase stake
-        node_pubkey = Pubkey::new_rand();
-        let vote_account_pubkeys: Vec<_> = std::iter::repeat_with(Pubkey::new_rand)
+        node_pubkey = solana_sdk::pubkey::new_rand();
+        let vote_account_pubkeys: Vec<_> = std::iter::repeat_with(solana_sdk::pubkey::new_rand)
             .take(num_vote_accounts)
             .collect();
         let epoch_vote_accounts: HashMap<_, _> = vote_account_pubkeys
             .iter()
             .skip(num_vote_accounts - staked_vote_accounts)
-            .map(|pubkey| (*pubkey, (1, Account::default())))
+            .map(|pubkey| (*pubkey, (1, ArcVoteAccount::default())))
             .collect();
-        stats.add_node_pubkey_internal(
-            &node_pubkey,
-            &mut all_pubkeys,
-            &vote_account_pubkeys,
-            &epoch_vote_accounts,
-        );
+        stats.add_node_pubkey_internal(&node_pubkey, &vote_account_pubkeys, &epoch_vote_accounts);
         assert!(stats.propagated_node_ids.contains(&node_pubkey));
         assert_eq!(
             stats.propagated_validators_stake,
             2 * staked_vote_accounts as u64
-        );
-        assert_eq!(
-            Rc::strong_count(&all_pubkeys.get_or_insert(&node_pubkey)),
-            3
         );
     }
 

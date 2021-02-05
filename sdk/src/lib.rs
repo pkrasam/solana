@@ -4,47 +4,45 @@
 // Allows macro expansion of `use ::solana_sdk::*` to work within this crate
 extern crate self as solana_sdk;
 
-#[cfg(RUSTC_WITH_SPECIALIZATION)]
-pub mod abi_digester;
-#[cfg(RUSTC_WITH_SPECIALIZATION)]
-pub mod abi_example;
+pub use solana_program::*;
 
 pub mod account;
 pub mod account_utils;
-pub mod bpf_loader;
-pub mod bpf_loader_deprecated;
 pub mod builtins;
-pub mod clock;
+pub mod client;
 pub mod commitment_config;
-pub mod decode_error;
+pub mod deserialize_utils;
+pub mod entrypoint;
+pub mod entrypoint_deprecated;
 pub mod entrypoint_native;
 pub mod epoch_info;
-pub mod epoch_schedule;
-pub mod fee_calculator;
+pub mod feature;
+pub mod feature_set;
+pub mod genesis_config;
+pub mod hard_forks;
 pub mod hash;
-pub mod incinerator;
 pub mod inflation;
-pub mod instruction;
-pub mod loader_instruction;
-pub mod message;
+pub mod keyed_account;
+pub mod log;
 pub mod native_loader;
-pub mod native_token;
-pub mod nonce;
+pub mod nonce_account;
+pub mod nonce_keyed_account;
 pub mod packet;
 pub mod poh_config;
+pub mod process_instruction;
 pub mod program_utils;
 pub mod pubkey;
-pub mod rent;
+pub mod recent_blockhashes_account;
 pub mod rpc_port;
-pub mod sanitize;
-pub mod short_vec;
-pub mod slot_hashes;
-pub mod slot_history;
-pub mod stake_history;
-pub mod system_instruction;
-pub mod system_program;
-pub mod sysvar;
+pub mod secp256k1_instruction;
+pub mod shred_version;
+pub mod signature;
+pub mod signers;
+pub mod stake_weighted_timestamp;
+pub mod system_transaction;
 pub mod timing;
+pub mod transaction;
+pub mod transport;
 
 /// Convenience macro to declare a static public key and functions to interact with it
 ///
@@ -72,33 +70,15 @@ pub use solana_sdk_macro::pubkeys;
 #[rustversion::since(1.46.0)]
 pub use solana_sdk_macro::respan;
 
-// On-chain program specific modules
-pub mod account_info;
-pub mod entrypoint;
-pub mod log;
-pub mod program;
-pub mod program_error;
-pub mod program_stubs;
-
-// Modules not usable by on-chain programs
-#[cfg(not(feature = "program"))]
-pub mod client;
-#[cfg(not(feature = "program"))]
-pub mod genesis_config;
-#[cfg(not(feature = "program"))]
-pub mod hard_forks;
-#[cfg(not(feature = "program"))]
-pub mod shred_version;
-#[cfg(not(feature = "program"))]
-pub mod signature;
-#[cfg(not(feature = "program"))]
-pub mod signers;
-#[cfg(not(feature = "program"))]
-pub mod system_transaction;
-#[cfg(not(feature = "program"))]
-pub mod transaction;
-#[cfg(not(feature = "program"))]
-pub mod transport;
+// Unused `solana_sdk::program_stubs!()` macro retained for source backwards compatibility with older programs
+#[macro_export]
+#[deprecated(
+    since = "1.4.3",
+    note = "program_stubs macro is obsolete and can be safely removed"
+)]
+macro_rules! program_stubs {
+    () => {};
+}
 
 #[macro_use]
 extern crate serde_derive;
@@ -106,4 +86,4 @@ pub extern crate bs58;
 extern crate log as logger;
 
 #[macro_use]
-extern crate solana_sdk_macro_frozen_abi;
+extern crate solana_frozen_abi_macro;

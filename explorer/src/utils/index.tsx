@@ -18,6 +18,16 @@ export function assertUnreachable(x: never): never {
   throw new Error("Unreachable!");
 }
 
+export function normalizeTokenAmount(
+  raw: string | number,
+  decimals: number
+): number {
+  let rawTokens: number;
+  if (typeof raw === "string") rawTokens = parseInt(raw);
+  else rawTokens = raw;
+  return rawTokens / Math.pow(10, decimals);
+}
+
 export function lamportsToSol(lamports: number | BN): number {
   if (typeof lamports === "number") {
     return Math.abs(lamports) / LAMPORTS_PER_SOL;
@@ -79,4 +89,13 @@ export function slotsToHumanString(
   slotTime = MS_PER_SLOT
 ): string {
   return HUMANIZER.humanize(slots * slotTime);
+}
+
+export function wrap(input: string, length: number): string {
+  var result = [];
+  while (input.length) {
+    result.push(input.substr(0, length));
+    input = input.substr(length);
+  }
+  return result.join("\n");
 }

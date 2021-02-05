@@ -79,15 +79,28 @@ up)
 
   (
     set -x
-    RUST_LOG=${RUST_LOG:-solana=info}
+    RUST_LOG=${RUST_LOG:-solana=info,solana_runtime::message_processor=debug}
     ARGS=(
       --detach
       --name solana-localnet
       --rm
-      --publish 8899:8899
-      --publish 8900:8900
-      --publish 9900:9900
+      --publish 8001:8001/tcp # entrypoint
+      --publish 8899:8899/tcp # rpc http
+      --publish 8900:8900/tcp # rpc pubsub
+      --publish 8901:8901/tcp # (future) bank service
+      --publish 8902:8902/tcp # bank service
+      --publish 9900:9900/tcp # faucet
+      --publish 8000:8000/udp # tvu
+      --publish 8001:8001/udp # gossip
+      --publish 8002:8002/udp # tvu_forwards
+      --publish 8003:8003/udp # tpu
+      --publish 8004:8004/udp # tpu_forwards
+      --publish 8005:8005/udp # retransmit
+      --publish 8006:8006/udp # repair
+      --publish 8007:8007/udp # serve_repair
+      --publish 8008:8008/udp # broadcast
       --tty
+      --ulimit "nofile=700000"
       --env "RUST_LOG=$RUST_LOG"
     )
     if [[ -n $network ]]; then
@@ -111,7 +124,7 @@ up)
 down)
   (
     set -x
-    if [[ -n "$(docker ps --filter "name=^solana-localnet$" -q)" ]]; then
+    if [[ $(docker ps --filter "name=^/solana-localnet$" -q) ]]; then
       docker stop --time 0 solana-localnet
     fi
   )
@@ -127,7 +140,7 @@ logs)
   fi
 
   while $follow; do
-    if [[ -n $(docker ps -q -f name=solana-localnet) ]]; then
+    if [[ $(docker ps -q -f "name=^/solana-localnet$") ]]; then
       (
         set -x
         docker logs solana-localnet -f

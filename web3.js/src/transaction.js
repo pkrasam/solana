@@ -63,6 +63,18 @@ export type TransactionInstructionCtorFields = {|
 |};
 
 /**
+ * Configuration object for Transaction.serialize()
+ *
+ * @typedef {Object} SerializeConfig
+ * @property {boolean|undefined} requireAllSignatures Require all transaction signatures be present (default: true)
+ * @property {boolean|undefined} verifySignatures Verify provided signatures (default: true)
+ */
+export type SerializeConfig = {
+  requireAllSignatures?: boolean,
+  verifySignatures?: boolean,
+};
+
+/**
  * Transaction Instruction class
  */
 export class TransactionInstruction {
@@ -100,12 +112,14 @@ type SignaturePubkeyPair = {|
  *
  * @typedef {Object} TransactionCtorFields
  * @property {?Blockhash} recentBlockhash A recent blockhash
+ * @property {?PublicKey} feePayer The transaction fee payer
  * @property {?Array<SignaturePubkeyPair>} signatures One or more signatures
  *
  */
 type TransactionCtorFields = {|
   recentBlockhash?: Blockhash | null,
   nonceInfo?: NonceInformation | null,
+  feePayer?: PublicKey | null,
   signatures?: Array<SignaturePubkeyPair>,
 |};
 
@@ -142,20 +156,25 @@ export class Transaction {
   }
 
   /**
+   * The transaction fee payer
+   */
+  feePayer: ?PublicKey;
+
+  /**
    * The instructions to atomically execute
    */
   instructions: Array<TransactionInstruction> = [];
 
   /**
-   * A recent transaction id.  Must be populated by the caller
+   * A recent transaction id. Must be populated by the caller
    */
-  recentBlockhash: Blockhash | null;
+  recentBlockhash: ?Blockhash;
 
   /**
    * Optional Nonce information. If populated, transaction will use a durable
    * Nonce hash instead of a recentBlockhash. Must be populated by the caller
    */
-  nonceInfo: NonceInformation | null;
+  nonceInfo: ?NonceInformation;
 
   /**
    * Construct an empty Transaction
@@ -206,14 +225,21 @@ export class Transaction {
       throw new Error('No instructions provided');
     }
 
-    let numReadonlySignedAccounts = 0;
-    let numReadonlyUnsignedAccounts = 0;
+    let feePayer: PublicKey;
+    if (this.feePayer) {
+      feePayer = this.feePayer;
+    } else if (this.signatures.length > 0 && this.signatures[0].publicKey) {
+      // Use implicit fee payer
+      feePayer = this.signatures[0].publicKey;
+    } else {
+      throw new Error('Transaction fee payer required');
+    }
 
     const programIds: string[] = [];
     const accountMetas: AccountMeta[] = [];
     this.instructions.forEach(instruction => {
       instruction.keys.forEach(accountMeta => {
-        accountMetas.push(accountMeta);
+        accountMetas.push({...accountMeta});
       });
 
       const programId = instruction.programId.toString();
@@ -230,8 +256,6 @@ export class Transaction {
         isWritable: false,
       });
     });
-
-    // Prefix accountMetas with feePayer here whenever that gets implemented
 
     // Sort. Prioritizing first by signer, then by writable
     accountMetas.sort(function (x, y) {
@@ -256,31 +280,54 @@ export class Transaction {
       }
     });
 
-    this.signatures.forEach(signature => {
-      const sigPubkeyString = signature.publicKey.toString();
+    // Move fee payer to the front
+    const feePayerIndex = uniqueMetas.findIndex(x => {
+      return x.pubkey.equals(feePayer);
+    });
+    if (feePayerIndex > -1) {
+      const [payerMeta] = uniqueMetas.splice(feePayerIndex, 1);
+      payerMeta.isSigner = true;
+      payerMeta.isWritable = true;
+      uniqueMetas.unshift(payerMeta);
+    } else {
+      uniqueMetas.unshift({
+        pubkey: feePayer,
+        isSigner: true,
+        isWritable: true,
+      });
+    }
+
+    // Disallow unknown signers
+    for (const signature of this.signatures) {
       const uniqueIndex = uniqueMetas.findIndex(x => {
-        return x.pubkey.toString() === sigPubkeyString;
+        return x.pubkey.equals(signature.publicKey);
       });
       if (uniqueIndex > -1) {
-        uniqueMetas[uniqueIndex].isSigner = true;
+        if (!uniqueMetas[uniqueIndex].isSigner) {
+          uniqueMetas[uniqueIndex].isSigner = true;
+          console.warn(
+            'Transaction references a signature that is unnecessary, ' +
+              'only the fee payer and instruction signer accounts should sign a transaction. ' +
+              'This behavior is deprecated and will throw an error in the next major version release.',
+          );
+        }
       } else {
-        uniqueMetas.unshift({
-          pubkey: new PublicKey(sigPubkeyString),
-          isSigner: true,
-          isWritable: true,
-        });
+        throw new Error(`unknown signer: ${signature.publicKey.toString()}`);
       }
-    });
+    }
 
-    // Split out signing from nonsigning keys and count readonlys
+    let numRequiredSignatures = 0;
+    let numReadonlySignedAccounts = 0;
+    let numReadonlyUnsignedAccounts = 0;
+
+    // Split out signing from non-signing keys and count header values
     const signedKeys: string[] = [];
     const unsignedKeys: string[] = [];
     uniqueMetas.forEach(({pubkey, isSigner, isWritable}) => {
       if (isSigner) {
-        // Promote the first signer to writable as it is the fee payer
-        const first = signedKeys.length === 0;
         signedKeys.push(pubkey.toString());
-        if (!first && !isWritable) {
+        numRequiredSignatures += 1;
+        if (!isWritable) {
           numReadonlySignedAccounts += 1;
         }
       } else {
@@ -291,23 +338,14 @@ export class Transaction {
       }
     });
 
-    // Initialize signature array, if needed
-    if (this.signatures.length === 0) {
-      const signatures: Array<SignaturePubkeyPair> = [];
-      signedKeys.forEach(pubkey => {
-        signatures.push({signature: null, publicKey: new PublicKey(pubkey)});
-      });
-      this.signatures = signatures;
-    }
-
     const accountKeys = signedKeys.concat(unsignedKeys);
     const instructions: CompiledInstruction[] = this.instructions.map(
       instruction => {
         const {data, programId} = instruction;
         return {
           programIdIndex: accountKeys.indexOf(programId.toString()),
-          accounts: instruction.keys.map(keyObj =>
-            accountKeys.indexOf(keyObj.pubkey.toString()),
+          accounts: instruction.keys.map(meta =>
+            accountKeys.indexOf(meta.pubkey.toString()),
           ),
           data: bs58.encode(data),
         };
@@ -321,7 +359,7 @@ export class Transaction {
 
     return new Message({
       header: {
-        numRequiredSignatures: this.signatures.length,
+        numRequiredSignatures,
         numReadonlySignedAccounts,
         numReadonlyUnsignedAccounts,
       },
@@ -332,16 +370,74 @@ export class Transaction {
   }
 
   /**
-   * Get a buffer of the Transaction data that need to be covered by signatures
+   * @private
    */
-  serializeMessage(): Buffer {
-    return this.compileMessage().serialize();
+  _compile(): Message {
+    const message = this.compileMessage();
+    const signedKeys = message.accountKeys.slice(
+      0,
+      message.header.numRequiredSignatures,
+    );
+
+    if (this.signatures.length === signedKeys.length) {
+      const valid = this.signatures.every((pair, index) => {
+        return signedKeys[index].equals(pair.publicKey);
+      });
+
+      if (valid) return message;
+    }
+
+    this.signatures = signedKeys.map(publicKey => ({
+      signature: null,
+      publicKey,
+    }));
+
+    return message;
   }
 
   /**
-   * Sign the Transaction with the specified accounts.  Multiple signatures may
+   * Get a buffer of the Transaction data that need to be covered by signatures
+   */
+  serializeMessage(): Buffer {
+    return this._compile().serialize();
+  }
+
+  /**
+   * Specify the public keys which will be used to sign the Transaction.
+   * The first signer will be used as the transaction fee payer account.
+   *
+   * Signatures can be added with either `partialSign` or `addSignature`
+   *
+   * @deprecated Deprecated since v0.84.0. Only the fee payer needs to be
+   * specified and it can be set in the Transaction constructor or with the
+   * `feePayer` property.
+   */
+  setSigners(...signers: Array<PublicKey>) {
+    if (signers.length === 0) {
+      throw new Error('No signers');
+    }
+
+    const seen = new Set();
+    this.signatures = signers
+      .filter(publicKey => {
+        const key = publicKey.toString();
+        if (seen.has(key)) {
+          return false;
+        } else {
+          seen.add(key);
+          return true;
+        }
+      })
+      .map(publicKey => ({signature: null, publicKey}));
+  }
+
+  /**
+   * Sign the Transaction with the specified accounts. Multiple signatures may
    * be applied to a Transaction. The first signature is considered "primary"
-   * and is used when testing for Transaction confirmation.
+   * and is used identify and confirm transactions.
+   *
+   * If the Transaction `feePayer` is not set, the first signer will be used
+   * as the transaction fee payer account.
    *
    * Transaction fields should not be modified after the first call to `sign`,
    * as doing so may invalidate the signature and cause the Transaction to be
@@ -350,79 +446,94 @@ export class Transaction {
    * The Transaction must be assigned a valid `recentBlockhash` before invoking this method
    */
   sign(...signers: Array<Account>) {
-    this.signPartial(...signers);
-  }
-
-  /**
-   * Partially sign a Transaction with the specified accounts.  The `Account`
-   * inputs will be used to sign the Transaction immediately, while any
-   * `PublicKey` inputs will be referenced in the signed Transaction but need to
-   * be filled in later by calling `addSigner()` with the matching `Account`.
-   *
-   * All the caveats from the `sign` method apply to `signPartial`
-   */
-  signPartial(...partialSigners: Array<PublicKey | Account>) {
-    if (partialSigners.length === 0) {
+    if (signers.length === 0) {
       throw new Error('No signers');
     }
 
-    function partialSignerPublicKey(accountOrPublicKey: any): PublicKey {
-      if ('publicKey' in accountOrPublicKey) {
-        return accountOrPublicKey.publicKey;
-      }
-      return accountOrPublicKey;
-    }
-
-    function signerAccount(accountOrPublicKey: any): ?Account {
-      if (
-        'publicKey' in accountOrPublicKey &&
-        'secretKey' in accountOrPublicKey
-      ) {
-        return accountOrPublicKey;
+    // Dedupe signers
+    const seen = new Set();
+    const uniqueSigners = [];
+    for (const signer of signers) {
+      const key = signer.publicKey.toString();
+      if (seen.has(key)) {
+        continue;
+      } else {
+        seen.add(key);
+        uniqueSigners.push(signer);
       }
     }
 
-    const signatures: Array<SignaturePubkeyPair> = partialSigners.map(
-      accountOrPublicKey => ({
-        signature: null,
-        publicKey: partialSignerPublicKey(accountOrPublicKey),
-      }),
-    );
-    this.signatures = signatures;
-    const signData = this.serializeMessage();
+    this.signatures = uniqueSigners.map(signer => ({
+      signature: null,
+      publicKey: signer.publicKey,
+    }));
 
-    partialSigners.forEach((accountOrPublicKey, index) => {
-      const account = signerAccount(accountOrPublicKey);
-      if (account) {
-        const signature = nacl.sign.detached(signData, account.secretKey);
-        invariant(signature.length === 64);
-        signatures[index].signature = Buffer.from(signature);
+    const message = this._compile();
+    this._partialSign(message, ...uniqueSigners);
+    this._verifySignatures(message.serialize(), true);
+  }
+
+  /**
+   * Partially sign a transaction with the specified accounts. All accounts must
+   * correspond to either the fee payer or a signer account in the transaction
+   * instructions.
+   *
+   * All the caveats from the `sign` method apply to `partialSign`
+   */
+  partialSign(...signers: Array<Account>) {
+    if (signers.length === 0) {
+      throw new Error('No signers');
+    }
+
+    // Dedupe signers
+    const seen = new Set();
+    const uniqueSigners = [];
+    for (const signer of signers) {
+      const key = signer.publicKey.toString();
+      if (seen.has(key)) {
+        continue;
+      } else {
+        seen.add(key);
+        uniqueSigners.push(signer);
       }
+    }
+
+    const message = this._compile();
+    this._partialSign(message, ...uniqueSigners);
+  }
+
+  /**
+   * @private
+   */
+  _partialSign(message: Message, ...signers: Array<Account>) {
+    const signData = message.serialize();
+    signers.forEach(signer => {
+      const signature = nacl.sign.detached(signData, signer.secretKey);
+      this._addSignature(signer.publicKey, signature);
     });
   }
 
   /**
-   * Fill in a signature for a partially signed Transaction.  The `signer` must
-   * be the corresponding `Account` for a `PublicKey` that was previously provided to
-   * `signPartial`
+   * Add an externally created signature to a transaction. The public key
+   * must correspond to either the fee payer or a signer account in the transaction
+   * instructions.
    */
-  addSigner(signer: Account) {
-    const signData = this.serializeMessage();
-    const signature = nacl.sign.detached(signData, signer.secretKey);
-    this.addSignature(signer.publicKey, signature);
+  addSignature(pubkey: PublicKey, signature: Buffer) {
+    this._compile(); // Ensure signatures array is populated
+    this._addSignature(pubkey, signature);
   }
 
   /**
-   * Add an externally created signature to a transaction
+   * @private
    */
-  addSignature(pubkey: PublicKey, signature: Buffer) {
+  _addSignature(pubkey: PublicKey, signature: Buffer) {
     invariant(signature.length === 64);
 
     const index = this.signatures.findIndex(sigpair =>
       pubkey.equals(sigpair.publicKey),
     );
     if (index < 0) {
-      throw new Error(`Unknown signer: ${pubkey.toString()}`);
+      throw new Error(`unknown signer: ${pubkey.toString()}`);
     }
 
     this.signatures[index].signature = Buffer.from(signature);
@@ -432,38 +543,44 @@ export class Transaction {
    * Verify signatures of a complete, signed Transaction
    */
   verifySignatures(): boolean {
-    return this._verifySignatures(this.serializeMessage());
+    return this._verifySignatures(this.serializeMessage(), true);
   }
 
   /**
    * @private
    */
-  _verifySignatures(signData: Buffer): boolean {
-    let verified = true;
+  _verifySignatures(signData: Buffer, requireAllSignatures: boolean): boolean {
     for (const {signature, publicKey} of this.signatures) {
-      if (
-        !nacl.sign.detached.verify(signData, signature, publicKey.toBuffer())
-      ) {
-        verified = false;
+      if (signature === null) {
+        if (requireAllSignatures) {
+          return false;
+        }
+      } else {
+        if (
+          !nacl.sign.detached.verify(signData, signature, publicKey.toBuffer())
+        ) {
+          return false;
+        }
       }
     }
-    return verified;
+    return true;
   }
 
   /**
    * Serialize the Transaction in the wire format.
-   *
-   * The Transaction must have a valid `signature` before invoking this method
    */
-  serialize(): Buffer {
-    const {signatures} = this;
-    if (!signatures || signatures.length === 0) {
-      throw new Error('Transaction has not been signed');
-    }
+  serialize(config?: SerializeConfig): Buffer {
+    const {requireAllSignatures, verifySignatures} = Object.assign(
+      {requireAllSignatures: true, verifySignatures: true},
+      config,
+    );
 
     const signData = this.serializeMessage();
-    if (!this._verifySignatures(signData)) {
-      throw new Error('Transaction has not been signed correctly');
+    if (
+      verifySignatures &&
+      !this._verifySignatures(signData, requireAllSignatures)
+    ) {
+      throw new Error('Signature verification failed');
     }
 
     return this._serialize(signData);
@@ -552,6 +669,9 @@ export class Transaction {
   static populate(message: Message, signatures: Array<string>): Transaction {
     const transaction = new Transaction();
     transaction.recentBlockhash = message.recentBlockhash;
+    if (message.header.numRequiredSignatures > 0) {
+      transaction.feePayer = message.accountKeys[0];
+    }
     signatures.forEach((signature, index) => {
       const sigPubkeyPair = {
         signature:

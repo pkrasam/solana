@@ -1,16 +1,15 @@
 use solana_cli::{
     cli::{process_command, request_and_confirm_airdrop, CliCommand, CliConfig},
-    cli_output::OutputFormat,
-    nonce,
-    offline::{
-        blockhash_query::{self, BlockhashQuery},
-        parse_sign_only_reply_string,
-    },
     spend_utils::SpendAmount,
     test_utils::{check_ready, check_recent_balance},
 };
-use solana_client::rpc_client::RpcClient;
-use solana_core::validator::{TestValidator, TestValidatorOptions};
+use solana_cli_output::{parse_sign_only_reply_string, OutputFormat};
+use solana_client::{
+    blockhash_query::{self, BlockhashQuery},
+    nonce_utils,
+    rpc_client::RpcClient,
+};
+use solana_core::test_validator::TestValidator;
 use solana_faucet::faucet::run_local_faucet;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
@@ -18,33 +17,22 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{keypair_from_seed, Keypair, NullSigner, Signer},
 };
-use std::{fs::remove_dir_all, sync::mpsc::channel};
 
 #[test]
 fn test_transfer() {
-    let TestValidator {
-        server,
-        leader_data,
-        alice: mint_keypair,
-        ledger_path,
-        ..
-    } = TestValidator::run_with_options(TestValidatorOptions {
-        fees: 1,
-        bootstrap_validator_lamports: 42_000,
-        ..TestValidatorOptions::default()
-    });
+    solana_logger::setup();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_custom_fees(mint_keypair.pubkey(), 1);
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let (sender, receiver) = channel();
-    run_local_faucet(mint_keypair, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
-
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
 
     let default_signer = Keypair::new();
     let default_offline_signer = Keypair::new();
 
     let mut config = CliConfig::recent_for_tests();
-    config.json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&default_signer];
 
     let sender_pubkey = config.signers[0].pubkey();
@@ -101,10 +89,7 @@ fn test_transfer() {
     check_recent_balance(50, &rpc_client, &offline_pubkey);
 
     // Offline transfer
-    let (blockhash, _, _) = rpc_client
-        .get_recent_blockhash_with_commitment(CommitmentConfig::recent())
-        .unwrap()
-        .value;
+    let (blockhash, _) = rpc_client.get_recent_blockhash().unwrap();
     offline.command = CliCommand::Transfer {
         amount: SpendAmount::Some(10),
         to: recipient_pubkey,
@@ -153,12 +138,12 @@ fn test_transfer() {
     check_recent_balance(49_987 - minimum_nonce_balance, &rpc_client, &sender_pubkey);
 
     // Fetch nonce hash
-    let nonce_hash = nonce::get_account_with_commitment(
+    let nonce_hash = nonce_utils::get_account_with_commitment(
         &rpc_client,
         &nonce_account.pubkey(),
-        CommitmentConfig::recent(),
+        CommitmentConfig::processed(),
     )
-    .and_then(|ref a| nonce::data_from_account(a))
+    .and_then(|ref a| nonce_utils::data_from_account(a))
     .unwrap()
     .blockhash;
 
@@ -181,12 +166,12 @@ fn test_transfer() {
     process_command(&config).unwrap();
     check_recent_balance(49_976 - minimum_nonce_balance, &rpc_client, &sender_pubkey);
     check_recent_balance(30, &rpc_client, &recipient_pubkey);
-    let new_nonce_hash = nonce::get_account_with_commitment(
+    let new_nonce_hash = nonce_utils::get_account_with_commitment(
         &rpc_client,
         &nonce_account.pubkey(),
-        CommitmentConfig::recent(),
+        CommitmentConfig::processed(),
     )
-    .and_then(|ref a| nonce::data_from_account(a))
+    .and_then(|ref a| nonce_utils::data_from_account(a))
     .unwrap()
     .blockhash;
     assert_ne!(nonce_hash, new_nonce_hash);
@@ -202,12 +187,12 @@ fn test_transfer() {
     check_recent_balance(49_975 - minimum_nonce_balance, &rpc_client, &sender_pubkey);
 
     // Fetch nonce hash
-    let nonce_hash = nonce::get_account_with_commitment(
+    let nonce_hash = nonce_utils::get_account_with_commitment(
         &rpc_client,
         &nonce_account.pubkey(),
-        CommitmentConfig::recent(),
+        CommitmentConfig::processed(),
     )
-    .and_then(|ref a| nonce::data_from_account(a))
+    .and_then(|ref a| nonce_utils::data_from_account(a))
     .unwrap()
     .blockhash;
 
@@ -246,28 +231,14 @@ fn test_transfer() {
     process_command(&config).unwrap();
     check_recent_balance(28, &rpc_client, &offline_pubkey);
     check_recent_balance(40, &rpc_client, &recipient_pubkey);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }
 
 #[test]
 fn test_transfer_multisession_signing() {
-    let TestValidator {
-        server,
-        leader_data,
-        alice: mint_keypair,
-        ledger_path,
-        ..
-    } = TestValidator::run_with_options(TestValidatorOptions {
-        fees: 1,
-        bootstrap_validator_lamports: 42_000,
-        ..TestValidatorOptions::default()
-    });
-
-    let (sender, receiver) = channel();
-    run_local_faucet(mint_keypair, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    solana_logger::setup();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_custom_fees(mint_keypair.pubkey(), 1);
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
     let to_pubkey = Pubkey::new(&[1u8; 32]);
     let offline_from_signer = keypair_from_seed(&[2u8; 32]).unwrap();
@@ -276,7 +247,8 @@ fn test_transfer_multisession_signing() {
     let config = CliConfig::recent_for_tests();
 
     // Setup accounts
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
     request_and_confirm_airdrop(
         &rpc_client,
         &faucet_addr,
@@ -299,10 +271,7 @@ fn test_transfer_multisession_signing() {
 
     check_ready(&rpc_client);
 
-    let (blockhash, _, _) = rpc_client
-        .get_recent_blockhash_with_commitment(CommitmentConfig::recent())
-        .unwrap()
-        .value;
+    let (blockhash, _) = rpc_client.get_recent_blockhash().unwrap();
 
     // Offline fee-payer signs first
     let mut fee_payer_config = CliConfig::recent_for_tests();
@@ -358,7 +327,7 @@ fn test_transfer_multisession_signing() {
 
     // Finally submit to the cluster
     let mut config = CliConfig::recent_for_tests();
-    config.json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&fee_payer_presigner, &from_presigner];
     config.command = CliCommand::Transfer {
         amount: SpendAmount::Some(42),
@@ -376,35 +345,22 @@ fn test_transfer_multisession_signing() {
     check_recent_balance(1, &rpc_client, &offline_from_signer.pubkey());
     check_recent_balance(1, &rpc_client, &offline_fee_payer_signer.pubkey());
     check_recent_balance(42, &rpc_client, &to_pubkey);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }
 
 #[test]
 fn test_transfer_all() {
-    let TestValidator {
-        server,
-        leader_data,
-        alice: mint_keypair,
-        ledger_path,
-        ..
-    } = TestValidator::run_with_options(TestValidatorOptions {
-        fees: 1,
-        bootstrap_validator_lamports: 42_000,
-        ..TestValidatorOptions::default()
-    });
+    solana_logger::setup();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_custom_fees(mint_keypair.pubkey(), 1);
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let (sender, receiver) = channel();
-    run_local_faucet(mint_keypair, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
-
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
 
     let default_signer = Keypair::new();
 
     let mut config = CliConfig::recent_for_tests();
-    config.json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&default_signer];
 
     let sender_pubkey = config.signers[0].pubkey();
@@ -432,7 +388,4 @@ fn test_transfer_all() {
     process_command(&config).unwrap();
     check_recent_balance(0, &rpc_client, &sender_pubkey);
     check_recent_balance(49_999, &rpc_client, &recipient_pubkey);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }

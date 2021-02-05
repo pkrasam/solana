@@ -7,9 +7,10 @@ use crate::{
 use chrono::prelude::{DateTime, Utc};
 use log::*;
 use solana_sdk::{
-    account::{next_keyed_account, KeyedAccount},
     hash::hash,
     instruction::InstructionError,
+    keyed_account::{next_keyed_account, KeyedAccount},
+    process_instruction::InvokeContext,
     program_utils::limited_deserialize,
     pubkey::Pubkey,
 };
@@ -116,6 +117,7 @@ pub fn process_instruction(
     _program_id: &Pubkey,
     keyed_accounts: &[KeyedAccount],
     data: &[u8],
+    _invoke_context: &mut dyn InvokeContext,
 ) -> Result<(), InstructionError> {
     let keyed_accounts_iter = &mut keyed_accounts.iter();
     let instruction = limited_deserialize(data)?;
@@ -139,9 +141,10 @@ pub fn process_instruction(
                 trace!("contract already exists");
                 return Err(InstructionError::AccountAlreadyInitialized);
             }
-            let mut budget_state = BudgetState::default();
-            budget_state.pending_budget = Some(*expr);
-            budget_state.initialized = true;
+            let budget_state = BudgetState {
+                pending_budget: Some(*expr),
+                initialized: true,
+            };
             budget_state.serialize(&mut contract_keyed_account.try_account_ref_mut()?.data)
         }
         BudgetInstruction::ApplyTimestamp(dt) => {
@@ -238,7 +241,7 @@ mod tests {
     fn create_bank(lamports: u64) -> (Bank, Keypair) {
         let (genesis_config, mint_keypair) = create_genesis_config(lamports);
         let mut bank = Bank::new(&genesis_config);
-        bank.add_builtin_program("budget_program", id(), process_instruction);
+        bank.add_builtin("budget_program", id(), process_instruction);
         (bank, mint_keypair)
     }
 
@@ -250,7 +253,7 @@ mod tests {
         let alice_pubkey = alice_keypair.pubkey();
         let budget_keypair = Keypair::new();
         let budget_pubkey = budget_keypair.pubkey();
-        let bob_pubkey = Pubkey::new_rand();
+        let bob_pubkey = solana_sdk::pubkey::new_rand();
 
         let mut instructions =
             budget_instruction::payment(&alice_pubkey, &bob_pubkey, &budget_pubkey, 1);
@@ -271,7 +274,7 @@ mod tests {
         let (bank, alice_keypair) = create_bank(10_000);
         let bank_client = BankClient::new(bank);
         let alice_pubkey = alice_keypair.pubkey();
-        let bob_pubkey = Pubkey::new_rand();
+        let bob_pubkey = solana_sdk::pubkey::new_rand();
         let budget_keypair = Keypair::new();
         let budget_pubkey = budget_keypair.pubkey();
         let instructions =
@@ -292,8 +295,8 @@ mod tests {
         // Initialize BudgetState
         let budget_keypair = Keypair::new();
         let budget_pubkey = budget_keypair.pubkey();
-        let bob_pubkey = Pubkey::new_rand();
-        let witness = Pubkey::new_rand();
+        let bob_pubkey = solana_sdk::pubkey::new_rand();
+        let witness = solana_sdk::pubkey::new_rand();
         let instructions = budget_instruction::when_signed(
             &alice_pubkey,
             &bob_pubkey,
@@ -341,7 +344,7 @@ mod tests {
         // Initialize BudgetState
         let budget_keypair = Keypair::new();
         let budget_pubkey = budget_keypair.pubkey();
-        let bob_pubkey = Pubkey::new_rand();
+        let bob_pubkey = solana_sdk::pubkey::new_rand();
         let dt = Utc::now();
         let instructions = budget_instruction::on_date(
             &alice_pubkey,
@@ -389,8 +392,8 @@ mod tests {
         let alice_pubkey = alice_keypair.pubkey();
         let budget_keypair = Keypair::new();
         let budget_pubkey = budget_keypair.pubkey();
-        let bob_pubkey = Pubkey::new_rand();
-        let mallory_pubkey = Pubkey::new_rand();
+        let bob_pubkey = solana_sdk::pubkey::new_rand();
+        let mallory_pubkey = solana_sdk::pubkey::new_rand();
         let dt = Utc::now();
 
         let instructions = budget_instruction::on_date(
@@ -460,7 +463,7 @@ mod tests {
         let alice_pubkey = alice_keypair.pubkey();
         let budget_keypair = Keypair::new();
         let budget_pubkey = budget_keypair.pubkey();
-        let bob_pubkey = Pubkey::new_rand();
+        let bob_pubkey = solana_sdk::pubkey::new_rand();
         let dt = Utc::now();
 
         let instructions = budget_instruction::on_date(
@@ -518,7 +521,7 @@ mod tests {
     #[test]
     fn test_pay_when_account_data() {
         let (bank, alice_keypair) = create_bank(42);
-        let game_pubkey = Pubkey::new_rand();
+        let game_pubkey = solana_sdk::pubkey::new_rand();
         let game_account = Account {
             lamports: 1,
             data: vec![1, 2, 3],

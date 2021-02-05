@@ -151,7 +151,7 @@ pub fn main() -> Result<(), String> {
         )
         .subcommand(
             SubCommand::with_name("info")
-                .about("displays information about the current installation")
+                .about("Displays information about the current installation")
                 .setting(AppSettings::DisableVersion)
                 .arg(
                     Arg::with_name("local_info_only")
@@ -160,11 +160,16 @@ pub fn main() -> Result<(), String> {
                         .help(
                         "only display local information, don't check the cluster for new updates",
                     ),
+                )
+                .arg(
+                    Arg::with_name("eval")
+                        .long("eval")
+                        .help("display information in a format that can be used with `eval`"),
                 ),
         )
         .subcommand(
             SubCommand::with_name("deploy")
-                .about("deploys a new update")
+                .about("Deploys a new update")
                 .setting(AppSettings::DisableVersion)
                 .arg({
                     let arg = Arg::with_name("from_keypair_file")
@@ -204,8 +209,13 @@ pub fn main() -> Result<(), String> {
                 ),
         )
         .subcommand(
+            SubCommand::with_name("gc")
+                .about("Delete older releases from the install cache to reclaim disk space")
+                .setting(AppSettings::DisableVersion),
+        )
+        .subcommand(
             SubCommand::with_name("update")
-                .about("checks for an update, and if available downloads and applies it")
+                .about("Checks for an update, and if available downloads and applies it")
                 .setting(AppSettings::DisableVersion),
         )
         .subcommand(
@@ -234,7 +244,8 @@ pub fn main() -> Result<(), String> {
         ("init", Some(matches)) => handle_init(&matches, &config_file),
         ("info", Some(matches)) => {
             let local_info_only = matches.is_present("local_info_only");
-            command::info(config_file, local_info_only).map(|_| ())
+            let eval = matches.is_present("eval");
+            command::info(config_file, local_info_only, eval).map(|_| ())
         }
         ("deploy", Some(matches)) => {
             let from_keypair_file = matches.value_of("from_keypair_file").unwrap();
@@ -249,6 +260,7 @@ pub fn main() -> Result<(), String> {
                 update_manifest_keypair_file,
             )
         }
+        ("gc", Some(_matches)) => command::gc(config_file),
         ("update", Some(_matches)) => command::update(config_file).map(|_| ()),
         ("run", Some(matches)) => {
             let program_name = matches.value_of("program_name").unwrap();
@@ -267,7 +279,7 @@ pub fn main_init() -> Result<(), String> {
     solana_logger::setup();
 
     let matches = App::new("solana-install-init")
-        .about("initializes a new installation")
+        .about("Initializes a new installation")
         .version(solana_version::version!())
         .arg({
             let arg = Arg::with_name("config_file")

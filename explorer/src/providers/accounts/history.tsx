@@ -1,14 +1,14 @@
 import React from "react";
-import * as Sentry from "@sentry/react";
 import {
   PublicKey,
   ConfirmedSignatureInfo,
   TransactionSignature,
   Connection,
 } from "@solana/web3.js";
-import { useCluster } from "../cluster";
+import { useCluster, Cluster } from "../cluster";
 import * as Cache from "providers/cache";
 import { ActionType, FetchStatus } from "providers/cache";
+import { reportError } from "utils/sentry";
 
 type AccountHistory = {
   fetched: ConfirmedSignatureInfo[];
@@ -28,22 +28,30 @@ function combineFetched(
   current: ConfirmedSignatureInfo[] | undefined,
   before: TransactionSignature | undefined
 ) {
-  if (current === undefined) {
+  if (current === undefined || current.length === 0) {
     return fetched;
   }
 
-  if (current.length > 0 && current[current.length - 1].signature === before) {
-    return current.concat(fetched);
-  } else {
-    return fetched;
+  // History was refreshed, fetch results should be prepended if contiguous
+  if (before === undefined) {
+    const end = fetched.findIndex((f) => f.signature === current[0].signature);
+    if (end < 0) return fetched;
+    return fetched.slice(0, end).concat(current);
   }
+
+  // More history was loaded, fetch results should be appended
+  if (current[current.length - 1].signature === before) {
+    return current.concat(fetched);
+  }
+
+  return fetched;
 }
 
 function reconcile(
   history: AccountHistory | undefined,
   update: HistoryUpdate | undefined
 ) {
-  if (update?.history === undefined) return;
+  if (update?.history === undefined) return history;
   return {
     fetched: combineFetched(
       update.history.fetched,
@@ -78,6 +86,7 @@ export function HistoryProvider({ children }: HistoryProviderProps) {
 async function fetchAccountHistory(
   dispatch: Dispatch,
   pubkey: PublicKey,
+  cluster: Cluster,
   url: string,
   options: { before?: TransactionSignature; limit: number }
 ) {
@@ -102,7 +111,9 @@ async function fetchAccountHistory(
     };
     status = FetchStatus.Fetched;
   } catch (error) {
-    Sentry.captureException(error, { tags: { url } });
+    if (cluster !== Cluster.Custom) {
+      reportError(error, { url });
+    }
     status = FetchStatus.FetchFailed;
   }
   dispatch({
@@ -142,7 +153,7 @@ export function useAccountHistory(
 }
 
 export function useFetchAccountHistory() {
-  const { url } = useCluster();
+  const { cluster, url } = useCluster();
   const state = React.useContext(StateContext);
   const dispatch = React.useContext(DispatchContext);
   if (!state || !dispatch) {
@@ -151,15 +162,21 @@ export function useFetchAccountHistory() {
     );
   }
 
-  return (pubkey: PublicKey, refresh?: boolean) => {
-    const before = state.entries[pubkey.toBase58()];
-    if (!refresh && before?.data?.fetched && before.data.fetched.length > 0) {
-      if (before.data.foundOldest) return;
-      const oldest =
-        before.data.fetched[before.data.fetched.length - 1].signature;
-      fetchAccountHistory(dispatch, pubkey, url, { before: oldest, limit: 25 });
-    } else {
-      fetchAccountHistory(dispatch, pubkey, url, { limit: 25 });
-    }
-  };
+  return React.useCallback(
+    (pubkey: PublicKey, refresh?: boolean) => {
+      const before = state.entries[pubkey.toBase58()];
+      if (!refresh && before?.data?.fetched && before.data.fetched.length > 0) {
+        if (before.data.foundOldest) return;
+        const oldest =
+          before.data.fetched[before.data.fetched.length - 1].signature;
+        fetchAccountHistory(dispatch, pubkey, cluster, url, {
+          before: oldest,
+          limit: 25,
+        });
+      } else {
+        fetchAccountHistory(dispatch, pubkey, cluster, url, { limit: 25 });
+      }
+    },
+    [state, dispatch, cluster, url]
+  );
 }

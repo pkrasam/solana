@@ -1,10 +1,15 @@
+use crate::{
+    rpc_config::{RpcSignatureSubscribeConfig, RpcTransactionLogsConfig, RpcTransactionLogsFilter},
+    rpc_response::{Response as RpcResponse, RpcLogsResponse, RpcSignatureResult, SlotInfo},
+};
 use log::*;
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::de::DeserializeOwned;
 use serde_json::{
     json,
     value::Value::{Number, Object},
     Map, Value,
 };
+use solana_sdk::signature::Signature;
 use std::{
     marker::PhantomData,
     sync::{
@@ -29,15 +34,8 @@ pub enum PubsubClientError {
     #[error("json parse error")]
     JsonParseError(#[from] serde_json::error::Error),
 
-    #[error("unexpected message format")]
-    UnexpectedMessageError,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
-pub struct SlotInfoMessage {
-    pub parent: u64,
-    pub root: u64,
-    pub slot: u64,
+    #[error("unexpected message format: {0}")]
+    UnexpectedMessageError(String),
 }
 
 pub struct PubsubClientSubscription<T>
@@ -73,18 +71,12 @@ where
 {
     fn send_subscribe(
         writable_socket: &Arc<RwLock<WebSocket<AutoStream>>>,
-        operation: &str,
+        body: String,
     ) -> Result<u64, PubsubClientError> {
-        let method = format!("{}Subscribe", operation);
         writable_socket
             .write()
             .unwrap()
-            .write_message(Message::Text(
-                json!({
-                "jsonrpc":"2.0","id":1,"method":method,"params":[]
-                })
-                .to_string(),
-            ))?;
+            .write_message(Message::Text(body))?;
         let message = writable_socket.write().unwrap().read_message()?;
         Self::extract_subscription_id(message)
     }
@@ -98,8 +90,11 @@ where
                 return Ok(x);
             }
         }
-
-        Err(PubsubClientError::UnexpectedMessageError)
+        // TODO: Add proper JSON RPC response/error handling...
+        Err(PubsubClientError::UnexpectedMessageError(format!(
+            "{:?}",
+            json_msg
+        )))
     }
 
     pub fn send_unsubscribe(&self) -> Result<(), PubsubClientError> {
@@ -123,14 +118,18 @@ where
         let message_text = &message.into_text().unwrap();
         let json_msg: Map<String, Value> = serde_json::from_str(message_text)?;
 
-        if let Some(Object(value_1)) = json_msg.get("params") {
-            if let Some(value_2) = value_1.get("result") {
-                let x: T = serde_json::from_value::<T>(value_2.clone()).unwrap();
+        if let Some(Object(params)) = json_msg.get("params") {
+            if let Some(result) = params.get("result") {
+                let x: T = serde_json::from_value::<T>(result.clone()).unwrap();
                 return Ok(x);
             }
         }
 
-        Err(PubsubClientError::UnexpectedMessageError)
+        // TODO: Add proper JSON RPC response/error handling...
+        Err(PubsubClientError::UnexpectedMessageError(format!(
+            "{:?}",
+            json_msg
+        )))
     }
 
     pub fn shutdown(&mut self) -> std::thread::Result<()> {
@@ -147,33 +146,41 @@ where
     }
 }
 
-const SLOT_OPERATION: &str = "slot";
+pub type LogsSubscription = (
+    PubsubClientSubscription<RpcResponse<RpcLogsResponse>>,
+    Receiver<RpcResponse<RpcLogsResponse>>,
+);
+pub type SlotsSubscription = (PubsubClientSubscription<SlotInfo>, Receiver<SlotInfo>);
+pub type SignatureSubscription = (
+    PubsubClientSubscription<RpcResponse<RpcSignatureResult>>,
+    Receiver<RpcResponse<RpcSignatureResult>>,
+);
 
 pub struct PubsubClient {}
 
 impl PubsubClient {
-    pub fn slot_subscribe(
+    pub fn logs_subscribe(
         url: &str,
-    ) -> Result<
-        (
-            PubsubClientSubscription<SlotInfoMessage>,
-            Receiver<SlotInfoMessage>,
-        ),
-        PubsubClientError,
-    > {
+        filter: RpcTransactionLogsFilter,
+        config: RpcTransactionLogsConfig,
+    ) -> Result<LogsSubscription, PubsubClientError> {
         let url = Url::parse(url)?;
         let (socket, _response) = connect(url)?;
-        let (sender, receiver) = channel::<SlotInfoMessage>();
+        let (sender, receiver) = channel();
 
         let socket = Arc::new(RwLock::new(socket));
         let socket_clone = socket.clone();
         let exit = Arc::new(AtomicBool::new(false));
         let exit_clone = exit.clone();
-        let subscription_id = PubsubClientSubscription::<SlotInfoMessage>::send_subscribe(
-            &socket_clone,
-            SLOT_OPERATION,
-        )
-        .unwrap();
+
+        let subscription_id =
+            PubsubClientSubscription::<RpcResponse<RpcLogsResponse>>::send_subscribe(
+                &socket_clone,
+                json!({
+                    "jsonrpc":"2.0","id":1,"method":"logsSubscribe","params":[filter, config]
+                })
+                .to_string(),
+            )?;
 
         let t_cleanup = std::thread::spawn(move || {
             loop {
@@ -181,7 +188,124 @@ impl PubsubClient {
                     break;
                 }
 
-                let message: Result<SlotInfoMessage, PubsubClientError> =
+                match PubsubClientSubscription::read_message(&socket_clone) {
+                    Ok(message) => match sender.send(message) {
+                        Ok(_) => (),
+                        Err(err) => {
+                            info!("receive error: {:?}", err);
+                            break;
+                        }
+                    },
+                    Err(err) => {
+                        info!("receive error: {:?}", err);
+                        break;
+                    }
+                }
+            }
+
+            info!("websocket - exited receive loop");
+        });
+
+        let result = PubsubClientSubscription {
+            message_type: PhantomData,
+            operation: "logs",
+            socket,
+            subscription_id,
+            t_cleanup: Some(t_cleanup),
+            exit,
+        };
+
+        Ok((result, receiver))
+    }
+
+    pub fn slot_subscribe(url: &str) -> Result<SlotsSubscription, PubsubClientError> {
+        let url = Url::parse(url)?;
+        let (socket, _response) = connect(url)?;
+        let (sender, receiver) = channel::<SlotInfo>();
+
+        let socket = Arc::new(RwLock::new(socket));
+        let socket_clone = socket.clone();
+        let exit = Arc::new(AtomicBool::new(false));
+        let exit_clone = exit.clone();
+        let subscription_id = PubsubClientSubscription::<SlotInfo>::send_subscribe(
+            &socket_clone,
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"slotSubscribe","params":[]
+            })
+            .to_string(),
+        )?;
+
+        let t_cleanup = std::thread::spawn(move || {
+            loop {
+                if exit_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                match PubsubClientSubscription::read_message(&socket_clone) {
+                    Ok(message) => match sender.send(message) {
+                        Ok(_) => (),
+                        Err(err) => {
+                            info!("receive error: {:?}", err);
+                            break;
+                        }
+                    },
+                    Err(err) => {
+                        info!("receive error: {:?}", err);
+                        break;
+                    }
+                }
+            }
+
+            info!("websocket - exited receive loop");
+        });
+
+        let result = PubsubClientSubscription {
+            message_type: PhantomData,
+            operation: "slot",
+            socket,
+            subscription_id,
+            t_cleanup: Some(t_cleanup),
+            exit,
+        };
+
+        Ok((result, receiver))
+    }
+
+    pub fn signature_subscribe(
+        url: &str,
+        signature: &Signature,
+        config: Option<RpcSignatureSubscribeConfig>,
+    ) -> Result<SignatureSubscription, PubsubClientError> {
+        let url = Url::parse(url)?;
+        let (socket, _response) = connect(url)?;
+        let (sender, receiver) = channel();
+
+        let socket = Arc::new(RwLock::new(socket));
+        let socket_clone = socket.clone();
+        let exit = Arc::new(AtomicBool::new(false));
+        let exit_clone = exit.clone();
+        let body = json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"signatureSubscribe",
+            "params":[
+                signature.to_string(),
+                config
+            ]
+        })
+        .to_string();
+        let subscription_id =
+            PubsubClientSubscription::<RpcResponse<RpcSignatureResult>>::send_subscribe(
+                &socket_clone,
+                body,
+            )?;
+
+        let t_cleanup = std::thread::spawn(move || {
+            loop {
+                if exit_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let message: Result<RpcResponse<RpcSignatureResult>, PubsubClientError> =
                     PubsubClientSubscription::read_message(&socket_clone);
 
                 if let Ok(msg) = message {
@@ -201,9 +325,9 @@ impl PubsubClient {
             info!("websocket - exited receive loop");
         });
 
-        let result: PubsubClientSubscription<SlotInfoMessage> = PubsubClientSubscription {
+        let result = PubsubClientSubscription {
             message_type: PhantomData,
-            operation: SLOT_OPERATION,
+            operation: "signature",
             socket,
             subscription_id,
             t_cleanup: Some(t_cleanup),

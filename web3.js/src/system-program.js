@@ -108,8 +108,8 @@ export type CreateNonceAccountWithSeedParams = {|
 /**
  * Initialize nonce account system instruction params
  * @typedef {Object} InitializeNonceParams
- * @property {PublicKey} fromPubkey
- * @property {PublicKey} programId
+ * @property {PublicKey} noncePubkey
+ * @property {PublicKey} authorizedPubkey
  */
 export type InitializeNonceParams = {|
   noncePubkey: PublicKey,
@@ -119,8 +119,8 @@ export type InitializeNonceParams = {|
 /**
  * Advance nonce account system instruction params
  * @typedef {Object} AdvanceNonceParams
- * @property {PublicKey} fromPubkey
- * @property {PublicKey} programId
+ * @property {PublicKey} noncePubkey
+ * @property {PublicKey} authorizedPubkey
  */
 export type AdvanceNonceParams = {|
   noncePubkey: PublicKey,
@@ -199,6 +199,25 @@ export type AssignWithSeedParams = {|
 |};
 
 /**
+ * Transfer with seed system transaction params
+ * @typedef {Object} TransferWithSeedParams
+ * @property {PublicKey} fromPubkey
+ * @property {PublicKey} basePubkey
+ * @property {PublicKey} toPubkey
+ * @property {number} lamports
+ * @property {string} seed
+ * @property {PublicKey} programId
+ */
+export type TransferWithSeedParams = {|
+  fromPubkey: PublicKey,
+  basePubkey: PublicKey,
+  toPubkey: PublicKey,
+  lamports: number,
+  seed: string,
+  programId: PublicKey,
+|};
+
+/**
  * System Instruction class
  */
 export class SystemInstruction {
@@ -266,6 +285,30 @@ export class SystemInstruction {
       fromPubkey: instruction.keys[0].pubkey,
       toPubkey: instruction.keys[1].pubkey,
       lamports,
+    };
+  }
+
+  /**
+   * Decode a transfer with seed system instruction and retrieve the instruction params.
+   */
+  static decodeTransferWithSeed(
+    instruction: TransactionInstruction,
+  ): TransferWithSeedParams {
+    this.checkProgramId(instruction.programId);
+    this.checkKeyLength(instruction.keys, 3);
+
+    const {lamports, seed, programId} = decodeData(
+      SYSTEM_INSTRUCTION_LAYOUTS.TransferWithSeed,
+      instruction.data,
+    );
+
+    return {
+      fromPubkey: instruction.keys[0].pubkey,
+      basePubkey: instruction.keys[1].pubkey,
+      toPubkey: instruction.keys[2].pubkey,
+      lamports,
+      seed,
+      programId: new PublicKey(programId),
     };
   }
 
@@ -576,6 +619,15 @@ export const SYSTEM_INSTRUCTION_LAYOUTS = Object.freeze({
       Layout.publicKey('programId'),
     ]),
   },
+  TransferWithSeed: {
+    index: 11,
+    layout: BufferLayout.struct([
+      BufferLayout.u32('instruction'),
+      BufferLayout.ns64('lamports'),
+      Layout.rustString('seed'),
+      Layout.publicKey('programId'),
+    ]),
+  },
 });
 
 /**
@@ -590,9 +642,9 @@ export class SystemProgram {
   }
 
   /**
-   * Generate a Transaction that creates a new account
+   * Generate a transaction instruction that creates a new account
    */
-  static createAccount(params: CreateAccountParams): Transaction {
+  static createAccount(params: CreateAccountParams): TransactionInstruction {
     const type = SYSTEM_INSTRUCTION_LAYOUTS.Create;
     const data = encodeData(type, {
       lamports: params.lamports,
@@ -600,7 +652,7 @@ export class SystemProgram {
       programId: params.programId.toBuffer(),
     });
 
-    return new Transaction().add({
+    return new TransactionInstruction({
       keys: [
         {pubkey: params.fromPubkey, isSigner: true, isWritable: true},
         {pubkey: params.newAccountPubkey, isSigner: true, isWritable: true},
@@ -611,27 +663,49 @@ export class SystemProgram {
   }
 
   /**
-   * Generate a Transaction that transfers lamports from one account to another
+   * Generate a transaction instruction that transfers lamports from one account to another
    */
-  static transfer(params: TransferParams): Transaction {
-    const type = SYSTEM_INSTRUCTION_LAYOUTS.Transfer;
-    const data = encodeData(type, {lamports: params.lamports});
-
-    return new Transaction().add({
-      keys: [
+  static transfer(
+    params: TransferParams | TransferWithSeedParams,
+  ): TransactionInstruction {
+    let data;
+    let keys;
+    if (params.basePubkey) {
+      const type = SYSTEM_INSTRUCTION_LAYOUTS.TransferWithSeed;
+      data = encodeData(type, {
+        lamports: params.lamports,
+        seed: params.seed,
+        programId: params.programId.toBuffer(),
+      });
+      keys = [
+        {pubkey: params.fromPubkey, isSigner: false, isWritable: true},
+        {pubkey: params.basePubkey, isSigner: true, isWritable: false},
+        {pubkey: params.toPubkey, isSigner: false, isWritable: true},
+      ];
+    } else {
+      const type = SYSTEM_INSTRUCTION_LAYOUTS.Transfer;
+      data = encodeData(type, {lamports: params.lamports});
+      keys = [
         {pubkey: params.fromPubkey, isSigner: true, isWritable: true},
         {pubkey: params.toPubkey, isSigner: false, isWritable: true},
-      ],
+      ];
+    }
+
+    return new TransactionInstruction({
+      keys,
       programId: this.programId,
       data,
     });
   }
 
   /**
-   * Generate a Transaction that assigns an account to a program
+   * Generate a transaction instruction that assigns an account to a program
    */
-  static assign(params: AssignParams | AssignWithSeedParams): Transaction {
+  static assign(
+    params: AssignParams | AssignWithSeedParams,
+  ): TransactionInstruction {
     let data;
+    let keys;
     if (params.basePubkey) {
       const type = SYSTEM_INSTRUCTION_LAYOUTS.AssignWithSeed;
       data = encodeData(type, {
@@ -639,25 +713,30 @@ export class SystemProgram {
         seed: params.seed,
         programId: params.programId.toBuffer(),
       });
+      keys = [
+        {pubkey: params.accountPubkey, isSigner: false, isWritable: true},
+        {pubkey: params.basePubkey, isSigner: true, isWritable: false},
+      ];
     } else {
       const type = SYSTEM_INSTRUCTION_LAYOUTS.Assign;
       data = encodeData(type, {programId: params.programId.toBuffer()});
+      keys = [{pubkey: params.accountPubkey, isSigner: true, isWritable: true}];
     }
 
-    return new Transaction().add({
-      keys: [{pubkey: params.accountPubkey, isSigner: true, isWritable: true}],
+    return new TransactionInstruction({
+      keys,
       programId: this.programId,
       data,
     });
   }
 
   /**
-   * Generate a Transaction that creates a new account at
+   * Generate a transaction instruction that creates a new account at
    *   an address generated with `from`, a seed, and programId
    */
   static createAccountWithSeed(
     params: CreateAccountWithSeedParams,
-  ): Transaction {
+  ): TransactionInstruction {
     const type = SYSTEM_INSTRUCTION_LAYOUTS.CreateWithSeed;
     const data = encodeData(type, {
       base: params.basePubkey.toBuffer(),
@@ -667,7 +746,7 @@ export class SystemProgram {
       programId: params.programId.toBuffer(),
     });
 
-    return new Transaction().add({
+    return new TransactionInstruction({
       keys: [
         {pubkey: params.fromPubkey, isSigner: true, isWritable: true},
         {pubkey: params.newAccountPubkey, isSigner: false, isWritable: true},
@@ -678,30 +757,34 @@ export class SystemProgram {
   }
 
   /**
-   * Generate a Transaction that creates a new Nonce account
+   * Generate a transaction that creates a new Nonce account
    */
   static createNonceAccount(
     params: CreateNonceAccountParams | CreateNonceAccountWithSeedParams,
   ): Transaction {
-    let transaction;
+    const transaction = new Transaction();
     if (params.basePubkey && params.seed) {
-      transaction = SystemProgram.createAccountWithSeed({
-        fromPubkey: params.fromPubkey,
-        newAccountPubkey: params.noncePubkey,
-        basePubkey: params.basePubkey,
-        seed: params.seed,
-        lamports: params.lamports,
-        space: NONCE_ACCOUNT_LENGTH,
-        programId: this.programId,
-      });
+      transaction.add(
+        SystemProgram.createAccountWithSeed({
+          fromPubkey: params.fromPubkey,
+          newAccountPubkey: params.noncePubkey,
+          basePubkey: params.basePubkey,
+          seed: params.seed,
+          lamports: params.lamports,
+          space: NONCE_ACCOUNT_LENGTH,
+          programId: this.programId,
+        }),
+      );
     } else {
-      transaction = SystemProgram.createAccount({
-        fromPubkey: params.fromPubkey,
-        newAccountPubkey: params.noncePubkey,
-        lamports: params.lamports,
-        space: NONCE_ACCOUNT_LENGTH,
-        programId: this.programId,
-      });
+      transaction.add(
+        SystemProgram.createAccount({
+          fromPubkey: params.fromPubkey,
+          newAccountPubkey: params.noncePubkey,
+          lamports: params.lamports,
+          space: NONCE_ACCOUNT_LENGTH,
+          programId: this.programId,
+        }),
+      );
     }
 
     const initParams = {
@@ -762,13 +845,13 @@ export class SystemProgram {
   }
 
   /**
-   * Generate a Transaction that withdraws lamports from a Nonce account
+   * Generate a transaction instruction that withdraws lamports from a Nonce account
    */
-  static nonceWithdraw(params: WithdrawNonceParams): Transaction {
+  static nonceWithdraw(params: WithdrawNonceParams): TransactionInstruction {
     const type = SYSTEM_INSTRUCTION_LAYOUTS.WithdrawNonceAccount;
     const data = encodeData(type, {lamports: params.lamports});
 
-    return new Transaction().add({
+    return new TransactionInstruction({
       keys: [
         {pubkey: params.noncePubkey, isSigner: false, isWritable: true},
         {pubkey: params.toPubkey, isSigner: false, isWritable: true},
@@ -790,16 +873,16 @@ export class SystemProgram {
   }
 
   /**
-   * Generate a Transaction that authorizes a new PublicKey as the authority
+   * Generate a transaction instruction that authorizes a new PublicKey as the authority
    * on a Nonce account.
    */
-  static nonceAuthorize(params: AuthorizeNonceParams): Transaction {
+  static nonceAuthorize(params: AuthorizeNonceParams): TransactionInstruction {
     const type = SYSTEM_INSTRUCTION_LAYOUTS.AuthorizeNonceAccount;
     const data = encodeData(type, {
       authorized: params.newAuthorizedPubkey.toBuffer(),
     });
 
-    return new Transaction().add({
+    return new TransactionInstruction({
       keys: [
         {pubkey: params.noncePubkey, isSigner: false, isWritable: true},
         {pubkey: params.authorizedPubkey, isSigner: true, isWritable: false},
@@ -810,12 +893,13 @@ export class SystemProgram {
   }
 
   /**
-   * Generate a Transaction that allocates space in an account without funding
+   * Generate a transaction instruction that allocates space in an account without funding
    */
   static allocate(
     params: AllocateParams | AllocateWithSeedParams,
-  ): Transaction {
+  ): TransactionInstruction {
     let data;
+    let keys;
     if (params.basePubkey) {
       const type = SYSTEM_INSTRUCTION_LAYOUTS.AllocateWithSeed;
       data = encodeData(type, {
@@ -824,15 +908,20 @@ export class SystemProgram {
         space: params.space,
         programId: params.programId.toBuffer(),
       });
+      keys = [
+        {pubkey: params.accountPubkey, isSigner: false, isWritable: true},
+        {pubkey: params.basePubkey, isSigner: true, isWritable: false},
+      ];
     } else {
       const type = SYSTEM_INSTRUCTION_LAYOUTS.Allocate;
       data = encodeData(type, {
         space: params.space,
       });
+      keys = [{pubkey: params.accountPubkey, isSigner: true, isWritable: true}];
     }
 
-    return new Transaction().add({
-      keys: [{pubkey: params.accountPubkey, isSigner: true, isWritable: true}],
+    return new TransactionInstruction({
+      keys,
       programId: this.programId,
       data,
     });

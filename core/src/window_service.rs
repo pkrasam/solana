@@ -5,6 +5,7 @@ use crate::{
     cluster_info::ClusterInfo,
     cluster_info_vote_listener::VerifiedVoteReceiver,
     cluster_slots::ClusterSlots,
+    completed_data_sets_service::CompletedDataSetsSender,
     repair_response,
     repair_service::{RepairInfo, RepairService},
     result::{Error, Result},
@@ -82,14 +83,19 @@ pub fn should_retransmit_and_persist(
 }
 
 fn run_check_duplicate(
-    blockstore: &Arc<Blockstore>,
+    cluster_info: &ClusterInfo,
+    blockstore: &Blockstore,
     shred_receiver: &CrossbeamReceiver<Shred>,
 ) -> Result<()> {
     let check_duplicate = |shred: Shred| -> Result<()> {
         if !blockstore.has_duplicate_shreds_in_slot(shred.slot()) {
-            if let Some(existing_shred_payload) =
-                blockstore.is_shred_duplicate(shred.slot(), shred.index(), &shred.payload)
-            {
+            if let Some(existing_shred_payload) = blockstore.is_shred_duplicate(
+                shred.slot(),
+                shred.index(),
+                &shred.payload,
+                shred.is_data(),
+            ) {
+                cluster_info.push_duplicate_shred(&shred, &existing_shred_payload)?;
                 blockstore.store_duplicate_slot(
                     shred.slot(),
                     existing_shred_payload,
@@ -110,7 +116,7 @@ fn run_check_duplicate(
     Ok(())
 }
 
-fn verify_repair(_shred: &Shred, repair_info: &Option<RepairMeta>) -> bool {
+fn verify_repair(repair_info: &Option<RepairMeta>) -> bool {
     repair_info
         .as_ref()
         .map(|repair_info| repair_info.nonce == DEFAULT_NONCE)
@@ -123,6 +129,7 @@ fn run_insert<F>(
     leader_schedule_cache: &Arc<LeaderScheduleCache>,
     handle_duplicate: F,
     metrics: &mut BlockstoreInsertionMetrics,
+    completed_data_sets_sender: &CompletedDataSetsSender,
 ) -> Result<()>
 where
     F: Fn(Shred),
@@ -136,15 +143,24 @@ where
 
     assert_eq!(shreds.len(), repair_infos.len());
     let mut i = 0;
-    shreds.retain(|shred| (verify_repair(&shred, &repair_infos[i]), i += 1).0);
+    shreds.retain(|_shred| (verify_repair(&repair_infos[i]), i += 1).0);
+    repair_infos.retain(|repair_info| verify_repair(&repair_info));
+    assert_eq!(shreds.len(), repair_infos.len());
 
-    blockstore.insert_shreds_handle_duplicate(
+    let (completed_data_sets, inserted_indices) = blockstore.insert_shreds_handle_duplicate(
         shreds,
         Some(leader_schedule_cache),
         false,
         &handle_duplicate,
         metrics,
     )?;
+    for index in inserted_indices {
+        if repair_infos[index].is_some() {
+            metrics.num_repair += 1;
+        }
+    }
+
+    completed_data_sets_sender.try_send(completed_data_sets)?;
     Ok(())
 }
 
@@ -302,6 +318,7 @@ impl WindowService {
         shred_filter: F,
         cluster_slots: Arc<ClusterSlots>,
         verified_vote_receiver: VerifiedVoteReceiver,
+        completed_data_sets_sender: CompletedDataSetsSender,
     ) -> WindowService
     where
         F: 'static
@@ -324,8 +341,12 @@ impl WindowService {
         let (insert_sender, insert_receiver) = unbounded();
         let (duplicate_sender, duplicate_receiver) = unbounded();
 
-        let t_check_duplicate =
-            Self::start_check_duplicate_thread(exit, &blockstore, duplicate_receiver);
+        let t_check_duplicate = Self::start_check_duplicate_thread(
+            cluster_info.clone(),
+            exit.clone(),
+            blockstore.clone(),
+            duplicate_receiver,
+        );
 
         let t_insert = Self::start_window_insert_thread(
             exit,
@@ -333,6 +354,7 @@ impl WindowService {
             leader_schedule_cache,
             insert_receiver,
             duplicate_sender,
+            completed_data_sets_sender,
         );
 
         let t_window = Self::start_recv_window_thread(
@@ -355,12 +377,11 @@ impl WindowService {
     }
 
     fn start_check_duplicate_thread(
-        exit: &Arc<AtomicBool>,
-        blockstore: &Arc<Blockstore>,
+        cluster_info: Arc<ClusterInfo>,
+        exit: Arc<AtomicBool>,
+        blockstore: Arc<Blockstore>,
         duplicate_receiver: CrossbeamReceiver<Shred>,
     ) -> JoinHandle<()> {
-        let exit = exit.clone();
-        let blockstore = blockstore.clone();
         let handle_error = || {
             inc_new_counter_error!("solana-check-duplicate-error", 1, 1);
         };
@@ -372,7 +393,8 @@ impl WindowService {
                 }
 
                 let mut noop = || {};
-                if let Err(e) = run_check_duplicate(&blockstore, &duplicate_receiver) {
+                if let Err(e) = run_check_duplicate(&cluster_info, &blockstore, &duplicate_receiver)
+                {
                     if Self::should_exit_on_error(e, &mut noop, &handle_error) {
                         break;
                     }
@@ -387,6 +409,7 @@ impl WindowService {
         leader_schedule_cache: &Arc<LeaderScheduleCache>,
         insert_receiver: CrossbeamReceiver<(Vec<Shred>, Vec<Option<RepairMeta>>)>,
         duplicate_sender: CrossbeamSender<Shred>,
+        completed_data_sets_sender: CompletedDataSetsSender,
     ) -> JoinHandle<()> {
         let exit = exit.clone();
         let blockstore = blockstore.clone();
@@ -415,6 +438,7 @@ impl WindowService {
                         &leader_schedule_cache,
                         &handle_duplicate,
                         &mut metrics,
+                        &completed_data_sets_sender,
                     ) {
                         if Self::should_exit_on_error(e, &mut handle_timeout, &handle_error) {
                             break;
@@ -533,6 +557,7 @@ impl WindowService {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::contact_info::ContactInfo;
     use solana_ledger::{
         blockstore::{make_many_slot_entries, Blockstore},
         entry::{create_ticks, Entry},
@@ -545,6 +570,7 @@ mod test {
         epoch_schedule::MINIMUM_SLOTS_PER_EPOCH,
         hash::Hash,
         signature::{Keypair, Signer},
+        timing::timestamp,
     };
     use std::sync::Arc;
 
@@ -579,7 +605,7 @@ mod test {
 
     #[test]
     fn test_should_retransmit_and_persist() {
-        let me_id = Pubkey::new_rand();
+        let me_id = solana_sdk::pubkey::new_rand();
         let leader_keypair = Arc::new(Keypair::new());
         let leader_pubkey = leader_keypair.pubkey();
         let bank = Arc::new(Bank::new(
@@ -663,7 +689,10 @@ mod test {
         let duplicate_shred_slot = duplicate_shred.slot();
         sender.send(duplicate_shred).unwrap();
         assert!(!blockstore.has_duplicate_shreds_in_slot(duplicate_shred_slot));
-        run_check_duplicate(&blockstore, &receiver).unwrap();
+        let keypair = Keypair::new();
+        let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), timestamp());
+        let cluster_info = ClusterInfo::new(contact_info, Arc::new(keypair));
+        run_check_duplicate(&cluster_info, &blockstore, &receiver).unwrap();
         assert!(blockstore.has_duplicate_shreds_in_slot(duplicate_shred_slot));
     }
 }

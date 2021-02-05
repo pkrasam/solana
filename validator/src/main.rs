@@ -1,17 +1,17 @@
 use clap::{
-    crate_description, crate_name, value_t, value_t_or_exit, values_t, values_t_or_exit, App, Arg,
-    ArgMatches,
+    crate_description, crate_name, value_t, value_t_or_exit, values_t, values_t_or_exit, App,
+    AppSettings, Arg, ArgMatches, SubCommand,
 };
 use log::*;
-use rand::{thread_rng, Rng};
+use rand::{seq::SliceRandom, thread_rng, Rng};
 use solana_clap_utils::{
-    input_parsers::{keypair_of, keypairs_of, pubkey_of},
+    input_parsers::{keypair_of, keypairs_of, pubkey_of, value_of},
     input_validators::{
         is_keypair_or_ask_keyword, is_parsable, is_pubkey, is_pubkey_or_keypair, is_slot,
     },
     keypair::SKIP_SEED_PHRASE_VALIDATION_ARG,
 };
-use solana_client::rpc_client::RpcClient;
+use solana_client::{rpc_client::RpcClient, rpc_request::MAX_MULTIPLE_ACCOUNTS};
 use solana_core::ledger_cleanup_service::{
     DEFAULT_MAX_LEDGER_SHREDS, DEFAULT_MIN_MAX_LEDGER_SHREDS,
 };
@@ -19,15 +19,19 @@ use solana_core::{
     cluster_info::{ClusterInfo, Node, MINIMUM_VALIDATOR_PORT_RANGE_WIDTH, VALIDATOR_PORT_RANGE},
     contact_info::ContactInfo,
     gossip_service::GossipService,
+    poh_service,
     rpc::JsonRpcConfig,
-    validator::{Validator, ValidatorConfig},
+    rpc_pubsub_service::PubSubConfig,
+    validator::{is_snapshot_config_invalid, Validator, ValidatorConfig},
 };
 use solana_download_utils::{download_genesis_if_missing, download_snapshot};
 use solana_ledger::blockstore_db::BlockstoreRecoveryMode;
 use solana_perf::recycler::enable_recycler_warming;
 use solana_runtime::{
-    bank_forks::{CompressionType, SnapshotConfig, SnapshotVersion},
+    accounts_index::AccountIndex,
+    bank_forks::{ArchiveFormat, SnapshotConfig, SnapshotVersion},
     hardened_unpack::{unpack_genesis_archive, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE},
+    snapshot_utils::get_highest_snapshot_archive_path,
 };
 use solana_sdk::{
     clock::Slot,
@@ -37,26 +41,27 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
+use solana_validator::redirect_stderr_to_file;
 use std::{
     collections::HashSet,
     env,
     fs::{self, File},
-    net::{SocketAddr, TcpListener, UdpSocket},
-    path::PathBuf,
+    net::{IpAddr, SocketAddr, TcpListener, UdpSocket},
+    path::{Path, PathBuf},
     process::exit,
     str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    thread::{sleep, JoinHandle},
+    thread::sleep,
     time::{Duration, Instant},
 };
 
-fn port_validator(port: String) -> Result<(), String> {
-    port.parse::<u16>()
-        .map(|_| ())
-        .map_err(|e| format!("{:?}", e))
+#[derive(Debug, PartialEq)]
+enum Operation {
+    Initialize,
+    Run,
 }
 
 fn port_range_validator(port_range: String) -> Result<(), String> {
@@ -79,34 +84,6 @@ fn hash_validator(hash: String) -> Result<(), String> {
     Hash::from_str(&hash)
         .map(|_| ())
         .map_err(|e| format!("{:?}", e))
-}
-
-fn get_shred_rpc_peers(
-    cluster_info: &ClusterInfo,
-    expected_shred_version: Option<u16>,
-) -> Vec<ContactInfo> {
-    let rpc_peers = cluster_info.all_rpc_peers();
-    match expected_shred_version {
-        Some(expected_shred_version) => {
-            // Filter out rpc peers that don't match the expected shred version
-            rpc_peers
-                .into_iter()
-                .filter(|contact_info| contact_info.shred_version == expected_shred_version)
-                .collect::<Vec<_>>()
-        }
-        None => {
-            if !rpc_peers
-                .iter()
-                .all(|contact_info| contact_info.shred_version == rpc_peers[0].shred_version)
-            {
-                eprintln!(
-                        "Multiple shred versions observed in gossip.  Restart with --expected-shred-version"
-                    );
-                exit(1);
-            }
-            rpc_peers
-        }
-    }
 }
 
 fn is_trusted_validator(id: &Pubkey, trusted_validators: &Option<HashSet<Pubkey>>) -> bool {
@@ -138,12 +115,15 @@ fn get_trusted_snapshot_hashes(
 
 fn start_gossip_node(
     identity_keypair: &Arc<Keypair>,
-    entrypoint_gossip: &SocketAddr,
+    cluster_entrypoints: &[ContactInfo],
+    ledger_path: &Path,
     gossip_addr: &SocketAddr,
     gossip_socket: UdpSocket,
     expected_shred_version: Option<u16>,
+    gossip_validators: Option<HashSet<Pubkey>>,
+    should_check_duplicate_instance: bool,
 ) -> (Arc<ClusterInfo>, Arc<AtomicBool>, GossipService) {
-    let cluster_info = ClusterInfo::new(
+    let mut cluster_info = ClusterInfo::new(
         ClusterInfo::gossip_contact_info(
             &identity_keypair.pubkey(),
             *gossip_addr,
@@ -151,31 +131,72 @@ fn start_gossip_node(
         ),
         identity_keypair.clone(),
     );
-    cluster_info.set_entrypoint(ContactInfo::new_gossip_entry_point(entrypoint_gossip));
+    cluster_info.set_entrypoints(cluster_entrypoints.to_vec());
+    cluster_info.restore_contact_info(ledger_path, 0);
     let cluster_info = Arc::new(cluster_info);
 
     let gossip_exit_flag = Arc::new(AtomicBool::new(false));
-    let gossip_service = GossipService::new(&cluster_info, None, gossip_socket, &gossip_exit_flag);
+    let gossip_service = GossipService::new(
+        &cluster_info,
+        None,
+        gossip_socket,
+        gossip_validators,
+        should_check_duplicate_instance,
+        &gossip_exit_flag,
+    );
     (cluster_info, gossip_exit_flag, gossip_service)
 }
 
 fn get_rpc_node(
     cluster_info: &ClusterInfo,
+    cluster_entrypoints: &[ContactInfo],
     validator_config: &ValidatorConfig,
     blacklisted_rpc_nodes: &mut HashSet<Pubkey>,
     snapshot_not_required: bool,
     no_untrusted_rpc: bool,
-) -> (ContactInfo, Option<(Slot, Hash)>) {
+    ledger_path: &std::path::Path,
+) -> Option<(ContactInfo, Option<(Slot, Hash)>)> {
     let mut blacklist_timeout = Instant::now();
+    let mut newer_cluster_snapshot_timeout = None;
+    let mut retry_reason = None;
     loop {
-        info!(
-            "Searching for an RPC service, shred version={:?}...",
-            validator_config.expected_shred_version
-        );
         sleep(Duration::from_secs(1));
-        info!("\n{}", cluster_info.contact_info_trace());
+        info!("\n{}", cluster_info.rpc_info_trace());
 
-        let rpc_peers = get_shred_rpc_peers(&cluster_info, validator_config.expected_shred_version);
+        let shred_version = validator_config
+            .expected_shred_version
+            .unwrap_or_else(|| cluster_info.my_shred_version());
+        if shred_version == 0 {
+            let all_zero_shred_versions = cluster_entrypoints.iter().all(|cluster_entrypoint| {
+                cluster_info
+                    .lookup_contact_info_by_gossip_addr(&cluster_entrypoint.gossip)
+                    .map_or(false, |entrypoint| entrypoint.shred_version == 0)
+            });
+
+            if all_zero_shred_versions {
+                eprintln!(
+                    "Entrypoint shred version is zero.  Restart with --expected-shred-version"
+                );
+                exit(1);
+            }
+            info!("Waiting to adopt entrypoint shred version...");
+            continue;
+        }
+
+        info!(
+            "Searching for an RPC service with shred version {}{}...",
+            shred_version,
+            retry_reason
+                .as_ref()
+                .map(|s| format!(" (Retrying: {})", s))
+                .unwrap_or_default()
+        );
+
+        let rpc_peers = cluster_info
+            .all_rpc_peers()
+            .into_iter()
+            .filter(|contact_info| contact_info.shred_version == shred_version)
+            .collect::<Vec<_>>();
         let rpc_peers_total = rpc_peers.len();
 
         // Filter out blacklisted nodes
@@ -197,17 +218,23 @@ fn get_rpc_node(
         );
 
         if rpc_peers_blacklisted == rpc_peers_total {
-            // If all nodes are blacklisted and no additional nodes are discovered after 60 seconds,
-            // remove the blacklist and try them all again
-            if blacklist_timeout.elapsed().as_secs() > 60 {
-                info!("Blacklist timeout expired");
+            retry_reason = if !blacklisted_rpc_nodes.is_empty()
+                && blacklist_timeout.elapsed().as_secs() > 60
+            {
+                // If all nodes are blacklisted and no additional nodes are discovered after 60 seconds,
+                // remove the blacklist and try them all again
                 blacklisted_rpc_nodes.clear();
-            }
+                Some("Blacklist timeout expired".to_owned())
+            } else {
+                Some("Wait for trusted rpc peers".to_owned())
+            };
             continue;
         }
         blacklist_timeout = Instant::now();
 
-        let mut highest_snapshot_hash: Option<(Slot, Hash)> = None;
+        let mut highest_snapshot_hash: Option<(Slot, Hash)> =
+            get_highest_snapshot_archive_path(ledger_path)
+                .map(|(_path, (slot, hash, _compression))| (slot, hash));
         let eligible_rpc_peers = if snapshot_not_required {
             rpc_peers
         } else {
@@ -249,9 +276,25 @@ fn get_rpc_node(
             match highest_snapshot_hash {
                 None => {
                     assert!(eligible_rpc_peers.is_empty());
-                    info!("No snapshots available");
                 }
                 Some(highest_snapshot_hash) => {
+                    if eligible_rpc_peers.is_empty() {
+                        match newer_cluster_snapshot_timeout {
+                            None => newer_cluster_snapshot_timeout = Some(Instant::now()),
+                            Some(newer_cluster_snapshot_timeout) => {
+                                if newer_cluster_snapshot_timeout.elapsed().as_secs() > 180 {
+                                    warn!("giving up newer snapshot from the cluster");
+                                    return None;
+                                }
+                            }
+                        }
+                        retry_reason = Some(format!(
+                            "Wait for newer snapshot than local: {:?}",
+                            highest_snapshot_hash
+                        ));
+                        continue;
+                    }
+
                     info!(
                         "Highest available snapshot slot is {}, available from {} node{}: {:?}",
                         highest_snapshot_hash.0,
@@ -274,7 +317,9 @@ fn get_rpc_node(
         if !eligible_rpc_peers.is_empty() {
             let contact_info =
                 &eligible_rpc_peers[thread_rng().gen_range(0, eligible_rpc_peers.len())];
-            return (contact_info.clone(), highest_snapshot_hash);
+            return Some((contact_info.clone(), highest_snapshot_hash));
+        } else {
+            retry_reason = Some("No snapshots available".to_owned());
         }
     }
 }
@@ -286,7 +331,7 @@ fn check_vote_account(
     authorized_voter_pubkeys: &[Pubkey],
 ) -> Result<(), String> {
     let vote_account = rpc_client
-        .get_account_with_commitment(vote_account_address, CommitmentConfig::root())
+        .get_account_with_commitment(vote_account_address, CommitmentConfig::confirmed())
         .map_err(|err| format!("failed to fetch vote account: {}", err.to_string()))?
         .value
         .ok_or_else(|| format!("vote account does not exist: {}", vote_account_address))?;
@@ -299,7 +344,7 @@ fn check_vote_account(
     }
 
     let identity_account = rpc_client
-        .get_account_with_commitment(identity_pubkey, CommitmentConfig::root())
+        .get_account_with_commitment(identity_pubkey, CommitmentConfig::confirmed())
         .map_err(|err| format!("failed to fetch identity account: {}", err.to_string()))?
         .value
         .ok_or_else(|| format!("identity account does not exist: {}", identity_pubkey))?;
@@ -352,6 +397,29 @@ fn hardforks_of(matches: &ArgMatches<'_>, name: &str) -> Option<Vec<Slot>> {
     }
 }
 
+fn validators_set(
+    identity_pubkey: &Pubkey,
+    matches: &ArgMatches<'_>,
+    matches_name: &str,
+    arg_name: &str,
+) -> Option<HashSet<Pubkey>> {
+    if matches.is_present(matches_name) {
+        let validators_set: HashSet<_> = values_t_or_exit!(matches, matches_name, Pubkey)
+            .into_iter()
+            .collect();
+        if validators_set.contains(identity_pubkey) {
+            eprintln!(
+                "The validator's identity pubkey cannot be a {}: {}",
+                arg_name, identity_pubkey
+            );
+            exit(1);
+        }
+        Some(validators_set)
+    } else {
+        None
+    }
+}
+
 fn check_genesis_hash(
     genesis_config: &GenesisConfig,
     expected_genesis_hash: Option<Hash>,
@@ -387,6 +455,7 @@ fn download_then_check_genesis_hash(
     expected_genesis_hash: Option<Hash>,
     max_genesis_archive_unpacked_size: u64,
     no_genesis_fetch: bool,
+    use_progress_bar: bool,
 ) -> Result<Hash, String> {
     if no_genesis_fetch {
         let genesis_config = load_local_genesis(ledger_path, expected_genesis_hash)?;
@@ -394,106 +463,336 @@ fn download_then_check_genesis_hash(
     }
 
     let genesis_package = ledger_path.join("genesis.tar.bz2");
-    let genesis_config =
-        if let Ok(tmp_genesis_package) = download_genesis_if_missing(rpc_addr, &genesis_package) {
-            unpack_genesis_archive(
-                &tmp_genesis_package,
-                &ledger_path,
-                max_genesis_archive_unpacked_size,
-            )
-            .map_err(|err| format!("Failed to unpack downloaded genesis config: {}", err))?;
+    let genesis_config = if let Ok(tmp_genesis_package) =
+        download_genesis_if_missing(rpc_addr, &genesis_package, use_progress_bar)
+    {
+        unpack_genesis_archive(
+            &tmp_genesis_package,
+            &ledger_path,
+            max_genesis_archive_unpacked_size,
+        )
+        .map_err(|err| format!("Failed to unpack downloaded genesis config: {}", err))?;
 
-            let downloaded_genesis = GenesisConfig::load(&ledger_path)
-                .map_err(|err| format!("Failed to load downloaded genesis config: {}", err))?;
+        let downloaded_genesis = GenesisConfig::load(&ledger_path)
+            .map_err(|err| format!("Failed to load downloaded genesis config: {}", err))?;
 
-            check_genesis_hash(&downloaded_genesis, expected_genesis_hash)?;
-            std::fs::rename(tmp_genesis_package, genesis_package)
-                .map_err(|err| format!("Unable to rename: {:?}", err))?;
+        check_genesis_hash(&downloaded_genesis, expected_genesis_hash)?;
+        std::fs::rename(tmp_genesis_package, genesis_package)
+            .map_err(|err| format!("Unable to rename: {:?}", err))?;
 
-            downloaded_genesis
-        } else {
-            load_local_genesis(ledger_path, expected_genesis_hash)?
-        };
+        downloaded_genesis
+    } else {
+        load_local_genesis(ledger_path, expected_genesis_hash)?
+    };
 
     Ok(genesis_config.hash())
 }
 
-fn is_snapshot_config_invalid(
-    snapshot_interval_slots: u64,
-    accounts_hash_interval_slots: u64,
+fn verify_reachable_ports(
+    node: &Node,
+    cluster_entrypoint: &ContactInfo,
+    validator_config: &ValidatorConfig,
 ) -> bool {
-    snapshot_interval_slots != 0
-        && (snapshot_interval_slots < accounts_hash_interval_slots
-            || snapshot_interval_slots % accounts_hash_interval_slots != 0)
+    let mut udp_sockets = vec![&node.sockets.gossip, &node.sockets.repair];
+
+    if ContactInfo::is_valid_address(&node.info.serve_repair) {
+        udp_sockets.push(&node.sockets.serve_repair);
+    }
+    if ContactInfo::is_valid_address(&node.info.tpu) {
+        udp_sockets.extend(node.sockets.tpu.iter());
+    }
+    if ContactInfo::is_valid_address(&node.info.tpu_forwards) {
+        udp_sockets.extend(node.sockets.tpu_forwards.iter());
+    }
+    if ContactInfo::is_valid_address(&node.info.tvu) {
+        udp_sockets.extend(node.sockets.tvu.iter());
+        udp_sockets.extend(node.sockets.broadcast.iter());
+        udp_sockets.extend(node.sockets.retransmit_sockets.iter());
+    }
+    if ContactInfo::is_valid_address(&node.info.tvu_forwards) {
+        udp_sockets.extend(node.sockets.tvu_forwards.iter());
+    }
+
+    let mut tcp_listeners = vec![];
+    if let Some((rpc_addr, rpc_pubsub_addr)) = validator_config.rpc_addrs {
+        for (purpose, bind_addr, public_addr) in &[
+            ("RPC", rpc_addr, &node.info.rpc),
+            ("RPC pubsub", rpc_pubsub_addr, &node.info.rpc_pubsub),
+        ] {
+            if ContactInfo::is_valid_address(&public_addr) {
+                tcp_listeners.push((
+                    bind_addr.port(),
+                    TcpListener::bind(bind_addr).unwrap_or_else(|err| {
+                        error!(
+                            "Unable to bind to tcp {:?} for {}: {}",
+                            bind_addr, purpose, err
+                        );
+                        exit(1);
+                    }),
+                ));
+            }
+        }
+    }
+
+    if let Some(ip_echo) = &node.sockets.ip_echo {
+        let ip_echo = ip_echo.try_clone().expect("unable to clone tcp_listener");
+        tcp_listeners.push((ip_echo.local_addr().unwrap().port(), ip_echo));
+    }
+
+    solana_net_utils::verify_reachable_ports(
+        &cluster_entrypoint.gossip,
+        tcp_listeners,
+        &udp_sockets,
+    )
 }
 
-#[cfg(unix)]
-fn redirect_stderr(filename: &str) {
-    use std::{fs::OpenOptions, os::unix::io::AsRawFd};
-    match OpenOptions::new()
-        .write(true)
-        .create(true)
-        .append(true)
-        .open(filename)
-    {
-        Ok(file) => unsafe {
-            libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
-        },
-        Err(err) => eprintln!("Unable to open {}: {}", filename, err),
+struct RpcBootstrapConfig {
+    no_genesis_fetch: bool,
+    no_snapshot_fetch: bool,
+    no_untrusted_rpc: bool,
+    max_genesis_archive_unpacked_size: u64,
+    no_check_vote_account: bool,
+}
+
+impl Default for RpcBootstrapConfig {
+    fn default() -> Self {
+        Self {
+            no_genesis_fetch: true,
+            no_snapshot_fetch: true,
+            no_untrusted_rpc: true,
+            max_genesis_archive_unpacked_size: MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+            no_check_vote_account: true,
+        }
     }
 }
 
-fn start_logger(logfile: Option<String>) -> Option<JoinHandle<()>> {
-    let logger_thread = match logfile {
-        None => None,
-        Some(logfile) => {
-            #[cfg(unix)]
-            {
-                let signals = signal_hook::iterator::Signals::new(&[signal_hook::SIGUSR1])
-                    .unwrap_or_else(|err| {
-                        eprintln!("Unable to register SIGUSR1 handler: {:?}", err);
-                        exit(1);
-                    });
+#[allow(clippy::too_many_arguments)]
+fn rpc_bootstrap(
+    node: &Node,
+    identity_keypair: &Arc<Keypair>,
+    ledger_path: &Path,
+    vote_account: &Pubkey,
+    authorized_voter_keypairs: &[Arc<Keypair>],
+    cluster_entrypoints: &[ContactInfo],
+    validator_config: &mut ValidatorConfig,
+    bootstrap_config: RpcBootstrapConfig,
+    no_port_check: bool,
+    use_progress_bar: bool,
+    maximum_local_snapshot_age: Slot,
+    should_check_duplicate_instance: bool,
+) {
+    if !no_port_check {
+        let mut order: Vec<_> = (0..cluster_entrypoints.len()).collect();
+        order.shuffle(&mut thread_rng());
+        if order
+            .into_iter()
+            .all(|i| !verify_reachable_ports(&node, &cluster_entrypoints[i], &validator_config))
+        {
+            exit(1);
+        }
+    }
 
-                redirect_stderr(&logfile);
-                Some(std::thread::spawn(move || {
-                    for signal in signals.forever() {
-                        info!(
-                            "received SIGUSR1 ({}), reopening log file: {:?}",
-                            signal, logfile
-                        );
-                        redirect_stderr(&logfile);
-                    }
-                }))
+    if bootstrap_config.no_genesis_fetch && bootstrap_config.no_snapshot_fetch {
+        return;
+    }
+
+    let mut blacklisted_rpc_nodes = HashSet::new();
+    let mut gossip = None;
+    loop {
+        if gossip.is_none() {
+            gossip = Some(start_gossip_node(
+                &identity_keypair,
+                &cluster_entrypoints,
+                ledger_path,
+                &node.info.gossip,
+                node.sockets.gossip.try_clone().unwrap(),
+                validator_config.expected_shred_version,
+                validator_config.gossip_validators.clone(),
+                should_check_duplicate_instance,
+            ));
+        }
+
+        let rpc_node_details = get_rpc_node(
+            &gossip.as_ref().unwrap().0,
+            &cluster_entrypoints,
+            &validator_config,
+            &mut blacklisted_rpc_nodes,
+            bootstrap_config.no_snapshot_fetch,
+            bootstrap_config.no_untrusted_rpc,
+            ledger_path,
+        );
+        if rpc_node_details.is_none() {
+            return;
+        }
+        let (rpc_contact_info, snapshot_hash) = rpc_node_details.unwrap();
+
+        info!(
+            "Using RPC service from node {}: {:?}",
+            rpc_contact_info.id, rpc_contact_info.rpc
+        );
+        let rpc_client = RpcClient::new_socket(rpc_contact_info.rpc);
+
+        let result = match rpc_client.get_version() {
+            Ok(rpc_version) => {
+                info!("RPC node version: {}", rpc_version.solana_core);
+                Ok(())
             }
-            #[cfg(not(unix))]
-            {
-                println!("logging to a file is not supported on this platform");
-                ()
+            Err(err) => Err(format!("Failed to get RPC node version: {}", err)),
+        }
+        .and_then(|_| {
+            let genesis_hash = download_then_check_genesis_hash(
+                &rpc_contact_info.rpc,
+                &ledger_path,
+                validator_config.expected_genesis_hash,
+                bootstrap_config.max_genesis_archive_unpacked_size,
+                bootstrap_config.no_genesis_fetch,
+                use_progress_bar,
+            );
+
+            if let Ok(genesis_hash) = genesis_hash {
+                if validator_config.expected_genesis_hash.is_none() {
+                    info!("Expected genesis hash set to {}", genesis_hash);
+                    validator_config.expected_genesis_hash = Some(genesis_hash);
+                }
+            }
+
+            if let Some(expected_genesis_hash) = validator_config.expected_genesis_hash {
+                // Sanity check that the RPC node is using the expected genesis hash before
+                // downloading a snapshot from it
+                let rpc_genesis_hash = rpc_client
+                    .get_genesis_hash()
+                    .map_err(|err| format!("Failed to get genesis hash: {}", err))?;
+
+                if expected_genesis_hash != rpc_genesis_hash {
+                    return Err(format!(
+                        "Genesis hash mismatch: expected {} but RPC node genesis hash is {}",
+                        expected_genesis_hash, rpc_genesis_hash
+                    ));
+                }
+            }
+
+            if let Some(snapshot_hash) = snapshot_hash {
+                let mut use_local_snapshot = false;
+
+                if let Some(highest_local_snapshot_slot) =
+                    get_highest_snapshot_archive_path(ledger_path)
+                        .map(|(_path, (slot, _hash, _compression))| slot)
+                {
+                    if highest_local_snapshot_slot
+                        > snapshot_hash.0.saturating_sub(maximum_local_snapshot_age)
+                    {
+                        info!(
+                            "Reusing local snapshot at slot {} instead \
+                               of downloading a snapshot for slot {}",
+                            highest_local_snapshot_slot, snapshot_hash.0
+                        );
+                        use_local_snapshot = true;
+                    } else {
+                        info!(
+                            "Local snapshot from slot {} is too old. \
+                              Downloading a newer snapshot for slot {}",
+                            highest_local_snapshot_slot, snapshot_hash.0
+                        );
+                    }
+                }
+
+                if use_local_snapshot {
+                    Ok(())
+                } else {
+                    rpc_client
+                        .get_slot_with_commitment(CommitmentConfig::finalized())
+                        .map_err(|err| format!("Failed to get RPC node slot: {}", err))
+                        .and_then(|slot| {
+                            info!("RPC node root slot: {}", slot);
+                            let (cluster_info, gossip_exit_flag, gossip_service) =
+                                gossip.take().unwrap();
+                            cluster_info.save_contact_info();
+                            gossip_exit_flag.store(true, Ordering::Relaxed);
+                            let ret = download_snapshot(
+                                &rpc_contact_info.rpc,
+                                &ledger_path,
+                                snapshot_hash,
+                                use_progress_bar,
+                            );
+                            gossip_service.join().unwrap();
+                            ret
+                        })
+                }
+            } else {
+                Ok(())
+            }
+        })
+        .map(|_| {
+            if !validator_config.voting_disabled && !bootstrap_config.no_check_vote_account {
+                check_vote_account(
+                    &rpc_client,
+                    &identity_keypair.pubkey(),
+                    &vote_account,
+                    &authorized_voter_keypairs
+                        .iter()
+                        .map(|k| k.pubkey())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap_or_else(|err| {
+                    // Consider failures here to be more likely due to user error (eg,
+                    // incorrect `solana-validator` command-line arguments) rather than the
+                    // RPC node failing.
+                    //
+                    // Power users can always use the `--no-check-vote-account` option to
+                    // bypass this check entirely
+                    error!("{}", err);
+                    exit(1);
+                });
+            }
+        });
+
+        if result.is_ok() {
+            break;
+        }
+        warn!("{}", result.unwrap_err());
+
+        if let Some(ref trusted_validators) = validator_config.trusted_validators {
+            if trusted_validators.contains(&rpc_contact_info.id) {
+                continue; // Never blacklist a trusted node
             }
         }
-    };
 
-    solana_logger::setup_with_default(
-        &[
-            "solana=info", /* info logging for all solana modules */
-            "rpc=trace",   /* json_rpc request/response logging */
-        ]
-        .join(","),
-    );
-
-    logger_thread
+        info!(
+            "Excluding {} as a future RPC candidate",
+            rpc_contact_info.id
+        );
+        blacklisted_rpc_nodes.insert(rpc_contact_info.id);
+    }
+    if let Some((cluster_info, gossip_exit_flag, gossip_service)) = gossip.take() {
+        cluster_info.save_contact_info();
+        gossip_exit_flag.store(true, Ordering::Relaxed);
+        gossip_service.join().unwrap();
+    }
 }
 
-#[allow(clippy::cognitive_complexity)]
 pub fn main() {
     let default_dynamic_port_range =
         &format!("{}-{}", VALIDATOR_PORT_RANGE.0, VALIDATOR_PORT_RANGE.1);
-    let default_limit_ledger_size = &DEFAULT_MAX_LEDGER_SHREDS.to_string();
     let default_genesis_archive_unpacked_size = &MAX_GENESIS_ARCHIVE_UNPACKED_SIZE.to_string();
+    let default_rpc_max_multiple_accounts = &MAX_MULTIPLE_ACCOUNTS.to_string();
+    let default_rpc_pubsub_max_connections = PubSubConfig::default().max_connections.to_string();
+    let default_rpc_pubsub_max_fragment_size =
+        PubSubConfig::default().max_fragment_size.to_string();
+    let default_rpc_pubsub_max_in_buffer_capacity =
+        PubSubConfig::default().max_in_buffer_capacity.to_string();
+    let default_rpc_pubsub_max_out_buffer_capacity =
+        PubSubConfig::default().max_out_buffer_capacity.to_string();
+    let default_rpc_send_transaction_retry_ms = ValidatorConfig::default()
+        .send_transaction_retry_ms
+        .to_string();
+    let default_rpc_send_transaction_leader_forward_count = ValidatorConfig::default()
+        .send_transaction_leader_forward_count
+        .to_string();
+    let default_rpc_threads = num_cpus::get().to_string();
 
     let matches = App::new(crate_name!()).about(crate_description!())
         .version(solana_version::version!())
+        .setting(AppSettings::VersionlessSubcommands)
         .arg(
             Arg::with_name(SKIP_SEED_PHRASE_VALIDATION_ARG.name)
                 .long(SKIP_SEED_PHRASE_VALIDATION_ARG.long)
@@ -538,7 +837,7 @@ pub fn main() {
                 .value_name("FILE")
                 .takes_value(true)
                 .help("Create this file if it doesn't already exist \
-                       once node initialization is complete"),
+                       once validator initialization is complete"),
         )
         .arg(
             Arg::with_name("ledger_path")
@@ -555,6 +854,7 @@ pub fn main() {
                 .long("entrypoint")
                 .value_name("HOST:PORT")
                 .takes_value(true)
+                .multiple(true)
                 .validator(solana_net_utils::is_host_port)
                 .help("Rendezvous with the cluster at this gossip entrypoint"),
         )
@@ -575,7 +875,7 @@ pub fn main() {
             Arg::with_name("no_voting")
                 .long("no-voting")
                 .takes_value(false)
-                .help("Launch node without voting"),
+                .help("Launch validator without voting"),
         )
         .arg(
             Arg::with_name("no_check_vote_account")
@@ -584,6 +884,17 @@ pub fn main() {
                 .conflicts_with("no_voting")
                 .requires("entrypoint")
                 .help("Skip the RPC vote account sanity check")
+        )
+        .arg(
+            Arg::with_name("restricted_repair_only_mode")
+                .long("restricted-repair-only-mode")
+                .takes_value(false)
+                .help("Do not publish the Gossip, TPU, TVU or Repair Service ports causing \
+                       the validator to operate in a limited capacity that reduces its \
+                       exposure to the rest of the cluster. \
+                       \
+                       The --no-voting flag is implicit when this flag is enabled \
+                      "),
         )
         .arg(
             Arg::with_name("dev_halt_at_slot")
@@ -598,14 +909,20 @@ pub fn main() {
                 .long("rpc-port")
                 .value_name("PORT")
                 .takes_value(true)
-                .validator(port_validator)
-                .help("Use this port for JSON RPC, the next port for the RPC websocket, and the following for the RPC banks API"),
+                .validator(solana_validator::port_validator)
+                .help("Use this port for JSON RPC and the next port for the RPC websocket"),
         )
         .arg(
             Arg::with_name("private_rpc")
                 .long("--private-rpc")
                 .takes_value(false)
-                .help("Do not publish the RPC port for use by other nodes")
+                .help("Do not publish the RPC port for use by others")
+        )
+        .arg(
+            Arg::with_name("no_port_check")
+                .long("--no-port-check")
+                .takes_value(false)
+                .help("Do not perform TCP/UDP reachable port checks at start-up")
         )
         .arg(
             Arg::with_name("enable_rpc_exit")
@@ -638,6 +955,30 @@ pub fn main() {
                        as a fallback to local ledger data"),
         )
         .arg(
+            Arg::with_name("enable_bigtable_ledger_upload")
+                .long("enable-bigtable-ledger-upload")
+                .requires("enable_rpc_transaction_history")
+                .takes_value(false)
+                .help("Upload new confirmed blocks into a BigTable instance"),
+        )
+        .arg(
+            Arg::with_name("enable_cpi_and_log_storage")
+                .long("enable-cpi-and-log-storage")
+                .requires("enable_rpc_transaction_history")
+                .takes_value(false)
+                .help("Include CPI inner instructions and logs in the \
+                        historical transaction info stored"),
+        )
+        .arg(
+            Arg::with_name("rpc_max_multiple_accounts")
+                .long("rpc-max-multiple-accounts")
+                .value_name("MAX ACCOUNTS")
+                .takes_value(true)
+                .default_value(default_rpc_max_multiple_accounts)
+                .help("Override the default maximum accounts accepted by \
+                       the getMultipleAccounts JSON RPC method")
+        )
+        .arg(
             Arg::with_name("health_check_slot_distance")
                 .long("health-check-slot-distance")
                 .value_name("SLOT_DISTANCE")
@@ -658,37 +999,48 @@ pub fn main() {
                 .help("Enable the JSON RPC 'requestAirdrop' API with this faucet address."),
         )
         .arg(
-            Arg::with_name("signer_addr")
-                .long("vote-signer-address")
-                .value_name("HOST:PORT")
-                .takes_value(true)
-                .hidden(true) // Don't document this argument to discourage its use
-                .validator(solana_net_utils::is_host_port)
-                .help("Rendezvous with the vote signer at this RPC end point"),
-        )
-        .arg(
             Arg::with_name("account_paths")
                 .long("accounts")
                 .value_name("PATHS")
                 .takes_value(true)
+                .multiple(true)
                 .help("Comma separated persistent accounts location"),
+        )
+        .arg(
+            Arg::with_name("account_shrink_path")
+                .long("account-shrink-path")
+                .value_name("PATH")
+                .takes_value(true)
+                .multiple(true)
+                .help("Path to accounts shrink path which can hold a compacted account set."),
         )
         .arg(
             Arg::with_name("gossip_port")
                 .long("gossip-port")
                 .value_name("PORT")
                 .takes_value(true)
-                .help("Gossip port number for the node"),
+                .help("Gossip port number for the validator"),
         )
         .arg(
             Arg::with_name("gossip_host")
                 .long("gossip-host")
                 .value_name("HOST")
                 .takes_value(true)
-                .conflicts_with("entrypoint")
                 .validator(solana_net_utils::is_host)
-                .help("IP address for the node to advertise in gossip when \
-                      --entrypoint is not provided [default: 127.0.0.1]"),
+                .help("Gossip DNS name or IP address for the validator to advertise in gossip \
+                       [default: ask --entrypoint, or 127.0.0.1 when --entrypoint is not provided]"),
+
+        )
+        .arg(
+            Arg::with_name("public_rpc_addr")
+                .long("public-rpc-address")
+                .value_name("HOST:PORT")
+                .takes_value(true)
+                .conflicts_with("private_rpc")
+                .validator(solana_net_utils::is_host_port)
+                .help("RPC address for the validator to advertise publicly in gossip. \
+                      Useful for validators running behind a load balancer or proxy \
+                      [default: use --rpc-bind-address / --rpc-port]"),
         )
         .arg(
             Arg::with_name("dynamic_port_range")
@@ -700,6 +1052,16 @@ pub fn main() {
                 .help("Range to use for dynamically assigned ports"),
         )
         .arg(
+            Arg::with_name("maximum_local_snapshot_age")
+                .long("maximum-local-snapshot-age")
+                .value_name("NUMBER_OF_SLOTS")
+                .takes_value(true)
+                .default_value("500")
+                .help("Reuse a local snapshot if it's less than this many \
+                       slots behind the highest snapshot available for \
+                       download from other validators"),
+        )
+        .arg(
             Arg::with_name("snapshot_interval_slots")
                 .long("snapshot-interval-slots")
                 .value_name("SNAPSHOT_INTERVAL_SLOTS")
@@ -707,6 +1069,19 @@ pub fn main() {
                 .default_value("100")
                 .help("Number of slots between generating snapshots, \
                       0 to disable snapshots"),
+        )
+        .arg(
+            Arg::with_name("contact_debug_interval")
+                .long("contact-debug-interval")
+                .value_name("CONTACT_DEBUG_INTERVAL")
+                .takes_value(true)
+                .default_value("10000")
+                .help("Milliseconds between printing contact debug from gossip."),
+        )
+        .arg(
+            Arg::with_name("no_poh_speed_test")
+                .long("no-poh-speed-test")
+                .help("Skip the check for PoH speed."),
         )
         .arg(
             Arg::with_name("accounts_hash_interval_slots")
@@ -732,20 +1107,26 @@ pub fn main() {
                 .takes_value(true)
                 .min_values(0)
                 .max_values(1)
-                .default_value(default_limit_ledger_size)
+                /* .default_value() intentionally not used here! */
                 .help("Keep this amount of shreds in root slots."),
         )
         .arg(
             Arg::with_name("skip_poh_verify")
                 .long("skip-poh-verify")
                 .takes_value(false)
-                .help("Skip ledger verification at node bootup"),
+                .help("Skip ledger verification at validator bootup"),
         )
         .arg(
             Arg::with_name("cuda")
                 .long("cuda")
                 .takes_value(false)
                 .help("Use CUDA"),
+        )
+        .arg(
+            clap::Arg::with_name("require_tower")
+                .long("require-tower")
+                .takes_value(false)
+                .help("Refuse to start if saved tower state is not found"),
         )
         .arg(
             Arg::with_name("expected_genesis_hash")
@@ -768,6 +1149,7 @@ pub fn main() {
                 .long("expected-shred-version")
                 .value_name("VERSION")
                 .takes_value(true)
+                .validator(is_parsable::<u16>)
                 .help("Require the shred version be this value"),
         )
         .arg(
@@ -786,7 +1168,8 @@ pub fn main() {
                 .requires("expected_bank_hash")
                 .value_name("SLOT")
                 .validator(is_slot)
-                .help("After processing the ledger and the next slot is SLOT, wait until a supermajority of stake is visible on gossip before starting PoH"),
+                .help("After processing the ledger and the next slot is SLOT, wait until a \
+                       supermajority of stake is visible on gossip before starting PoH"),
         )
         .arg(
             Arg::with_name("hard_forks")
@@ -808,10 +1191,40 @@ pub fn main() {
                        May be specified multiple times. If unspecified any snapshot hash will be accepted"),
         )
         .arg(
+            Arg::with_name("debug_key")
+                .long("debug-key")
+                .validator(is_pubkey)
+                .value_name("PUBKEY")
+                .multiple(true)
+                .takes_value(true)
+                .help("Log when transactions are processed which reference a given key."),
+        )
+        .arg(
             Arg::with_name("no_untrusted_rpc")
                 .long("no-untrusted-rpc")
                 .takes_value(false)
                 .help("Use the RPC service of trusted validators only")
+        )
+        .arg(
+            Arg::with_name("repair_validators")
+                .long("repair-validator")
+                .validator(is_pubkey)
+                .value_name("PUBKEY")
+                .multiple(true)
+                .takes_value(true)
+                .help("A list of validators to request repairs from. If specified, repair will not \
+                       request from validators outside this set [default: all validators]")
+        )
+        .arg(
+            Arg::with_name("gossip_validators")
+                .long("gossip-validator")
+                .validator(is_pubkey)
+                .value_name("PUBKEY")
+                .multiple(true)
+                .takes_value(true)
+                .help("A list of validators to gossip with.  If specified, gossip \
+                      will not pull/pull from from validators outside this set. \
+                      [default: all validators]")
         )
         .arg(
             Arg::with_name("no_rocksdb_compaction")
@@ -837,6 +1250,87 @@ pub fn main() {
                 .help("IP address to bind the RPC port [default: use --bind-address]"),
         )
         .arg(
+            Arg::with_name("rpc_threads")
+                .long("rpc-threads")
+                .value_name("NUMBER")
+                .validator(is_parsable::<usize>)
+                .takes_value(true)
+                .default_value(&default_rpc_threads)
+                .help("Number of threads to use for servicing RPC requests"),
+        )
+        .arg(
+            Arg::with_name("rpc_bigtable_timeout")
+                .long("rpc-bigtable-timeout")
+                .value_name("SECONDS")
+                .validator(is_parsable::<u64>)
+                .takes_value(true)
+                .default_value("30")
+                .help("Number of seconds before timing out RPC requests backed by BigTable"),
+        )
+        .arg(
+            Arg::with_name("rpc_pubsub_enable_vote_subscription")
+                .long("rpc-pubsub-enable-vote-subscription")
+                .takes_value(false)
+                .help("Enable the unstable RPC PubSub `voteSubscribe` subscription"),
+        )
+        .arg(
+            Arg::with_name("rpc_pubsub_max_connections")
+                .long("rpc-pubsub-max-connections")
+                .value_name("NUMBER")
+                .takes_value(true)
+                .validator(is_parsable::<usize>)
+                .default_value(&default_rpc_pubsub_max_connections)
+                .help("The maximum number of connections that RPC PubSub will support. \
+                       This is a hard limit and no new connections beyond this limit can \
+                       be made until an old connection is dropped."),
+        )
+        .arg(
+            Arg::with_name("rpc_pubsub_max_fragment_size")
+                .long("rpc-pubsub-max-fragment-size")
+                .value_name("BYTES")
+                .takes_value(true)
+                .validator(is_parsable::<usize>)
+                .default_value(&default_rpc_pubsub_max_fragment_size)
+                .help("The maximum length in bytes of acceptable incoming frames. Messages longer \
+                       than this will be rejected."),
+        )
+        .arg(
+            Arg::with_name("rpc_pubsub_max_in_buffer_capacity")
+                .long("rpc-pubsub-max-in-buffer-capacity")
+                .value_name("BYTES")
+                .takes_value(true)
+                .validator(is_parsable::<usize>)
+                .default_value(&default_rpc_pubsub_max_in_buffer_capacity)
+                .help("The maximum size in bytes to which the incoming websocket buffer can grow."),
+        )
+        .arg(
+            Arg::with_name("rpc_pubsub_max_out_buffer_capacity")
+                .long("rpc-pubsub-max-out-buffer-capacity")
+                .value_name("BYTES")
+                .takes_value(true)
+                .validator(is_parsable::<usize>)
+                .default_value(&default_rpc_pubsub_max_out_buffer_capacity)
+                .help("The maximum size in bytes to which the outgoing websocket buffer can grow."),
+        )
+        .arg(
+            Arg::with_name("rpc_send_transaction_retry_ms")
+                .long("rpc-send-retry-ms")
+                .value_name("MILLISECS")
+                .takes_value(true)
+                .validator(is_parsable::<u64>)
+                .default_value(&default_rpc_send_transaction_retry_ms)
+                .help("The rate at which transactions sent via rpc service are retried."),
+        )
+        .arg(
+            Arg::with_name("rpc_send_transaction_leader_forward_count")
+                .long("rpc-send-leader-count")
+                .value_name("NUMBER")
+                .takes_value(true)
+                .validator(is_parsable::<u64>)
+                .default_value(&default_rpc_send_transaction_leader_forward_count)
+                .help("The number of upcoming leaders to which to forward transactions sent via rpc service."),
+        )
+        .arg(
             Arg::with_name("halt_on_trusted_validators_accounts_hash_mismatch")
                 .long("halt-on-trusted-validators-accounts-hash-mismatch")
                 .requires("trusted_validators")
@@ -855,12 +1349,14 @@ pub fn main() {
                        other than increasing the account balance"),
         )
         .arg(
-            Arg::with_name("snapshot_compression")
-                .long("snapshot-compression")
-                .possible_values(&["bz2", "gzip", "zstd", "none"])
-                .value_name("COMPRESSION_TYPE")
+            Arg::with_name("snapshot_archive_format")
+                .long("snapshot-archive-format")
+                .alias("snapshot-compression") // Legacy name used by Solana v1.5.x and older
+                .possible_values(&["bz2", "gzip", "zstd", "tar", "none"])
+                .default_value("zstd")
+                .value_name("ARCHIVE_TYPE")
                 .takes_value(true)
-                .help("Type of snapshot compression to use."),
+                .help("Snapshot archive format to use."),
         )
         .arg(
             Arg::with_name("max_genesis_archive_unpacked_size")
@@ -886,7 +1382,77 @@ pub fn main() {
                     "Mode to recovery the ledger db write ahead log."
                 ),
         )
+        .arg(
+            Arg::with_name("bpf_jit")
+                .long("bpf-jit")
+                .takes_value(false)
+                .help("Use the just-in-time compiler instead of the interpreter for BPF."),
+        )
+        .arg(
+            Arg::with_name("poh_pinned_cpu_core")
+                .hidden(true)
+                .long("experimental-poh-pinned-cpu-core")
+                .takes_value(true)
+                .value_name("CPU_CORE_INDEX")
+                .validator(|s| {
+                    let core_index = usize::from_str(&s).map_err(|e| e.to_string())?;
+                    let max_index = core_affinity::get_core_ids().map(|cids| cids.len() - 1).unwrap_or(0);
+                    if core_index > max_index {
+                        return Err(format!("core index must be in the range [0, {}]", max_index));
+                    }
+                    Ok(())
+                })
+                .help("EXPERIMENTAL: Specify which CPU core PoH is pinned to"),
+        )
+        .arg(
+            Arg::with_name("account_indexes")
+                .long("account-index")
+                .takes_value(true)
+                .multiple(true)
+                .possible_values(&["program-id", "spl-token-owner", "spl-token-mint"])
+                .value_name("INDEX")
+                .help("Enable an accounts index, indexed by the selected account field"),
+        )
+        .arg(
+            Arg::with_name("no_accounts_db_caching")
+                .long("no-accounts-db-caching")
+                .help("Disables accounts caching"),
+        )
+        .arg(
+            Arg::with_name("accounts_db_test_hash_calculation")
+                .long("accounts-db-test-hash-calculation")
+                .help("Enables testing of hash calculation using stores in AccountsHashVerifier. This has a computational cost."),
+        )
+        .arg(
+            // legacy nop argument
+            Arg::with_name("accounts_db_caching_enabled")
+                .long("accounts-db-caching-enabled")
+                .conflicts_with("no_accounts_db_caching")
+                .hidden(true)
+        )
+        .arg(
+            Arg::with_name("no_duplicate_instance_check")
+                .long("no-duplicate-instance-check")
+                .takes_value(false)
+                .help("Disables duplicate instance check")
+                .hidden(true),
+        )
+        .after_help("The default subcommand is run")
+        .subcommand(
+             SubCommand::with_name("init")
+             .about("Initialize the ledger directory then exit")
+         )
+        .subcommand(
+             SubCommand::with_name("run")
+             .about("Run the validator")
+         )
         .get_matches();
+
+    let operation = match matches.subcommand().0 {
+        "" | "run" => Operation::Run,
+        "init" => Operation::Initialize,
+        _ => unreachable!(),
+    };
 
     let identity_keypair = Arc::new(keypair_of(&matches, "identity").unwrap_or_else(Keypair::new));
 
@@ -896,12 +1462,21 @@ pub fn main() {
 
     let ledger_path = PathBuf::from(matches.value_of("ledger_path").unwrap());
     let init_complete_file = matches.value_of("init_complete_file");
-    let skip_poh_verify = matches.is_present("skip_poh_verify");
-    let cuda = matches.is_present("cuda");
-    let no_genesis_fetch = matches.is_present("no_genesis_fetch");
-    let no_snapshot_fetch = matches.is_present("no_snapshot_fetch");
-    let no_check_vote_account = matches.is_present("no_check_vote_account");
+
+    let rpc_bootstrap_config = RpcBootstrapConfig {
+        no_genesis_fetch: matches.is_present("no_genesis_fetch"),
+        no_snapshot_fetch: matches.is_present("no_snapshot_fetch"),
+        no_check_vote_account: matches.is_present("no_check_vote_account"),
+        no_untrusted_rpc: matches.is_present("no_untrusted_rpc"),
+        max_genesis_archive_unpacked_size: value_t_or_exit!(
+            matches,
+            "max_genesis_archive_unpacked_size",
+            u64
+        ),
+    };
+
     let private_rpc = matches.is_present("private_rpc");
+    let no_port_check = matches.is_present("no_port_check");
     let no_rocksdb_compaction = matches.is_present("no_rocksdb_compaction");
     let wal_recovery_mode = matches
         .value_of("wal_recovery_mode")
@@ -914,26 +1489,62 @@ pub fn main() {
         exit(1);
     });
 
-    let no_untrusted_rpc = matches.is_present("no_untrusted_rpc");
-    let trusted_validators = if matches.is_present("trusted_validators") {
-        let trusted_validators: HashSet<_> =
-            values_t_or_exit!(matches, "trusted_validators", Pubkey)
+    let debug_keys: Option<Arc<HashSet<_>>> = if matches.is_present("debug_key") {
+        Some(Arc::new(
+            values_t_or_exit!(matches, "debug_key", Pubkey)
                 .into_iter()
-                .collect();
-        if trusted_validators.contains(&identity_keypair.pubkey()) {
-            eprintln!(
-                "The validator's identity pubkey cannot be a --trusted-validator: {}",
-                identity_keypair.pubkey()
-            );
-            exit(1);
-        }
-        Some(trusted_validators)
+                .collect(),
+        ))
     } else {
         None
     };
 
+    let trusted_validators = validators_set(
+        &identity_keypair.pubkey(),
+        &matches,
+        "trusted_validators",
+        "--trusted-validator",
+    );
+    let repair_validators = validators_set(
+        &identity_keypair.pubkey(),
+        &matches,
+        "repair_validators",
+        "--repair-validator",
+    );
+    let gossip_validators = validators_set(
+        &identity_keypair.pubkey(),
+        &matches,
+        "gossip_validators",
+        "--gossip-validator",
+    );
+
+    let bind_address = solana_net_utils::parse_host(matches.value_of("bind_address").unwrap())
+        .expect("invalid bind_address");
+    let rpc_bind_address = if matches.is_present("rpc_bind_address") {
+        solana_net_utils::parse_host(matches.value_of("rpc_bind_address").unwrap())
+            .expect("invalid rpc_bind_address")
+    } else {
+        bind_address
+    };
+
+    let contact_debug_interval = value_t_or_exit!(matches, "contact_debug_interval", u64);
+
+    let account_indexes: HashSet<AccountIndex> = matches
+        .values_of("account_indexes")
+        .unwrap_or_default()
+        .map(|value| match value {
+            "program-id" => AccountIndex::ProgramId,
+            "spl-token-mint" => AccountIndex::SplTokenMint,
+            "spl-token-owner" => AccountIndex::SplTokenOwner,
+            _ => unreachable!(),
+        })
+        .collect();
+
+    let restricted_repair_only_mode = matches.is_present("restricted_repair_only_mode");
     let mut validator_config = ValidatorConfig {
+        require_tower: matches.is_present("require_tower"),
         dev_halt_at_slot: value_t!(matches, "dev_halt_at_slot", Slot).ok(),
+        cuda: matches.is_present("cuda"),
         expected_genesis_hash: matches
             .value_of("expected_genesis_hash")
             .map(|s| Hash::from_str(&s).unwrap()),
@@ -946,33 +1557,86 @@ pub fn main() {
             enable_validator_exit: matches.is_present("enable_rpc_exit"),
             enable_set_log_filter: matches.is_present("enable_rpc_set_log_filter"),
             enable_rpc_transaction_history: matches.is_present("enable_rpc_transaction_history"),
+            enable_cpi_and_log_storage: matches.is_present("enable_cpi_and_log_storage"),
             enable_bigtable_ledger_storage: matches
                 .is_present("enable_rpc_bigtable_ledger_storage"),
+            enable_bigtable_ledger_upload: matches.is_present("enable_bigtable_ledger_upload"),
             identity_pubkey: identity_keypair.pubkey(),
             faucet_addr: matches.value_of("rpc_faucet_addr").map(|address| {
                 solana_net_utils::parse_host_port(address).expect("failed to parse faucet address")
             }),
+            max_multiple_accounts: Some(value_t_or_exit!(
+                matches,
+                "rpc_max_multiple_accounts",
+                usize
+            )),
             health_check_slot_distance: value_t_or_exit!(
                 matches,
                 "health_check_slot_distance",
                 u64
             ),
+            rpc_threads: value_t_or_exit!(matches, "rpc_threads", usize),
+            rpc_bigtable_timeout: value_t!(matches, "rpc_bigtable_timeout", u64)
+                .ok()
+                .map(Duration::from_secs),
+            account_indexes: account_indexes.clone(),
         },
-        rpc_ports: value_t!(matches, "rpc_port", u16)
-            .ok()
-            .map(|rpc_port| (rpc_port, rpc_port + 1, rpc_port + 2)),
-        voting_disabled: matches.is_present("no_voting"),
+        rpc_addrs: value_t!(matches, "rpc_port", u16).ok().map(|rpc_port| {
+            (
+                SocketAddr::new(rpc_bind_address, rpc_port),
+                SocketAddr::new(rpc_bind_address, rpc_port + 1),
+                // If additional ports are added, +2 needs to be skipped to avoid a conflict with
+                // the websocket port (which is +2) in web3.js This odd port shifting is tracked at
+                // https://github.com/solana-labs/solana/issues/12250
+            )
+        }),
+        pubsub_config: PubSubConfig {
+            enable_vote_subscription: matches.is_present("rpc_pubsub_enable_vote_subscription"),
+            max_connections: value_t_or_exit!(matches, "rpc_pubsub_max_connections", usize),
+            max_fragment_size: value_t_or_exit!(matches, "rpc_pubsub_max_fragment_size", usize),
+            max_in_buffer_capacity: value_t_or_exit!(
+                matches,
+                "rpc_pubsub_max_in_buffer_capacity",
+                usize
+            ),
+            max_out_buffer_capacity: value_t_or_exit!(
+                matches,
+                "rpc_pubsub_max_out_buffer_capacity",
+                usize
+            ),
+        },
+        voting_disabled: matches.is_present("no_voting") || restricted_repair_only_mode,
         wait_for_supermajority: value_t!(matches, "wait_for_supermajority", Slot).ok(),
         trusted_validators,
+        repair_validators,
+        gossip_validators,
         frozen_accounts: values_t!(matches, "frozen_accounts", Pubkey).unwrap_or_default(),
         no_rocksdb_compaction,
         wal_recovery_mode,
+        poh_verify: !matches.is_present("skip_poh_verify"),
+        debug_keys,
+        contact_debug_interval,
+        bpf_jit: matches.is_present("bpf_jit"),
+        send_transaction_retry_ms: value_t_or_exit!(matches, "rpc_send_transaction_retry_ms", u64),
+        send_transaction_leader_forward_count: value_t_or_exit!(
+            matches,
+            "rpc_send_transaction_leader_forward_count",
+            u64
+        ),
+        no_poh_speed_test: matches.is_present("no_poh_speed_test"),
+        poh_pinned_cpu_core: value_of(&matches, "poh_pinned_cpu_core")
+            .unwrap_or(poh_service::DEFAULT_PINNED_CPU_CORE),
+        account_indexes,
+        accounts_db_caching_enabled: !matches.is_present("no_accounts_db_caching"),
+        accounts_db_test_hash_calculation: matches.is_present("accounts_db_test_hash_calculation"),
         ..ValidatorConfig::default()
     };
 
     let vote_account = pubkey_of(&matches, "vote_account").unwrap_or_else(|| {
-        warn!("--vote-account not specified, validator will not vote");
-        validator_config.voting_disabled = true;
+        if !validator_config.voting_disabled {
+            warn!("--vote-account not specified, validator will not vote");
+            validator_config.voting_disabled = true;
+        }
         Keypair::new().pubkey()
     });
 
@@ -980,20 +1644,20 @@ pub fn main() {
         solana_net_utils::parse_port_range(matches.value_of("dynamic_port_range").unwrap())
             .expect("invalid dynamic_port_range");
 
-    let bind_address = solana_net_utils::parse_host(matches.value_of("bind_address").unwrap())
-        .expect("invalid bind_address");
-    let rpc_bind_address = if matches.is_present("rpc_bind_address") {
-        solana_net_utils::parse_host(matches.value_of("rpc_bind_address").unwrap())
-            .expect("invalid rpc_bind_address")
-    } else {
-        bind_address
-    };
-
-    let account_paths = if let Some(account_paths) = matches.value_of("account_paths") {
-        account_paths.split(',').map(PathBuf::from).collect()
-    } else {
-        vec![ledger_path.join("accounts")]
-    };
+    let account_paths: Vec<PathBuf> =
+        if let Ok(account_paths) = values_t!(matches, "account_paths", String) {
+            account_paths
+                .join(",")
+                .split(',')
+                .map(PathBuf::from)
+                .collect()
+        } else {
+            vec![ledger_path.join("accounts")]
+        };
+    let account_shrink_paths: Option<Vec<PathBuf>> =
+        values_t!(matches, "account_shrink_path", String)
+            .map(|shrink_paths| shrink_paths.into_iter().map(PathBuf::from).collect())
+            .ok();
 
     // Create and canonicalize account paths to avoid issues with symlink creation
     validator_config.account_paths = account_paths
@@ -1012,7 +1676,28 @@ pub fn main() {
         })
         .collect();
 
+    validator_config.account_shrink_paths = account_shrink_paths.map(|paths| {
+        paths
+            .into_iter()
+            .map(|account_path| {
+                match fs::create_dir_all(&account_path)
+                    .and_then(|_| fs::canonicalize(&account_path))
+                {
+                    Ok(account_path) => account_path,
+                    Err(err) => {
+                        eprintln!(
+                            "Unable to access account path: {:?}, err: {:?}",
+                            account_path, err
+                        );
+                        exit(1);
+                    }
+                }
+            })
+            .collect()
+    });
+
     let snapshot_interval_slots = value_t_or_exit!(matches, "snapshot_interval_slots", u64);
+    let maximum_local_snapshot_age = value_t_or_exit!(matches, "maximum_local_snapshot_age", u64);
     let snapshot_path = ledger_path.join("snapshot");
     fs::create_dir_all(&snapshot_path).unwrap_or_else(|err| {
         eprintln!(
@@ -1022,16 +1707,17 @@ pub fn main() {
         exit(1);
     });
 
-    let mut snapshot_compression = CompressionType::Bzip2;
-    if let Ok(compression_str) = value_t!(matches, "snapshot_compression", String) {
-        match compression_str.as_str() {
-            "bz2" => snapshot_compression = CompressionType::Bzip2,
-            "gzip" => snapshot_compression = CompressionType::Gzip,
-            "zstd" => snapshot_compression = CompressionType::Zstd,
-            "none" => snapshot_compression = CompressionType::NoCompression,
-            _ => panic!("Compression type not recognized: {}", compression_str),
+    let archive_format = {
+        let archive_format_str = value_t_or_exit!(matches, "snapshot_archive_format", String);
+        match archive_format_str.as_str() {
+            "bz2" => ArchiveFormat::TarBzip2,
+            "gzip" => ArchiveFormat::TarGzip,
+            "zstd" => ArchiveFormat::TarZstd,
+            "tar" | "none" => ArchiveFormat::Tar,
+            _ => panic!("Archive format not recognized: {}", archive_format_str),
         }
-    }
+    };
+
     let snapshot_version =
         matches
             .value_of("snapshot_version")
@@ -1049,7 +1735,7 @@ pub fn main() {
         },
         snapshot_path,
         snapshot_package_output_path: ledger_path.clone(),
-        compression: snapshot_compression,
+        archive_format,
         snapshot_version,
     });
 
@@ -1071,7 +1757,10 @@ pub fn main() {
     }
 
     if matches.is_present("limit_ledger_size") {
-        let limit_ledger_size = value_t_or_exit!(matches, "limit_ledger_size", u64);
+        let limit_ledger_size = match matches.value_of("limit_ledger_size") {
+            Some(_) => value_t_or_exit!(matches, "limit_ledger_size", u64),
+            None => DEFAULT_MAX_LEDGER_SHREDS,
+        };
         if limit_ledger_size < DEFAULT_MIN_MAX_LEDGER_SHREDS {
             eprintln!(
                 "The provided --limit-ledger-size value was too small, the minimum value is {}",
@@ -1086,9 +1775,25 @@ pub fn main() {
         validator_config.halt_on_trusted_validators_accounts_hash_mismatch = true;
     }
 
-    if matches.value_of("signer_addr").is_some() {
-        warn!("--vote-signer-address ignored");
-    }
+    let entrypoint_addrs = values_t!(matches, "entrypoint", String)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entrypoint| {
+            solana_net_utils::parse_host_port(&entrypoint).unwrap_or_else(|e| {
+                eprintln!("failed to parse entrypoint address: {}", e);
+                exit(1);
+            })
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let public_rpc_addr = matches.value_of("public_rpc_addr").map(|addr| {
+        solana_net_utils::parse_host_port(addr).unwrap_or_else(|e| {
+            eprintln!("failed to parse public rpc address: {}", e);
+            exit(1);
+        })
+    });
 
     let logfile = {
         let logfile = matches
@@ -1103,54 +1808,51 @@ pub fn main() {
             Some(logfile)
         }
     };
-    let _logger_thread = start_logger(logfile);
-
-    // Default to RUST_BACKTRACE=1 for more informative validator logs
-    if env::var_os("RUST_BACKTRACE").is_none() {
-        env::set_var("RUST_BACKTRACE", "1")
-    }
+    let use_progress_bar = logfile.is_none();
+    let _logger_thread = redirect_stderr_to_file(logfile);
 
     info!("{} {}", crate_name!(), solana_version::version!());
     info!("Starting validator with: {:#?}", std::env::args_os());
 
-    solana_metrics::set_host_id(identity_keypair.pubkey().to_string());
-    solana_metrics::set_panic_hook("validator");
-
-    if cuda {
-        solana_perf::perf_libs::init_cuda();
-        enable_recycler_warming();
-    }
-
-    solana_ledger::entry::init_poh();
-
-    let entrypoint_addr = matches.value_of("entrypoint").map(|entrypoint| {
-        solana_net_utils::parse_host_port(entrypoint).unwrap_or_else(|e| {
-            eprintln!("failed to parse entrypoint address: {}", e);
-            exit(1);
-        })
-    });
-
-    let gossip_host = if let Some(entrypoint_addr) = entrypoint_addr {
-        let ip_addr =
-            solana_net_utils::get_public_ip_addr(&entrypoint_addr).unwrap_or_else(|err| {
-                eprintln!(
-                    "Failed to contact cluster entrypoint {}: {}",
-                    entrypoint_addr, err
-                );
-                exit(1);
-            });
-        info!(
-            "{} reports the IP address for this machine as {}",
-            entrypoint_addr, ip_addr
-        );
-        ip_addr
-    } else {
-        solana_net_utils::parse_host(matches.value_of("gossip_host").unwrap_or("127.0.0.1"))
-            .unwrap_or_else(|err| {
-                eprintln!("Error: {}", err);
+    let gossip_host: IpAddr = matches
+        .value_of("gossip_host")
+        .map(|gossip_host| {
+            solana_net_utils::parse_host(gossip_host).unwrap_or_else(|err| {
+                eprintln!("Failed to parse --gossip-host: {}", err);
                 exit(1);
             })
-    };
+        })
+        .unwrap_or_else(|| {
+            if !entrypoint_addrs.is_empty() {
+                let mut order: Vec<_> = (0..entrypoint_addrs.len()).collect();
+                order.shuffle(&mut thread_rng());
+
+                let gossip_host = order.into_iter().find_map(|i| {
+                    let entrypoint_addr = &entrypoint_addrs[i];
+                    info!(
+                        "Contacting {} to determine the validator's public IP address",
+                        entrypoint_addr
+                    );
+                    solana_net_utils::get_public_ip_addr(entrypoint_addr).map_or_else(
+                        |err| {
+                            eprintln!(
+                                "Failed to contact cluster entrypoint {}: {}",
+                                entrypoint_addr, err
+                            );
+                            None
+                        },
+                        Some,
+                    )
+                });
+
+                gossip_host.unwrap_or_else(|| {
+                    eprintln!("Unable to determine the validator's public IP address");
+                    exit(1);
+                })
+            } else {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+            }
+        });
 
     let gossip_addr = SocketAddr::new(
         gossip_host,
@@ -1163,12 +1865,11 @@ pub fn main() {
             )
         }),
     );
-    let max_genesis_archive_unpacked_size =
-        value_t_or_exit!(matches, "max_genesis_archive_unpacked_size", u64);
 
-    let cluster_entrypoint = entrypoint_addr
-        .as_ref()
-        .map(ContactInfo::new_gossip_entry_point);
+    let cluster_entrypoints = entrypoint_addrs
+        .iter()
+        .map(ContactInfo::new_gossip_entry_point)
+        .collect::<Vec<_>>();
 
     let mut node = Node::new_with_external_ip(
         &identity_keypair.pubkey(),
@@ -1177,203 +1878,72 @@ pub fn main() {
         bind_address,
     );
 
+    if restricted_repair_only_mode {
+        let any = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0);
+        // When in --restricted_repair_only_mode is enabled only the gossip and repair ports
+        // need to be reachable by the entrypoint to respond to gossip pull requests and repair
+        // requests initiated by the node.  All other ports are unused.
+        node.info.tpu = any;
+        node.info.tpu_forwards = any;
+        node.info.tvu = any;
+        node.info.tvu_forwards = any;
+        node.info.serve_repair = any;
+
+        // A node in this configuration shouldn't be an entrypoint to other nodes
+        node.sockets.ip_echo = None;
+    }
+
     if !private_rpc {
-        if let Some((rpc_port, rpc_pubsub_port, rpc_banks_port)) = validator_config.rpc_ports {
-            node.info.rpc = SocketAddr::new(node.info.gossip.ip(), rpc_port);
-            node.info.rpc_pubsub = SocketAddr::new(node.info.gossip.ip(), rpc_pubsub_port);
-            node.info.rpc_banks = SocketAddr::new(node.info.gossip.ip(), rpc_banks_port);
+        if let Some(public_rpc_addr) = public_rpc_addr {
+            node.info.rpc = public_rpc_addr;
+            node.info.rpc_pubsub = public_rpc_addr;
+        } else if let Some((rpc_addr, rpc_pubsub_addr)) = validator_config.rpc_addrs {
+            node.info.rpc = SocketAddr::new(node.info.gossip.ip(), rpc_addr.port());
+            node.info.rpc_pubsub = SocketAddr::new(node.info.gossip.ip(), rpc_pubsub_addr.port());
         }
     }
 
-    if let Some(ref cluster_entrypoint) = cluster_entrypoint {
-        let mut udp_sockets = vec![
-            &node.sockets.gossip,
-            &node.sockets.repair,
-            &node.sockets.serve_repair,
-        ];
-        udp_sockets.extend(node.sockets.tpu.iter());
-        udp_sockets.extend(node.sockets.tpu_forwards.iter());
-        udp_sockets.extend(node.sockets.tvu.iter());
-        udp_sockets.extend(node.sockets.tvu_forwards.iter());
-        udp_sockets.extend(node.sockets.broadcast.iter());
-        udp_sockets.extend(node.sockets.retransmit_sockets.iter());
+    solana_metrics::set_host_id(identity_keypair.pubkey().to_string());
+    solana_metrics::set_panic_hook("validator");
 
-        let mut tcp_listeners = vec![];
-        if !private_rpc {
-            if let Some((rpc_port, rpc_pubsub_port, rpc_banks_port)) = validator_config.rpc_ports {
-                for (purpose, port) in &[
-                    ("RPC", rpc_port),
-                    ("RPC pubsub", rpc_pubsub_port),
-                    ("RPC banks", rpc_banks_port),
-                ] {
-                    tcp_listeners.push((
-                        *port,
-                        TcpListener::bind(&SocketAddr::from((rpc_bind_address, *port)))
-                            .unwrap_or_else(|err| {
-                                error!("Unable to bind to tcp/{} for {}: {}", port, purpose, err);
-                                exit(1);
-                            }),
-                    ));
-                }
-            }
-        }
-
-        if let Some(ip_echo) = &node.sockets.ip_echo {
-            let ip_echo = ip_echo.try_clone().expect("unable to clone tcp_listener");
-            tcp_listeners.push((node.info.gossip.port(), ip_echo));
-        }
-
-        if !solana_net_utils::verify_reachable_ports(
-            &cluster_entrypoint.gossip,
-            tcp_listeners,
-            &udp_sockets,
-        ) {
-            exit(1);
-        }
-        if !no_genesis_fetch || !no_snapshot_fetch {
-            let mut blacklisted_rpc_nodes = HashSet::new();
-            let mut gossip = None;
-            loop {
-                if gossip.is_none() {
-                    gossip = Some(start_gossip_node(
-                        &identity_keypair,
-                        &cluster_entrypoint.gossip,
-                        &node.info.gossip,
-                        node.sockets.gossip.try_clone().unwrap(),
-                        validator_config.expected_shred_version,
-                    ));
-                }
-
-                let (rpc_contact_info, snapshot_hash) = get_rpc_node(
-                    &gossip.as_ref().unwrap().0,
-                    &validator_config,
-                    &mut blacklisted_rpc_nodes,
-                    no_snapshot_fetch,
-                    no_untrusted_rpc,
-                );
-                info!(
-                    "Using RPC service from node {}: {:?}",
-                    rpc_contact_info.id, rpc_contact_info.rpc
-                );
-                let rpc_client = RpcClient::new_socket(rpc_contact_info.rpc);
-
-                let result = match rpc_client.get_version() {
-                    Ok(rpc_version) => {
-                        info!("RPC node version: {}", rpc_version.solana_core);
-                        Ok(())
-                    }
-                    Err(err) => Err(format!("Failed to get RPC node version: {}", err)),
-                }
-                .and_then(|_| {
-                    let genesis_hash = download_then_check_genesis_hash(
-                        &rpc_contact_info.rpc,
-                        &ledger_path,
-                        validator_config.expected_genesis_hash,
-                        max_genesis_archive_unpacked_size,
-                        no_genesis_fetch,
-                    );
-
-                    if let Ok(genesis_hash) = genesis_hash {
-                        if validator_config.expected_genesis_hash.is_none() {
-                            info!("Expected genesis hash set to {}", genesis_hash);
-                            validator_config.expected_genesis_hash = Some(genesis_hash);
-                        }
-                    }
-                    genesis_hash
-                })
-                .and_then(|_| {
-                    if let Some(expected_genesis_hash) = validator_config.expected_genesis_hash {
-                        // Sanity check that the RPC node is using the expected genesis hash before
-                        // downloading a snapshot from it
-                        let rpc_genesis_hash = rpc_client
-                            .get_genesis_hash()
-                            .map_err(|err| format!("Failed to get genesis hash: {}", err))?;
-
-                        if expected_genesis_hash != rpc_genesis_hash {
-                            return Err(format!("Genesis hash mismatch: expected {} but RPC node genesis hash is {}",
-                                               expected_genesis_hash, rpc_genesis_hash));
-                        }
-                    }
-                    Ok(())
-                })
-                .and_then(|_| {
-                    if let Some(snapshot_hash) = snapshot_hash {
-                        rpc_client.get_slot_with_commitment(CommitmentConfig::root())
-                            .map_err(|err| format!("Failed to get RPC node slot: {}", err))
-                            .and_then(|slot| {
-                               info!("RPC node root slot: {}", slot);
-                               let (_cluster_info, gossip_exit_flag, gossip_service) = gossip.take().unwrap();
-                               gossip_exit_flag.store(true, Ordering::Relaxed);
-                               let ret = download_snapshot(&rpc_contact_info.rpc, &ledger_path, snapshot_hash);
-                               gossip_service.join().unwrap();
-                               ret
-                            })
-                    } else {
-                        Ok(())
-                    }
-                })
-                .map(|_| {
-                    if !validator_config.voting_disabled && !no_check_vote_account {
-                        check_vote_account(
-                            &rpc_client,
-                            &identity_keypair.pubkey(),
-                            &vote_account,
-                            &authorized_voter_keypairs.iter().map(|k| k.pubkey()).collect::<Vec<_>>(),
-
-                        ).unwrap_or_else(|err| {
-                            // Consider failures here to be more likely due to user error (eg,
-                            // incorrect `solana-validator` command-line arguments) rather than the
-                            // RPC node failing.
-                            //
-                            // Power users can always use the `--no-check-vote-account` option to
-                            // bypass this check entirely
-                            error!("{}", err);
-                            exit(1);
-                        });
-                    }
-                });
-
-                if result.is_ok() {
-                    break;
-                }
-                warn!("{}", result.unwrap_err());
-
-                if let Some(ref trusted_validators) = validator_config.trusted_validators {
-                    if trusted_validators.contains(&rpc_contact_info.id) {
-                        continue; // Never blacklist a trusted node
-                    }
-                }
-
-                info!(
-                    "Excluding {} as a future RPC candidate",
-                    rpc_contact_info.id
-                );
-                blacklisted_rpc_nodes.insert(rpc_contact_info.id);
-            }
-            if let Some((_cluster_info, gossip_exit_flag, gossip_service)) = gossip.take() {
-                gossip_exit_flag.store(true, Ordering::Relaxed);
-                gossip_service.join().unwrap();
-            }
-        }
+    if validator_config.cuda {
+        solana_perf::perf_libs::init_cuda();
+        enable_recycler_warming();
     }
+    solana_ledger::entry::init_poh();
+    solana_runtime::snapshot_utils::remove_tmp_snapshot_archives(&ledger_path);
 
-    if !ledger_path.is_dir() {
-        error!(
-            "ledger directory does not exist or is not accessible: {:?}",
-            ledger_path
+    let should_check_duplicate_instance = !matches.is_present("no_duplicate_instance_check");
+    if !cluster_entrypoints.is_empty() {
+        rpc_bootstrap(
+            &node,
+            &identity_keypair,
+            &ledger_path,
+            &vote_account,
+            &authorized_voter_keypairs,
+            &cluster_entrypoints,
+            &mut validator_config,
+            rpc_bootstrap_config,
+            no_port_check,
+            use_progress_bar,
+            maximum_local_snapshot_age,
+            should_check_duplicate_instance,
         );
-        exit(1);
     }
 
+    if operation == Operation::Initialize {
+        info!("Validator ledger initialization complete");
+        return;
+    }
     let validator = Validator::new(
         node,
         &identity_keypair,
         &ledger_path,
         &vote_account,
         authorized_voter_keypairs,
-        cluster_entrypoint.as_ref(),
-        !skip_poh_verify,
+        cluster_entrypoints,
         &validator_config,
+        should_check_duplicate_instance,
     );
 
     if let Some(filename) = init_complete_file {
@@ -1383,20 +1953,6 @@ pub fn main() {
         });
     }
     info!("Validator initialized");
-    validator.join().expect("validator exit");
+    validator.join();
     info!("Validator exiting..");
-}
-
-#[cfg(test)]
-pub mod tests {
-    use super::*;
-
-    #[test]
-    fn test_interval_check() {
-        assert!(!is_snapshot_config_invalid(0, 100));
-        assert!(is_snapshot_config_invalid(1, 100));
-        assert!(is_snapshot_config_invalid(230, 100));
-        assert!(!is_snapshot_config_invalid(500, 100));
-        assert!(!is_snapshot_config_invalid(5, 5));
-    }
 }

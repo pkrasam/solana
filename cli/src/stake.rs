@@ -1,29 +1,47 @@
 use crate::{
     checks::{check_account_for_fee_with_commitment, check_unique_pubkeys},
     cli::{
-        fee_payer_arg, generate_unique_signers, log_instruction_custom_error, nonce_authority_arg,
-        return_signers, CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult,
-        SignerIndex, FEE_PAYER_ARG,
+        log_instruction_custom_error, CliCommand, CliCommandInfo, CliConfig, CliError,
+        ProcessResult,
     },
-    cli_output::{CliStakeHistory, CliStakeHistoryEntry, CliStakeState, CliStakeType},
-    nonce::{self, check_nonce_account, nonce_arg, NONCE_ARG, NONCE_AUTHORITY_ARG},
-    offline::{blockhash_query::BlockhashQuery, *},
+    nonce::check_nonce_account,
     spend_utils::{resolve_spend_tx_and_check_account_balances, SpendAmount},
 };
+use chrono::{Local, TimeZone};
 use clap::{App, Arg, ArgGroup, ArgMatches, SubCommand};
-use solana_clap_utils::{input_parsers::*, input_validators::*, offline::*, ArgConstant};
-use solana_client::{rpc_client::RpcClient, rpc_request::DELINQUENT_VALIDATOR_SLOT_DISTANCE};
+use solana_clap_utils::{
+    fee_payer::{fee_payer_arg, FEE_PAYER_ARG},
+    input_parsers::*,
+    input_validators::*,
+    keypair::{DefaultSigner, SignerIndex},
+    nonce::*,
+    offline::*,
+    ArgConstant,
+};
+use solana_cli_output::{
+    return_signers, CliEpochReward, CliStakeHistory, CliStakeHistoryEntry, CliStakeState,
+    CliStakeType,
+};
+use solana_client::{
+    blockhash_query::BlockhashQuery,
+    client_error::{ClientError, ClientErrorKind},
+    nonce_utils,
+    rpc_client::RpcClient,
+    rpc_custom_error,
+    rpc_request::{self, DELINQUENT_VALIDATOR_SLOT_DISTANCE},
+};
 use solana_remote_wallet::remote_wallet::RemoteWalletManager;
 use solana_sdk::{
+    account::from_account,
     account_utils::StateMut,
-    clock::Clock,
+    clock::{Clock, Epoch, Slot, UnixTimestamp, SECONDS_PER_DAY},
+    feature, feature_set,
     message::Message,
     pubkey::Pubkey,
     system_instruction::SystemError,
     sysvar::{
         clock,
         stake_history::{self, StakeHistory},
-        Sysvar,
     },
     transaction::Transaction,
 };
@@ -32,7 +50,7 @@ use solana_stake_program::{
     stake_state::{Authorized, Lockup, Meta, StakeAuthorize, StakeState},
 };
 use solana_vote_program::vote_state::VoteState;
-use std::{ops::Deref, sync::Arc};
+use std::{convert::TryInto, ops::Deref, sync::Arc};
 
 pub const STAKE_AUTHORITY_ARG: ArgConstant<'static> = ArgConstant {
     name: "stake_authority",
@@ -44,6 +62,12 @@ pub const WITHDRAW_AUTHORITY_ARG: ArgConstant<'static> = ArgConstant {
     name: "withdraw_authority",
     long: "withdraw-authority",
     help: "Authorized withdrawer [default: cli config keypair]",
+};
+
+pub const CUSTODIAN_ARG: ArgConstant<'static> = ArgConstant {
+    name: "custodian",
+    long: "custodian",
+    help: "Authority to override account lockup",
 };
 
 fn stake_authority_arg<'a, 'b>() -> Arg<'a, 'b> {
@@ -62,6 +86,15 @@ fn withdraw_authority_arg<'a, 'b>() -> Arg<'a, 'b> {
         .value_name("KEYPAIR")
         .validator(is_valid_signer)
         .help(WITHDRAW_AUTHORITY_ARG.help)
+}
+
+fn custodian_arg<'a, 'b>() -> Arg<'a, 'b> {
+    Arg::with_name(CUSTODIAN_ARG.name)
+        .long(CUSTODIAN_ARG.long)
+        .takes_value(true)
+        .value_name("KEYPAIR")
+        .validator(is_valid_signer)
+        .help(CUSTODIAN_ARG.help)
 }
 
 pub trait StakeSubCommands {
@@ -144,8 +177,7 @@ impl StakeSubCommands for App<'_, '_> {
                         .help("Source account of funds [default: cli config keypair]"),
                 )
                 .offline_args()
-                .arg(nonce_arg())
-                .arg(nonce_authority_arg())
+                .nonce_args(false)
                 .arg(fee_payer_arg())
         )
         .subcommand(
@@ -174,8 +206,7 @@ impl StakeSubCommands for App<'_, '_> {
                 )
                 .arg(stake_authority_arg())
                 .offline_args()
-                .arg(nonce_arg())
-                .arg(nonce_authority_arg())
+                .nonce_args(false)
                 .arg(fee_payer_arg())
         )
         .subcommand(
@@ -205,9 +236,9 @@ impl StakeSubCommands for App<'_, '_> {
                 .arg(stake_authority_arg())
                 .arg(withdraw_authority_arg())
                 .offline_args()
-                .arg(nonce_arg())
-                .arg(nonce_authority_arg())
+                .nonce_args(false)
                 .arg(fee_payer_arg())
+                .arg(custodian_arg())
         )
         .subcommand(
             SubCommand::with_name("deactivate-stake")
@@ -221,8 +252,7 @@ impl StakeSubCommands for App<'_, '_> {
                 )
                 .arg(stake_authority_arg())
                 .offline_args()
-                .arg(nonce_arg())
-                .arg(nonce_authority_arg())
+                .nonce_args(false)
                 .arg(fee_payer_arg())
         )
         .subcommand(
@@ -262,8 +292,7 @@ impl StakeSubCommands for App<'_, '_> {
                 )
                 .arg(stake_authority_arg())
                 .offline_args()
-                .arg(nonce_arg())
-                .arg(nonce_authority_arg())
+                .nonce_args(false)
                 .arg(fee_payer_arg())
         )
         .subcommand(
@@ -285,8 +314,7 @@ impl StakeSubCommands for App<'_, '_> {
                 )
                 .arg(stake_authority_arg())
                 .offline_args()
-                .arg(nonce_arg())
-                .arg(nonce_authority_arg())
+                .nonce_args(false)
                 .arg(fee_payer_arg())
         )
         .subcommand(
@@ -317,17 +345,9 @@ impl StakeSubCommands for App<'_, '_> {
                 )
                 .arg(withdraw_authority_arg())
                 .offline_args()
-                .arg(nonce_arg())
-                .arg(nonce_authority_arg())
+                .nonce_args(false)
                 .arg(fee_payer_arg())
-                .arg(
-                    Arg::with_name("custodian")
-                        .long("custodian")
-                        .takes_value(true)
-                        .value_name("KEYPAIR")
-                        .validator(is_valid_signer)
-                        .help("Authority to override account lockup")
-                )
+                .arg(custodian_arg())
         )
         .subcommand(
             SubCommand::with_name("stake-set-lockup")
@@ -373,8 +393,7 @@ impl StakeSubCommands for App<'_, '_> {
                         .help("Keypair of the existing custodian [default: cli config pubkey]")
                 )
                 .offline_args()
-                .arg(nonce_arg())
-                .arg(nonce_authority_arg())
+                .nonce_args(false)
                 .arg(fee_payer_arg())
         )
         .subcommand(
@@ -393,7 +412,7 @@ impl StakeSubCommands for App<'_, '_> {
                         .long("lamports")
                         .takes_value(false)
                         .help("Display balance in lamports instead of SOL")
-                )
+                ),
         )
         .subcommand(
             SubCommand::with_name("stake-history")
@@ -411,7 +430,7 @@ impl StakeSubCommands for App<'_, '_> {
 
 pub fn parse_stake_create_account(
     matches: &ArgMatches<'_>,
-    default_signer_path: &str,
+    default_signer: &DefaultSigner,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let seed = matches.value_of("seed").map(|s| s.to_string());
@@ -436,7 +455,7 @@ pub fn parse_stake_create_account(
         bulk_signers.push(nonce_authority);
     }
     let signer_info =
-        generate_unique_signers(bulk_signers, matches, default_signer_path, wallet_manager)?;
+        default_signer.generate_unique_signers(bulk_signers, matches, wallet_manager)?;
 
     Ok(CliCommandInfo {
         command: CliCommand::CreateStakeAccount {
@@ -463,7 +482,7 @@ pub fn parse_stake_create_account(
 
 pub fn parse_stake_delegate_stake(
     matches: &ArgMatches<'_>,
-    default_signer_path: &str,
+    default_signer: &DefaultSigner,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let stake_account_pubkey =
@@ -485,7 +504,7 @@ pub fn parse_stake_delegate_stake(
         bulk_signers.push(nonce_authority);
     }
     let signer_info =
-        generate_unique_signers(bulk_signers, matches, default_signer_path, wallet_manager)?;
+        default_signer.generate_unique_signers(bulk_signers, matches, wallet_manager)?;
 
     Ok(CliCommandInfo {
         command: CliCommand::DelegateStake {
@@ -505,7 +524,7 @@ pub fn parse_stake_delegate_stake(
 
 pub fn parse_stake_authorize(
     matches: &ArgMatches<'_>,
-    default_signer_path: &str,
+    default_signer: &DefaultSigner,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let stake_account_pubkey =
@@ -551,13 +570,17 @@ pub fn parse_stake_authorize(
     let (nonce_authority, nonce_authority_pubkey) =
         signer_of(matches, NONCE_AUTHORITY_ARG.name, wallet_manager)?;
     let (fee_payer, fee_payer_pubkey) = signer_of(matches, FEE_PAYER_ARG.name, wallet_manager)?;
+    let (custodian, custodian_pubkey) = signer_of(matches, "custodian", wallet_manager)?;
 
     bulk_signers.push(fee_payer);
     if nonce_account.is_some() {
         bulk_signers.push(nonce_authority);
     }
+    if custodian.is_some() {
+        bulk_signers.push(custodian);
+    }
     let signer_info =
-        generate_unique_signers(bulk_signers, matches, default_signer_path, wallet_manager)?;
+        default_signer.generate_unique_signers(bulk_signers, matches, wallet_manager)?;
 
     let new_authorizations = new_authorizations
         .into_iter()
@@ -581,6 +604,7 @@ pub fn parse_stake_authorize(
             nonce_account,
             nonce_authority: signer_info.index_of(nonce_authority_pubkey).unwrap(),
             fee_payer: signer_info.index_of(fee_payer_pubkey).unwrap(),
+            custodian: custodian_pubkey.and_then(|_| signer_info.index_of(custodian_pubkey)),
         },
         signers: signer_info.signers,
     })
@@ -588,7 +612,7 @@ pub fn parse_stake_authorize(
 
 pub fn parse_split_stake(
     matches: &ArgMatches<'_>,
-    default_signer_path: &str,
+    default_signer: &DefaultSigner,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let stake_account_pubkey =
@@ -612,7 +636,7 @@ pub fn parse_split_stake(
         bulk_signers.push(nonce_authority);
     }
     let signer_info =
-        generate_unique_signers(bulk_signers, matches, default_signer_path, wallet_manager)?;
+        default_signer.generate_unique_signers(bulk_signers, matches, wallet_manager)?;
 
     Ok(CliCommandInfo {
         command: CliCommand::SplitStake {
@@ -633,7 +657,7 @@ pub fn parse_split_stake(
 
 pub fn parse_merge_stake(
     matches: &ArgMatches<'_>,
-    default_signer_path: &str,
+    default_signer: &DefaultSigner,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let stake_account_pubkey =
@@ -655,7 +679,7 @@ pub fn parse_merge_stake(
         bulk_signers.push(nonce_authority);
     }
     let signer_info =
-        generate_unique_signers(bulk_signers, matches, default_signer_path, wallet_manager)?;
+        default_signer.generate_unique_signers(bulk_signers, matches, wallet_manager)?;
 
     Ok(CliCommandInfo {
         command: CliCommand::MergeStake {
@@ -674,7 +698,7 @@ pub fn parse_merge_stake(
 
 pub fn parse_stake_deactivate_stake(
     matches: &ArgMatches<'_>,
-    default_signer_path: &str,
+    default_signer: &DefaultSigner,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let stake_account_pubkey =
@@ -693,7 +717,7 @@ pub fn parse_stake_deactivate_stake(
         bulk_signers.push(nonce_authority);
     }
     let signer_info =
-        generate_unique_signers(bulk_signers, matches, default_signer_path, wallet_manager)?;
+        default_signer.generate_unique_signers(bulk_signers, matches, wallet_manager)?;
 
     Ok(CliCommandInfo {
         command: CliCommand::DeactivateStake {
@@ -711,7 +735,7 @@ pub fn parse_stake_deactivate_stake(
 
 pub fn parse_stake_withdraw_stake(
     matches: &ArgMatches<'_>,
-    default_signer_path: &str,
+    default_signer: &DefaultSigner,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let stake_account_pubkey =
@@ -737,7 +761,7 @@ pub fn parse_stake_withdraw_stake(
         bulk_signers.push(custodian);
     }
     let signer_info =
-        generate_unique_signers(bulk_signers, matches, default_signer_path, wallet_manager)?;
+        default_signer.generate_unique_signers(bulk_signers, matches, wallet_manager)?;
 
     Ok(CliCommandInfo {
         command: CliCommand::WithdrawStake {
@@ -758,7 +782,7 @@ pub fn parse_stake_withdraw_stake(
 
 pub fn parse_stake_set_lockup(
     matches: &ArgMatches<'_>,
-    default_signer_path: &str,
+    default_signer: &DefaultSigner,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let stake_account_pubkey =
@@ -781,7 +805,7 @@ pub fn parse_stake_set_lockup(
         bulk_signers.push(nonce_authority);
     }
     let signer_info =
-        generate_unique_signers(bulk_signers, matches, default_signer_path, wallet_manager)?;
+        default_signer.generate_unique_signers(bulk_signers, matches, wallet_manager)?;
 
     Ok(CliCommandInfo {
         command: CliCommand::StakeSetLockup {
@@ -934,8 +958,11 @@ pub fn process_create_stake_account(
         }
 
         if let Some(nonce_account) = &nonce_account {
-            let nonce_account =
-                nonce::get_account_with_commitment(rpc_client, nonce_account, config.commitment)?;
+            let nonce_account = nonce_utils::get_account_with_commitment(
+                rpc_client,
+                nonce_account,
+                config.commitment,
+            )?;
             check_nonce_account(&nonce_account, &nonce_authority.pubkey(), &recent_blockhash)?;
         }
     }
@@ -943,14 +970,10 @@ pub fn process_create_stake_account(
     let mut tx = Transaction::new_unsigned(message);
     if sign_only {
         tx.try_partial_sign(&config.signers, recent_blockhash)?;
-        return_signers(&tx, &config)
+        return_signers(&tx, &config.output_format)
     } else {
         tx.try_sign(&config.signers, recent_blockhash)?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-            &tx,
-            config.commitment,
-            config.send_transaction_config,
-        );
+        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
         log_instruction_custom_error::<SystemError>(result, &config)
     }
 }
@@ -961,6 +984,7 @@ pub fn process_stake_authorize(
     config: &CliConfig,
     stake_account_pubkey: &Pubkey,
     new_authorizations: &[(StakeAuthorize, Pubkey, SignerIndex)],
+    custodian: Option<SignerIndex>,
     sign_only: bool,
     blockhash_query: &BlockhashQuery,
     nonce_account: Option<Pubkey>,
@@ -968,6 +992,7 @@ pub fn process_stake_authorize(
     fee_payer: SignerIndex,
 ) -> ProcessResult {
     let mut ixs = Vec::new();
+    let custodian = custodian.map(|index| config.signers[index]);
     for (stake_authorize, authorized_pubkey, authority) in new_authorizations.iter() {
         check_unique_pubkeys(
             (stake_account_pubkey, "stake_account_pubkey".to_string()),
@@ -979,6 +1004,7 @@ pub fn process_stake_authorize(
             &authority.pubkey(),  // currently authorized
             authorized_pubkey,    // new stake signer
             *stake_authorize,     // stake or withdraw
+            custodian.map(|signer| signer.pubkey()).as_ref(),
         ));
     }
 
@@ -1002,12 +1028,15 @@ pub fn process_stake_authorize(
 
     if sign_only {
         tx.try_partial_sign(&config.signers, recent_blockhash)?;
-        return_signers(&tx, &config)
+        return_signers(&tx, &config.output_format)
     } else {
         tx.try_sign(&config.signers, recent_blockhash)?;
         if let Some(nonce_account) = &nonce_account {
-            let nonce_account =
-                nonce::get_account_with_commitment(rpc_client, nonce_account, config.commitment)?;
+            let nonce_account = nonce_utils::get_account_with_commitment(
+                rpc_client,
+                nonce_account,
+                config.commitment,
+            )?;
             check_nonce_account(&nonce_account, &nonce_authority.pubkey(), &recent_blockhash)?;
         }
         check_account_for_fee_with_commitment(
@@ -1017,11 +1046,7 @@ pub fn process_stake_authorize(
             &tx.message,
             config.commitment,
         )?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-            &tx,
-            config.commitment,
-            config.send_transaction_config,
-        );
+        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
         log_instruction_custom_error::<StakeError>(result, &config)
     }
 }
@@ -1062,12 +1087,15 @@ pub fn process_deactivate_stake_account(
 
     if sign_only {
         tx.try_partial_sign(&config.signers, recent_blockhash)?;
-        return_signers(&tx, &config)
+        return_signers(&tx, &config.output_format)
     } else {
         tx.try_sign(&config.signers, recent_blockhash)?;
         if let Some(nonce_account) = &nonce_account {
-            let nonce_account =
-                nonce::get_account_with_commitment(rpc_client, nonce_account, config.commitment)?;
+            let nonce_account = nonce_utils::get_account_with_commitment(
+                rpc_client,
+                nonce_account,
+                config.commitment,
+            )?;
             check_nonce_account(&nonce_account, &nonce_authority.pubkey(), &recent_blockhash)?;
         }
         check_account_for_fee_with_commitment(
@@ -1077,11 +1105,7 @@ pub fn process_deactivate_stake_account(
             &tx.message,
             config.commitment,
         )?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-            &tx,
-            config.commitment,
-            config.send_transaction_config,
-        );
+        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
         log_instruction_custom_error::<StakeError>(result, &config)
     }
 }
@@ -1131,12 +1155,15 @@ pub fn process_withdraw_stake(
 
     if sign_only {
         tx.try_partial_sign(&config.signers, recent_blockhash)?;
-        return_signers(&tx, &config)
+        return_signers(&tx, &config.output_format)
     } else {
         tx.try_sign(&config.signers, recent_blockhash)?;
         if let Some(nonce_account) = &nonce_account {
-            let nonce_account =
-                nonce::get_account_with_commitment(rpc_client, nonce_account, config.commitment)?;
+            let nonce_account = nonce_utils::get_account_with_commitment(
+                rpc_client,
+                nonce_account,
+                config.commitment,
+            )?;
             check_nonce_account(&nonce_account, &nonce_authority.pubkey(), &recent_blockhash)?;
         }
         check_account_for_fee_with_commitment(
@@ -1146,11 +1173,7 @@ pub fn process_withdraw_stake(
             &tx.message,
             config.commitment,
         )?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-            &tx,
-            config.commitment,
-            config.send_transaction_config,
-        );
+        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
         log_instruction_custom_error::<SystemError>(result, &config)
     }
 }
@@ -1271,12 +1294,15 @@ pub fn process_split_stake(
 
     if sign_only {
         tx.try_partial_sign(&config.signers, recent_blockhash)?;
-        return_signers(&tx, &config)
+        return_signers(&tx, &config.output_format)
     } else {
         tx.try_sign(&config.signers, recent_blockhash)?;
         if let Some(nonce_account) = &nonce_account {
-            let nonce_account =
-                nonce::get_account_with_commitment(rpc_client, nonce_account, config.commitment)?;
+            let nonce_account = nonce_utils::get_account_with_commitment(
+                rpc_client,
+                nonce_account,
+                config.commitment,
+            )?;
             check_nonce_account(&nonce_account, &nonce_authority.pubkey(), &recent_blockhash)?;
         }
         check_account_for_fee_with_commitment(
@@ -1286,11 +1312,7 @@ pub fn process_split_stake(
             &tx.message,
             config.commitment,
         )?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-            &tx,
-            config.commitment,
-            config.send_transaction_config,
-        );
+        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
         log_instruction_custom_error::<StakeError>(result, &config)
     }
 }
@@ -1370,12 +1392,15 @@ pub fn process_merge_stake(
 
     if sign_only {
         tx.try_partial_sign(&config.signers, recent_blockhash)?;
-        return_signers(&tx, &config)
+        return_signers(&tx, &config.output_format)
     } else {
         tx.try_sign(&config.signers, recent_blockhash)?;
         if let Some(nonce_account) = &nonce_account {
-            let nonce_account =
-                nonce::get_account_with_commitment(rpc_client, nonce_account, config.commitment)?;
+            let nonce_account = nonce_utils::get_account_with_commitment(
+                rpc_client,
+                nonce_account,
+                config.commitment,
+            )?;
             check_nonce_account(&nonce_account, &nonce_authority.pubkey(), &recent_blockhash)?;
         }
         check_account_for_fee_with_commitment(
@@ -1433,12 +1458,15 @@ pub fn process_stake_set_lockup(
 
     if sign_only {
         tx.try_partial_sign(&config.signers, recent_blockhash)?;
-        return_signers(&tx, &config)
+        return_signers(&tx, &config.output_format)
     } else {
         tx.try_sign(&config.signers, recent_blockhash)?;
         if let Some(nonce_account) = &nonce_account {
-            let nonce_account =
-                nonce::get_account_with_commitment(rpc_client, nonce_account, config.commitment)?;
+            let nonce_account = nonce_utils::get_account_with_commitment(
+                rpc_client,
+                nonce_account,
+                config.commitment,
+            )?;
             check_nonce_account(&nonce_account, &nonce_authority.pubkey(), &recent_blockhash)?;
         }
         check_account_for_fee_with_commitment(
@@ -1448,11 +1476,7 @@ pub fn process_stake_set_lockup(
             &tx.message,
             config.commitment,
         )?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-            &tx,
-            config.commitment,
-            config.send_transaction_config,
-        );
+        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
         log_instruction_custom_error::<StakeError>(result, &config)
     }
 }
@@ -1471,6 +1495,7 @@ pub fn build_stake_state(
     use_lamports_unit: bool,
     stake_history: &StakeHistory,
     clock: &Clock,
+    stake_program_v2_enabled: bool,
 ) -> CliStakeState {
     match stake_state {
         StakeState::Stake(
@@ -1482,9 +1507,12 @@ pub fn build_stake_state(
             stake,
         ) => {
             let current_epoch = clock.epoch;
-            let (active_stake, activating_stake, deactivating_stake) = stake
-                .delegation
-                .stake_activating_and_deactivating(current_epoch, Some(stake_history));
+            let (active_stake, activating_stake, deactivating_stake) =
+                stake.delegation.stake_activating_and_deactivating(
+                    current_epoch,
+                    Some(stake_history),
+                    stake_program_v2_enabled,
+                );
             let lockup = if lockup.is_in_force(clock, None) {
                 Some(lockup.into())
             } else {
@@ -1493,6 +1521,7 @@ pub fn build_stake_state(
             CliStakeState {
                 stake_type: CliStakeType::Stake,
                 account_balance,
+                credits_observed: Some(stake.credits_observed),
                 delegated_stake: Some(stake.delegation.stake),
                 delegated_vote_account_address: if stake.delegation.voter_pubkey
                     != Pubkey::default()
@@ -1519,6 +1548,7 @@ pub fn build_stake_state(
                 active_stake: u64_some_if_not_zero(active_stake),
                 activating_stake: u64_some_if_not_zero(activating_stake),
                 deactivating_stake: u64_some_if_not_zero(deactivating_stake),
+                ..CliStakeState::default()
             }
         }
         StakeState::RewardsPool => CliStakeState {
@@ -1543,6 +1573,7 @@ pub fn build_stake_state(
             CliStakeState {
                 stake_type: CliStakeType::Initialized,
                 account_balance,
+                credits_observed: Some(0),
                 authorized: Some(authorized.into()),
                 lockup,
                 use_lamports_unit,
@@ -1553,39 +1584,153 @@ pub fn build_stake_state(
     }
 }
 
+pub(crate) fn fetch_epoch_rewards(
+    rpc_client: &RpcClient,
+    address: &Pubkey,
+    lowest_epoch: Epoch,
+) -> Result<Vec<CliEpochReward>, Box<dyn std::error::Error>> {
+    let mut all_epoch_rewards = vec![];
+
+    let epoch_schedule = rpc_client.get_epoch_schedule()?;
+    let slot = rpc_client.get_slot()?;
+    let first_available_block = rpc_client.get_first_available_block()?;
+
+    let mut epoch = epoch_schedule.get_epoch_and_slot_index(slot).0;
+    let mut epoch_info: Option<(Slot, UnixTimestamp, solana_transaction_status::Rewards)> = None;
+    while epoch > lowest_epoch {
+        let first_slot_in_epoch = epoch_schedule.get_first_slot_in_epoch(epoch);
+        if first_slot_in_epoch < first_available_block {
+            // RPC node is out of history data
+            break;
+        }
+
+        let first_confirmed_block_in_epoch = *rpc_client
+            .get_confirmed_blocks_with_limit(first_slot_in_epoch, 1)?
+            .get(0)
+            .ok_or_else(|| format!("Unable to fetch first confirmed block for epoch {}", epoch))?;
+
+        let first_confirmed_block = match rpc_client.get_confirmed_block_with_encoding(
+            first_confirmed_block_in_epoch,
+            solana_transaction_status::UiTransactionEncoding::Base64,
+        ) {
+            Ok(first_confirmed_block) => first_confirmed_block,
+            Err(ClientError {
+                kind:
+                    ClientErrorKind::RpcError(rpc_request::RpcError::RpcResponseError {
+                        code: rpc_custom_error::JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
+                        ..
+                    }),
+                ..
+            }) => {
+                // RPC node doesn't have this block
+                break;
+            }
+            Err(err) => {
+                return Err(err.into());
+            }
+        };
+
+        let epoch_start_time = if let Some(block_time) = first_confirmed_block.block_time {
+            block_time
+        } else {
+            break;
+        };
+
+        // Rewards for the previous epoch are found in the first confirmed block of the current epoch
+        let previous_epoch_rewards = first_confirmed_block.rewards;
+
+        if let Some((effective_slot, epoch_end_time, epoch_rewards)) = epoch_info {
+            let wallclock_epoch_duration = if epoch_end_time > epoch_start_time {
+                Some(
+                    { Local.timestamp(epoch_end_time, 0) - Local.timestamp(epoch_start_time, 0) }
+                        .to_std()?
+                        .as_secs_f64(),
+                )
+            } else {
+                None
+            };
+
+            if let Some(reward) = epoch_rewards
+                .into_iter()
+                .find(|reward| reward.pubkey == address.to_string())
+            {
+                if reward.post_balance > reward.lamports.try_into().unwrap_or(0) {
+                    let rate_change = reward.lamports.abs() as f64
+                        / (reward.post_balance as f64 - reward.lamports as f64);
+
+                    let apr = wallclock_epoch_duration.map(|wallclock_epoch_duration| {
+                        let wallclock_epochs_per_year =
+                            (SECONDS_PER_DAY * 356) as f64 / wallclock_epoch_duration;
+                        rate_change * wallclock_epochs_per_year
+                    });
+
+                    all_epoch_rewards.push(CliEpochReward {
+                        epoch,
+                        effective_slot,
+                        amount: reward.lamports.abs() as u64,
+                        post_balance: reward.post_balance,
+                        percent_change: rate_change * 100.0,
+                        apr: apr.map(|r| r * 100.0),
+                    });
+                }
+            }
+        }
+
+        epoch -= 1;
+        epoch_info = Some((
+            first_confirmed_block_in_epoch,
+            epoch_start_time,
+            previous_epoch_rewards,
+        ));
+    }
+
+    Ok(all_epoch_rewards)
+}
+
 pub fn process_show_stake_account(
     rpc_client: &RpcClient,
     config: &CliConfig,
-    stake_account_pubkey: &Pubkey,
+    stake_account_address: &Pubkey,
     use_lamports_unit: bool,
 ) -> ProcessResult {
-    let stake_account = rpc_client.get_account(stake_account_pubkey)?;
+    let stake_account = rpc_client.get_account(stake_account_address)?;
     if stake_account.owner != solana_stake_program::id() {
         return Err(CliError::RpcRequestError(format!(
             "{:?} is not a stake account",
-            stake_account_pubkey,
+            stake_account_address,
         ))
         .into());
     }
     match stake_account.state() {
         Ok(stake_state) => {
             let stake_history_account = rpc_client.get_account(&stake_history::id())?;
-            let stake_history =
-                StakeHistory::from_account(&stake_history_account).ok_or_else(|| {
-                    CliError::RpcRequestError("Failed to deserialize stake history".to_string())
-                })?;
+            let stake_history = from_account(&stake_history_account).ok_or_else(|| {
+                CliError::RpcRequestError("Failed to deserialize stake history".to_string())
+            })?;
             let clock_account = rpc_client.get_account(&clock::id())?;
-            let clock: Clock = Sysvar::from_account(&clock_account).ok_or_else(|| {
+            let clock: Clock = from_account(&clock_account).ok_or_else(|| {
                 CliError::RpcRequestError("Failed to deserialize clock sysvar".to_string())
             })?;
 
-            let state = build_stake_state(
+            let mut state = build_stake_state(
                 stake_account.lamports,
                 &stake_state,
                 use_lamports_unit,
                 &stake_history,
                 &clock,
+                is_stake_program_v2_enabled(rpc_client)?, // At v1.6, this check can be removed and simply passed as `true`
             );
+
+            if state.stake_type == CliStakeType::Stake {
+                if let Some(activation_epoch) = state.activation_epoch {
+                    let rewards =
+                        fetch_epoch_rewards(rpc_client, stake_account_address, activation_epoch);
+                    match rewards {
+                        Ok(rewards) => state.epoch_rewards = Some(rewards),
+                        Err(error) => eprintln!("Failed to fetch epoch rewards: {:?}", error),
+                    };
+                }
+            }
             Ok(config.output_format.formatted_string(&state))
         }
         Err(err) => Err(CliError::RpcRequestError(format!(
@@ -1602,7 +1747,7 @@ pub fn process_show_stake_history(
     use_lamports_unit: bool,
 ) -> ProcessResult {
     let stake_history_account = rpc_client.get_account(&stake_history::id())?;
-    let stake_history = StakeHistory::from_account(&stake_history_account).ok_or_else(|| {
+    let stake_history = from_account::<StakeHistory>(&stake_history_account).ok_or_else(|| {
         CliError::RpcRequestError("Failed to deserialize stake history".to_string())
     })?;
 
@@ -1640,23 +1785,15 @@ pub fn process_delegate_stake(
     if !sign_only {
         // Sanity check the vote account to ensure it is attached to a validator that has recently
         // voted at the tip of the ledger
-        let vote_account = rpc_client
-            .get_account_with_commitment(vote_account_pubkey, config.commitment)
-            .map_err(|_| {
+        let vote_account_data = rpc_client
+            .get_account(vote_account_pubkey)
+            .map_err(|err| {
                 CliError::RpcRequestError(format!(
-                    "Vote account not found: {}",
-                    vote_account_pubkey
+                    "Vote account not found: {}. error: {}",
+                    vote_account_pubkey, err,
                 ))
-            })?;
-        let vote_account_data = if let Some(account) = vote_account.value {
-            account.data
-        } else {
-            return Err(CliError::RpcRequestError(format!(
-                "Vote account not found: {}",
-                vote_account_pubkey
-            ))
-            .into());
-        };
+            })?
+            .data;
 
         let vote_state = VoteState::deserialize(&vote_account_data).map_err(|_| {
             CliError::RpcRequestError(
@@ -1718,12 +1855,15 @@ pub fn process_delegate_stake(
 
     if sign_only {
         tx.try_partial_sign(&config.signers, recent_blockhash)?;
-        return_signers(&tx, &config)
+        return_signers(&tx, &config.output_format)
     } else {
         tx.try_sign(&config.signers, recent_blockhash)?;
         if let Some(nonce_account) = &nonce_account {
-            let nonce_account =
-                nonce::get_account_with_commitment(rpc_client, nonce_account, config.commitment)?;
+            let nonce_account = nonce_utils::get_account_with_commitment(
+                rpc_client,
+                nonce_account,
+                config.commitment,
+            )?;
             check_nonce_account(&nonce_account, &nonce_authority.pubkey(), &recent_blockhash)?;
         }
         check_account_for_fee_with_commitment(
@@ -1733,19 +1873,25 @@ pub fn process_delegate_stake(
             &tx.message,
             config.commitment,
         )?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-            &tx,
-            config.commitment,
-            config.send_transaction_config,
-        );
+        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
         log_instruction_custom_error::<StakeError>(result, &config)
     }
+}
+
+pub fn is_stake_program_v2_enabled(
+    rpc_client: &RpcClient,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let feature_account = rpc_client.get_account(&feature_set::stake_program_v2::id())?;
+    Ok(feature::from_account(&feature_account)
+        .and_then(|feature| feature.activated_at)
+        .is_some())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::{app, parse_command};
+    use solana_client::blockhash_query;
     use solana_sdk::{
         hash::Hash,
         signature::{
@@ -1766,6 +1912,10 @@ mod tests {
         let default_keypair = Keypair::new();
         let (default_keypair_file, mut tmp_file) = make_tmp_file();
         write_keypair(&default_keypair, tmp_file.as_file_mut()).unwrap();
+        let default_signer = DefaultSigner {
+            path: default_keypair_file.clone(),
+            arg_name: String::new(),
+        };
         let (keypair_file, mut tmp_file) = make_tmp_file();
         let stake_account_keypair = Keypair::new();
         write_keypair(&stake_account_keypair, tmp_file.as_file_mut()).unwrap();
@@ -1793,7 +1943,7 @@ mod tests {
             &new_withdraw_string,
         ]);
         assert_eq!(
-            parse_command(&test_stake_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_stake_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -1806,6 +1956,7 @@ mod tests {
                     nonce_account: None,
                     nonce_authority: 0,
                     fee_payer: 0,
+                    custodian: None,
                 },
                 signers: vec![read_keypair_file(&default_keypair_file).unwrap().into(),],
             },
@@ -1827,7 +1978,7 @@ mod tests {
             &withdraw_authority_keypair_file,
         ]);
         assert_eq!(
-            parse_command(&test_stake_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_stake_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -1840,6 +1991,7 @@ mod tests {
                     nonce_account: None,
                     nonce_authority: 0,
                     fee_payer: 0,
+                    custodian: None,
                 },
                 signers: vec![
                     read_keypair_file(&default_keypair_file).unwrap().into(),
@@ -1865,7 +2017,7 @@ mod tests {
             &withdraw_authority_keypair_file,
         ]);
         assert_eq!(
-            parse_command(&test_stake_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_stake_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -1878,6 +2030,7 @@ mod tests {
                     nonce_account: None,
                     nonce_authority: 0,
                     fee_payer: 0,
+                    custodian: None,
                 },
                 signers: vec![
                     read_keypair_file(&default_keypair_file).unwrap().into(),
@@ -1895,7 +2048,7 @@ mod tests {
             &new_stake_string,
         ]);
         assert_eq!(
-            parse_command(&test_stake_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_stake_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -1905,6 +2058,7 @@ mod tests {
                     nonce_account: None,
                     nonce_authority: 0,
                     fee_payer: 0,
+                    custodian: None,
                 },
                 signers: vec![read_keypair_file(&default_keypair_file).unwrap().into(),],
             },
@@ -1919,7 +2073,7 @@ mod tests {
             &stake_authority_keypair_file,
         ]);
         assert_eq!(
-            parse_command(&test_stake_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_stake_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -1929,6 +2083,7 @@ mod tests {
                     nonce_account: None,
                     nonce_authority: 0,
                     fee_payer: 0,
+                    custodian: None,
                 },
                 signers: vec![
                     read_keypair_file(&default_keypair_file).unwrap().into(),
@@ -1949,7 +2104,7 @@ mod tests {
             &withdraw_authority_keypair_file,
         ]);
         assert_eq!(
-            parse_command(&test_stake_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_stake_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -1959,6 +2114,7 @@ mod tests {
                     nonce_account: None,
                     nonce_authority: 0,
                     fee_payer: 0,
+                    custodian: None,
                 },
                 signers: vec![
                     read_keypair_file(&default_keypair_file).unwrap().into(),
@@ -1976,7 +2132,7 @@ mod tests {
             &new_withdraw_string,
         ]);
         assert_eq!(
-            parse_command(&test_stake_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_stake_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -1990,6 +2146,7 @@ mod tests {
                     nonce_account: None,
                     nonce_authority: 0,
                     fee_payer: 0,
+                    custodian: None,
                 },
                 signers: vec![read_keypair_file(&default_keypair_file).unwrap().into(),],
             },
@@ -2004,7 +2161,7 @@ mod tests {
             &withdraw_authority_keypair_file,
         ]);
         assert_eq!(
-            parse_command(&test_stake_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_stake_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -2018,6 +2175,7 @@ mod tests {
                     nonce_account: None,
                     nonce_authority: 0,
                     fee_payer: 0,
+                    custodian: None,
                 },
                 signers: vec![
                     read_keypair_file(&default_keypair_file).unwrap().into(),
@@ -2042,7 +2200,7 @@ mod tests {
             "--sign-only",
         ]);
         assert_eq!(
-            parse_command(&test_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -2052,6 +2210,7 @@ mod tests {
                     nonce_account: None,
                     nonce_authority: 0,
                     fee_payer: 0,
+                    custodian: None,
                 },
                 signers: vec![read_keypair_file(&default_keypair_file).unwrap().into()],
             }
@@ -2075,7 +2234,7 @@ mod tests {
             &pubkey.to_string(),
         ]);
         assert_eq!(
-            parse_command(&test_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -2088,6 +2247,7 @@ mod tests {
                     nonce_account: None,
                     nonce_authority: 0,
                     fee_payer: 1,
+                    custodian: None,
                 },
                 signers: vec![
                     read_keypair_file(&default_keypair_file).unwrap().into(),
@@ -2121,7 +2281,7 @@ mod tests {
             &pubkey2.to_string(),
         ]);
         assert_eq!(
-            parse_command(&test_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -2134,6 +2294,7 @@ mod tests {
                     nonce_account: Some(nonce_account),
                     nonce_authority: 2,
                     fee_payer: 1,
+                    custodian: None,
                 },
                 signers: vec![
                     read_keypair_file(&default_keypair_file).unwrap().into(),
@@ -2153,7 +2314,7 @@ mod tests {
             &blockhash_string,
         ]);
         assert_eq!(
-            parse_command(&test_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -2166,6 +2327,7 @@ mod tests {
                     nonce_account: None,
                     nonce_authority: 0,
                     fee_payer: 0,
+                    custodian: None,
                 },
                 signers: vec![read_keypair_file(&default_keypair_file).unwrap().into()],
             }
@@ -2190,7 +2352,7 @@ mod tests {
             &nonce_keypair_file,
         ]);
         assert_eq!(
-            parse_command(&test_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -2203,6 +2365,7 @@ mod tests {
                     nonce_account: Some(nonce_account_pubkey),
                     nonce_authority: 1,
                     fee_payer: 0,
+                    custodian: None,
                 },
                 signers: vec![
                     read_keypair_file(&default_keypair_file).unwrap().into(),
@@ -2226,7 +2389,7 @@ mod tests {
             &fee_payer_keypair_file,
         ]);
         assert_eq!(
-            parse_command(&test_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -2236,6 +2399,7 @@ mod tests {
                     nonce_account: None,
                     nonce_authority: 0,
                     fee_payer: 1,
+                    custodian: None,
                 },
                 signers: vec![
                     read_keypair_file(&default_keypair_file).unwrap().into(),
@@ -2260,7 +2424,7 @@ mod tests {
             &signer,
         ]);
         assert_eq!(
-            parse_command(&test_authorize, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_authorize, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::StakeAuthorize {
                     stake_account_pubkey,
@@ -2273,6 +2437,7 @@ mod tests {
                     nonce_account: None,
                     nonce_authority: 0,
                     fee_payer: 1,
+                    custodian: None,
                 },
                 signers: vec![
                     read_keypair_file(&default_keypair_file).unwrap().into(),
@@ -2282,9 +2447,9 @@ mod tests {
         );
 
         // Test CreateStakeAccount SubCommand
-        let custodian = Pubkey::new_rand();
+        let custodian = solana_sdk::pubkey::new_rand();
         let custodian_string = format!("{}", custodian);
-        let authorized = Pubkey::new_rand();
+        let authorized = solana_sdk::pubkey::new_rand();
         let authorized_string = format!("{}", authorized);
         let test_create_stake_account = test_commands.clone().get_matches_from(vec![
             "test",
@@ -2301,7 +2466,7 @@ mod tests {
             "43",
         ]);
         assert_eq!(
-            parse_command(&test_create_stake_account, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_create_stake_account, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::CreateStakeAccount {
                     stake_account: 1,
@@ -2342,12 +2507,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            parse_command(
-                &test_create_stake_account2,
-                &default_keypair_file,
-                &mut None
-            )
-            .unwrap(),
+            parse_command(&test_create_stake_account2, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::CreateStakeAccount {
                     stake_account: 1,
@@ -2400,12 +2560,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            parse_command(
-                &test_create_stake_account2,
-                &default_keypair_file,
-                &mut None
-            )
-            .unwrap(),
+            parse_command(&test_create_stake_account2, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::CreateStakeAccount {
                     stake_account: 1,
@@ -2432,7 +2587,7 @@ mod tests {
         );
 
         // Test DelegateStake Subcommand
-        let vote_account_pubkey = Pubkey::new_rand();
+        let vote_account_pubkey = solana_sdk::pubkey::new_rand();
         let vote_account_string = vote_account_pubkey.to_string();
         let test_delegate_stake = test_commands.clone().get_matches_from(vec![
             "test",
@@ -2441,7 +2596,7 @@ mod tests {
             &vote_account_string,
         ]);
         assert_eq!(
-            parse_command(&test_delegate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_delegate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DelegateStake {
                     stake_account_pubkey,
@@ -2459,7 +2614,7 @@ mod tests {
         );
 
         // Test DelegateStake Subcommand w/ authority
-        let vote_account_pubkey = Pubkey::new_rand();
+        let vote_account_pubkey = solana_sdk::pubkey::new_rand();
         let vote_account_string = vote_account_pubkey.to_string();
         let test_delegate_stake = test_commands.clone().get_matches_from(vec![
             "test",
@@ -2470,7 +2625,7 @@ mod tests {
             &stake_authority_keypair_file,
         ]);
         assert_eq!(
-            parse_command(&test_delegate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_delegate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DelegateStake {
                     stake_account_pubkey,
@@ -2501,7 +2656,7 @@ mod tests {
             &vote_account_string,
         ]);
         assert_eq!(
-            parse_command(&test_delegate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_delegate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DelegateStake {
                     stake_account_pubkey,
@@ -2530,7 +2685,7 @@ mod tests {
             &blockhash_string,
         ]);
         assert_eq!(
-            parse_command(&test_delegate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_delegate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DelegateStake {
                     stake_account_pubkey,
@@ -2560,7 +2715,7 @@ mod tests {
             "--sign-only",
         ]);
         assert_eq!(
-            parse_command(&test_delegate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_delegate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DelegateStake {
                     stake_account_pubkey,
@@ -2578,7 +2733,7 @@ mod tests {
         );
 
         // Test Delegate Subcommand w/ absent fee payer
-        let key1 = Pubkey::new_rand();
+        let key1 = solana_sdk::pubkey::new_rand();
         let sig1 = Keypair::new().sign_message(&[0u8]);
         let signer1 = format!("{}={}", key1, sig1);
         let test_delegate_stake = test_commands.clone().get_matches_from(vec![
@@ -2594,7 +2749,7 @@ mod tests {
             &key1.to_string(),
         ]);
         assert_eq!(
-            parse_command(&test_delegate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_delegate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DelegateStake {
                     stake_account_pubkey,
@@ -2618,7 +2773,7 @@ mod tests {
         );
 
         // Test Delegate Subcommand w/ absent fee payer and absent nonce authority
-        let key2 = Pubkey::new_rand();
+        let key2 = solana_sdk::pubkey::new_rand();
         let sig2 = Keypair::new().sign_message(&[0u8]);
         let signer2 = format!("{}={}", key2, sig2);
         let test_delegate_stake = test_commands.clone().get_matches_from(vec![
@@ -2640,7 +2795,7 @@ mod tests {
             &key2.to_string(),
         ]);
         assert_eq!(
-            parse_command(&test_delegate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_delegate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DelegateStake {
                     stake_account_pubkey,
@@ -2677,7 +2832,7 @@ mod tests {
             &fee_payer_keypair_file,
         ]);
         assert_eq!(
-            parse_command(&test_delegate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_delegate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DelegateStake {
                     stake_account_pubkey,
@@ -2707,7 +2862,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            parse_command(&test_withdraw_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_withdraw_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::WithdrawStake {
                     stake_account_pubkey,
@@ -2737,7 +2892,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            parse_command(&test_withdraw_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_withdraw_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::WithdrawStake {
                     stake_account_pubkey,
@@ -2772,7 +2927,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            parse_command(&test_withdraw_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_withdraw_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::WithdrawStake {
                     stake_account_pubkey,
@@ -2815,7 +2970,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            parse_command(&test_withdraw_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_withdraw_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::WithdrawStake {
                     stake_account_pubkey,
@@ -2848,7 +3003,7 @@ mod tests {
             &stake_account_string,
         ]);
         assert_eq!(
-            parse_command(&test_deactivate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_deactivate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DeactivateStake {
                     stake_account_pubkey,
@@ -2872,7 +3027,7 @@ mod tests {
             &stake_authority_keypair_file,
         ]);
         assert_eq!(
-            parse_command(&test_deactivate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_deactivate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DeactivateStake {
                     stake_account_pubkey,
@@ -2903,7 +3058,7 @@ mod tests {
             &blockhash_string,
         ]);
         assert_eq!(
-            parse_command(&test_deactivate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_deactivate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DeactivateStake {
                     stake_account_pubkey,
@@ -2930,7 +3085,7 @@ mod tests {
             "--sign-only",
         ]);
         assert_eq!(
-            parse_command(&test_deactivate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_deactivate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DeactivateStake {
                     stake_account_pubkey,
@@ -2946,7 +3101,7 @@ mod tests {
         );
 
         // Test Deactivate Subcommand w/ absent fee payer
-        let key1 = Pubkey::new_rand();
+        let key1 = solana_sdk::pubkey::new_rand();
         let sig1 = Keypair::new().sign_message(&[0u8]);
         let signer1 = format!("{}={}", key1, sig1);
         let test_deactivate_stake = test_commands.clone().get_matches_from(vec![
@@ -2961,7 +3116,7 @@ mod tests {
             &key1.to_string(),
         ]);
         assert_eq!(
-            parse_command(&test_deactivate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_deactivate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DeactivateStake {
                     stake_account_pubkey,
@@ -2983,7 +3138,7 @@ mod tests {
         );
 
         // Test Deactivate Subcommand w/ absent fee payer and nonce authority
-        let key2 = Pubkey::new_rand();
+        let key2 = solana_sdk::pubkey::new_rand();
         let sig2 = Keypair::new().sign_message(&[0u8]);
         let signer2 = format!("{}={}", key2, sig2);
         let test_deactivate_stake = test_commands.clone().get_matches_from(vec![
@@ -3004,7 +3159,7 @@ mod tests {
             &key2.to_string(),
         ]);
         assert_eq!(
-            parse_command(&test_deactivate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_deactivate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DeactivateStake {
                     stake_account_pubkey,
@@ -3035,7 +3190,7 @@ mod tests {
             &fee_payer_keypair_file,
         ]);
         assert_eq!(
-            parse_command(&test_deactivate_stake, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_deactivate_stake, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::DeactivateStake {
                     stake_account_pubkey,
@@ -3069,7 +3224,7 @@ mod tests {
             "50",
         ]);
         assert_eq!(
-            parse_command(&test_split_stake_account, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_split_stake_account, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::SplitStake {
                     stake_account_pubkey: stake_account_keypair.pubkey(),
@@ -3130,7 +3285,7 @@ mod tests {
             &stake_signer,
         ]);
         assert_eq!(
-            parse_command(&test_split_stake_account, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_split_stake_account, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::SplitStake {
                     stake_account_pubkey: stake_account_keypair.pubkey(),
@@ -3162,7 +3317,7 @@ mod tests {
         let stake_account_keypair = Keypair::new();
         write_keypair(&stake_account_keypair, tmp_file.as_file_mut()).unwrap();
 
-        let source_stake_account_pubkey = Pubkey::new_rand();
+        let source_stake_account_pubkey = solana_sdk::pubkey::new_rand();
         let test_merge_stake_account = test_commands.clone().get_matches_from(vec![
             "test",
             "merge-stake",
@@ -3170,7 +3325,7 @@ mod tests {
             &source_stake_account_pubkey.to_string(),
         ]);
         assert_eq!(
-            parse_command(&test_merge_stake_account, &default_keypair_file, &mut None).unwrap(),
+            parse_command(&test_merge_stake_account, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::MergeStake {
                     stake_account_pubkey: stake_account_keypair.pubkey(),

@@ -2,13 +2,14 @@ use {
     crate::{
         accounts::Accounts,
         accounts_db::{AccountStorageEntry, AccountsDB, AppendVecId, BankHashInfo},
-        accounts_index::Ancestors,
+        accounts_index::{AccountIndex, Ancestors},
         append_vec::AppendVec,
-        bank::{Bank, BankFieldsToDeserialize, BankRc},
+        bank::{Bank, BankFieldsToDeserialize, BankRc, Builtins},
         blockhash_queue::BlockhashQueue,
         epoch_stakes::EpochStakes,
         message_processor::MessageProcessor,
         rent_collector::RentCollector,
+        serde_snapshot::future::SerializableStorage,
         stakes::Stakes,
     },
     bincode,
@@ -21,6 +22,7 @@ use {
         clock::{Epoch, Slot, UnixTimestamp},
         epoch_schedule::EpochSchedule,
         fee_calculator::{FeeCalculator, FeeRateGovernor},
+        genesis_config::ClusterType,
         genesis_config::GenesisConfig,
         hard_forks::HardForks,
         hash::Hash,
@@ -28,17 +30,17 @@ use {
         pubkey::Pubkey,
     },
     std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         io::{BufReader, BufWriter, Read, Write},
         path::{Path, PathBuf},
         result::Result,
-        sync::{atomic::Ordering, Arc},
+        sync::{atomic::Ordering, Arc, RwLock},
         time::Instant,
     },
 };
 
 #[cfg(RUSTC_WITH_SPECIALIZATION)]
-use solana_sdk::abi_example::IgnoreAsHelper;
+use solana_frozen_abi::abi_example::IgnoreAsHelper;
 
 mod common;
 mod future;
@@ -69,7 +71,7 @@ trait TypeContext<'a> {
     type SerializableAccountStorageEntry: Serialize
         + DeserializeOwned
         + From<&'a AccountStorageEntry>
-        + Into<AccountStorageEntry>;
+        + SerializableStorage;
 
     fn serialize_bank_and_storage<S: serde::ser::Serializer>(
         serializer: S,
@@ -116,6 +118,7 @@ where
         .deserialize_from::<R, T>(reader)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn bank_from_stream<R, P>(
     serde_style: SerdeStyle,
     stream: &mut BufReader<R>,
@@ -123,6 +126,10 @@ pub(crate) fn bank_from_stream<R, P>(
     account_paths: &[PathBuf],
     genesis_config: &GenesisConfig,
     frozen_account_pubkeys: &[Pubkey],
+    debug_keys: Option<Arc<HashSet<Pubkey>>>,
+    additional_builtins: Option<&Builtins>,
+    account_indexes: HashSet<AccountIndex>,
+    caching_enabled: bool,
 ) -> std::result::Result<Bank, Error>
 where
     R: Read,
@@ -139,6 +146,10 @@ where
                 frozen_account_pubkeys,
                 account_paths,
                 append_vecs_path,
+                debug_keys,
+                additional_builtins,
+                account_indexes,
+                caching_enabled,
             )?;
             Ok(bank)
         }};
@@ -216,6 +227,7 @@ impl<'a, C: TypeContext<'a>> Serialize for SerializableAccountsDB<'a, C> {
 #[cfg(RUSTC_WITH_SPECIALIZATION)]
 impl<'a, C> IgnoreAsHelper for SerializableAccountsDB<'a, C> {}
 
+#[allow(clippy::too_many_arguments)]
 fn reconstruct_bank_from_fields<E, P>(
     bank_fields: BankFieldsToDeserialize,
     accounts_db_fields: AccountsDbFields<E>,
@@ -223,17 +235,33 @@ fn reconstruct_bank_from_fields<E, P>(
     frozen_account_pubkeys: &[Pubkey],
     account_paths: &[PathBuf],
     append_vecs_path: P,
+    debug_keys: Option<Arc<HashSet<Pubkey>>>,
+    additional_builtins: Option<&Builtins>,
+    account_indexes: HashSet<AccountIndex>,
+    caching_enabled: bool,
 ) -> Result<Bank, Error>
 where
-    E: Into<AccountStorageEntry>,
+    E: SerializableStorage,
     P: AsRef<Path>,
 {
-    let mut accounts_db =
-        reconstruct_accountsdb_from_fields(accounts_db_fields, account_paths, append_vecs_path)?;
+    let mut accounts_db = reconstruct_accountsdb_from_fields(
+        accounts_db_fields,
+        account_paths,
+        append_vecs_path,
+        &genesis_config.cluster_type,
+        account_indexes,
+        caching_enabled,
+    )?;
     accounts_db.freeze_accounts(&bank_fields.ancestors, frozen_account_pubkeys);
 
     let bank_rc = BankRc::new(Accounts::new_empty(accounts_db), bank_fields.slot);
-    let bank = Bank::new_from_fields(bank_rc, genesis_config, bank_fields);
+    let bank = Bank::new_from_fields(
+        bank_rc,
+        genesis_config,
+        bank_fields,
+        debug_keys,
+        additional_builtins,
+    );
 
     Ok(bank)
 }
@@ -242,28 +270,27 @@ fn reconstruct_accountsdb_from_fields<E, P>(
     accounts_db_fields: AccountsDbFields<E>,
     account_paths: &[PathBuf],
     stream_append_vecs_path: P,
+    cluster_type: &ClusterType,
+    account_indexes: HashSet<AccountIndex>,
+    caching_enabled: bool,
 ) -> Result<AccountsDB, Error>
 where
-    E: Into<AccountStorageEntry>,
+    E: SerializableStorage,
     P: AsRef<Path>,
 {
-    let accounts_db = AccountsDB::new(account_paths.to_vec());
-
+    let mut accounts_db = AccountsDB::new_with_config(
+        account_paths.to_vec(),
+        cluster_type,
+        account_indexes,
+        caching_enabled,
+    );
     let AccountsDbFields(storage, version, slot, bank_hash_info) = accounts_db_fields;
 
-    // convert to two level map of slot -> id -> account storage entry
-    let storage = {
-        let mut map = HashMap::new();
-        for (slot, entries) in storage.into_iter() {
-            let sub_map = map.entry(slot).or_insert_with(HashMap::new);
-            for entry in entries.into_iter() {
-                let mut entry: AccountStorageEntry = entry.into();
-                entry.slot = slot;
-                sub_map.insert(entry.id, Arc::new(entry));
-            }
-        }
-        map
-    };
+    // Ensure all account paths exist
+    for path in &accounts_db.paths {
+        std::fs::create_dir_all(path)
+            .unwrap_or_else(|err| panic!("Failed to create directory {}: {}", path.display(), err));
+    }
 
     let mut last_log_update = Instant::now();
     let mut remaining_slots_to_process = storage.len();
@@ -280,15 +307,14 @@ where
             remaining_slots_to_process -= 1;
 
             let mut new_slot_storage = HashMap::new();
-            for (id, storage_entry) in slot_storage.drain() {
+            for storage_entry in slot_storage.drain(..) {
                 let path_index = thread_rng().gen_range(0, accounts_db.paths.len());
                 let local_dir = &accounts_db.paths[path_index];
 
-                std::fs::create_dir_all(local_dir).expect("Create directory failed");
-
                 // Move the corresponding AppendVec from the snapshot into the directory pointed
                 // at by `local_dir`
-                let append_vec_relative_path = AppendVec::new_relative_path(slot, storage_entry.id);
+                let append_vec_relative_path =
+                    AppendVec::new_relative_path(slot, storage_entry.id());
                 let append_vec_abs_path = stream_append_vecs_path
                     .as_ref()
                     .join(&append_vec_relative_path);
@@ -303,9 +329,17 @@ where
 
                 // Notify the AppendVec of the new file location
                 let local_path = local_dir.join(append_vec_relative_path);
-                let mut u_storage_entry = Arc::try_unwrap(storage_entry).unwrap();
-                u_storage_entry.set_file(local_path)?;
-                new_slot_storage.insert(id, Arc::new(u_storage_entry));
+
+                let (accounts, num_accounts) =
+                    AppendVec::new_from_file(&local_path, storage_entry.current_len())?;
+                let u_storage_entry = AccountStorageEntry::new_existing(
+                    slot,
+                    storage_entry.id(),
+                    accounts,
+                    num_accounts,
+                );
+
+                new_slot_storage.insert(storage_entry.id(), Arc::new(u_storage_entry));
             }
             Ok((slot, new_slot_storage))
         })
@@ -330,8 +364,15 @@ where
         .expect("At least one storage entry must exist from deserializing stream");
 
     {
-        let mut stores = accounts_db.storage.write().unwrap();
-        stores.0.extend(storage);
+        accounts_db.storage.0.extend(
+            storage.into_iter().map(|(slot, slot_storage_entry)| {
+                (slot, Arc::new(RwLock::new(slot_storage_entry)))
+            }),
+        );
+    }
+
+    if max_id > AppendVecId::MAX / 2 {
+        panic!("Storage id {} larger than allowed max", max_id);
     }
 
     accounts_db.next_id.store(max_id + 1, Ordering::Relaxed);

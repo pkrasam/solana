@@ -1,18 +1,29 @@
 use assert_matches::assert_matches;
+use crossbeam_channel::{unbounded, Receiver};
 use gag::BufferRedirect;
 use log::*;
-use serial_test_derive::serial;
-use solana_client::rpc_client::RpcClient;
-use solana_client::thin_client::create_client;
+use serial_test::serial;
+use solana_client::{
+    pubsub_client::PubsubClient,
+    rpc_client::RpcClient,
+    rpc_config::{RpcProgramAccountsConfig, RpcSignatureSubscribeConfig},
+    rpc_response::RpcSignatureResult,
+    thin_client::{create_client, ThinClient},
+};
 use solana_core::{
     broadcast_stage::BroadcastStageType,
-    consensus::{SWITCH_FORK_THRESHOLD, VOTE_THRESHOLD_DEPTH},
+    cluster_info::VALIDATOR_PORT_RANGE,
+    consensus::{Tower, SWITCH_FORK_THRESHOLD, VOTE_THRESHOLD_DEPTH},
     gossip_service::discover_cluster,
+    optimistic_confirmation_verifier::OptimisticConfirmationVerifier,
     validator::ValidatorConfig,
 };
 use solana_download_utils::download_snapshot;
 use solana_ledger::{
-    blockstore::Blockstore, blockstore_db::AccessType, leader_schedule::FixedSchedule,
+    ancestor_iterator::AncestorIterator,
+    blockstore::{Blockstore, PurgeType},
+    blockstore_db::AccessType,
+    leader_schedule::FixedSchedule,
     leader_schedule::LeaderSchedule,
 };
 use solana_local_cluster::{
@@ -21,29 +32,32 @@ use solana_local_cluster::{
     local_cluster::{ClusterConfig, LocalCluster},
 };
 use solana_runtime::{
-    bank_forks::{CompressionType, SnapshotConfig},
+    bank_forks::{ArchiveFormat, SnapshotConfig},
     snapshot_utils,
 };
 use solana_sdk::{
+    account::Account,
     client::{AsyncClient, SyncClient},
     clock::{self, Slot},
     commitment_config::CommitmentConfig,
     epoch_schedule::MINIMUM_SLOTS_PER_EPOCH,
-    genesis_config::OperatingMode,
+    genesis_config::ClusterType,
     hash::Hash,
     poh_config::PohConfig,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
+    system_program, system_transaction,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use solana_vote_program::vote_state::MAX_LOCKOUT_HISTORY;
 use std::{
     collections::{HashMap, HashSet},
     fs,
     io::Read,
     iter,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
-    thread::sleep,
+    thread::{sleep, Builder, JoinHandle},
     time::Duration,
 };
 use tempfile::TempDir;
@@ -54,16 +68,18 @@ fn test_ledger_cleanup_service() {
     solana_logger::setup();
     error!("test_ledger_cleanup_service");
     let num_nodes = 3;
-    let mut validator_config = ValidatorConfig::default();
-    validator_config.max_ledger_shreds = Some(100);
-    let config = ClusterConfig {
+    let validator_config = ValidatorConfig {
+        max_ledger_shreds: Some(100),
+        ..ValidatorConfig::default()
+    };
+    let mut config = ClusterConfig {
         cluster_lamports: 10_000,
         poh_config: PohConfig::new_sleep(Duration::from_millis(50)),
         node_stakes: vec![100; num_nodes],
         validator_configs: vec![validator_config; num_nodes],
         ..ClusterConfig::default()
     };
-    let mut cluster = LocalCluster::new(&config);
+    let mut cluster = LocalCluster::new(&mut config);
     // 200ms/per * 100 = 20 seconds, so sleep a little longer than that.
     sleep(Duration::from_secs(60));
 
@@ -133,6 +149,79 @@ fn test_spend_and_verify_all_nodes_3() {
 }
 
 #[test]
+#[serial]
+fn test_local_cluster_signature_subscribe() {
+    solana_logger::setup();
+    let num_nodes = 2;
+    let cluster = LocalCluster::new_with_equal_stakes(num_nodes, 10_000, 100);
+    let nodes = cluster.get_node_pubkeys();
+
+    // Get non leader
+    let non_bootstrap_id = nodes
+        .into_iter()
+        .find(|id| *id != cluster.entry_point_info.id)
+        .unwrap();
+    let non_bootstrap_info = cluster.get_contact_info(&non_bootstrap_id).unwrap();
+
+    let tx_client = create_client(
+        non_bootstrap_info.client_facing_addr(),
+        VALIDATOR_PORT_RANGE,
+    );
+    let (blockhash, _fee_calculator, _last_valid_slot) = tx_client
+        .get_recent_blockhash_with_commitment(CommitmentConfig::processed())
+        .unwrap();
+
+    let mut transaction = system_transaction::transfer(
+        &cluster.funding_keypair,
+        &solana_sdk::pubkey::new_rand(),
+        10,
+        blockhash,
+    );
+
+    let (mut sig_subscribe_client, receiver) = PubsubClient::signature_subscribe(
+        &format!("ws://{}", &non_bootstrap_info.rpc_pubsub.to_string()),
+        &transaction.signatures[0],
+        Some(RpcSignatureSubscribeConfig {
+            commitment: Some(CommitmentConfig::processed()),
+            enable_received_notification: Some(true),
+        }),
+    )
+    .unwrap();
+
+    tx_client
+        .retry_transfer(&cluster.funding_keypair, &mut transaction, 5)
+        .unwrap();
+
+    let mut got_received_notification = false;
+    loop {
+        let responses: Vec<_> = receiver.try_iter().collect();
+        let mut should_break = false;
+        for response in responses {
+            match response.value {
+                RpcSignatureResult::ProcessedSignature(_) => {
+                    should_break = true;
+                    break;
+                }
+                RpcSignatureResult::ReceivedSignature(_) => {
+                    got_received_notification = true;
+                }
+            }
+        }
+
+        if should_break {
+            break;
+        }
+        sleep(Duration::from_millis(100));
+    }
+
+    // If we don't drop the cluster, the blocking web socket service
+    // won't return, and the `sig_subscribe_client` won't shut down
+    drop(cluster);
+    sig_subscribe_client.shutdown().unwrap();
+    assert!(got_received_notification);
+}
+
+#[test]
 #[allow(unused_attributes)]
 #[ignore]
 fn test_spend_and_verify_all_nodes_env_num_nodes() {
@@ -171,13 +260,13 @@ fn test_validator_exit_2() {
     validator_config.rpc_config.enable_validator_exit = true;
     validator_config.wait_for_supermajority = Some(0);
 
-    let config = ClusterConfig {
+    let mut config = ClusterConfig {
         cluster_lamports: 10_000,
         node_stakes: vec![100; num_nodes],
         validator_configs: vec![validator_config; num_nodes],
         ..ClusterConfig::default()
     };
-    let local = LocalCluster::new(&config);
+    let local = LocalCluster::new(&mut config);
     cluster_tests::validator_exit(&local.entry_point_info, num_nodes);
 }
 
@@ -190,13 +279,13 @@ fn test_leader_failure_4() {
     let num_nodes = 4;
     let mut validator_config = ValidatorConfig::default();
     validator_config.rpc_config.enable_validator_exit = true;
-    let config = ClusterConfig {
+    let mut config = ClusterConfig {
         cluster_lamports: 10_000,
         node_stakes: vec![100; 4],
         validator_configs: vec![validator_config; num_nodes],
         ..ClusterConfig::default()
     };
-    let local = LocalCluster::new(&config);
+    let local = LocalCluster::new(&mut config);
     cluster_tests::kill_entry_and_spend_and_verify_rest(
         &local.entry_point_info,
         &local.funding_keypair,
@@ -220,9 +309,10 @@ fn run_cluster_partition<E, F>(
     leader_schedule: Option<(LeaderSchedule, Vec<Arc<Keypair>>)>,
     on_partition_start: E,
     on_partition_resolved: F,
+    additional_accounts: Vec<(Pubkey, Account)>,
 ) where
-    E: Fn(&mut LocalCluster),
-    F: Fn(&mut LocalCluster),
+    E: FnOnce(&mut LocalCluster),
+    F: FnOnce(&mut LocalCluster),
 {
     solana_logger::setup();
     info!("PARTITION_TEST!");
@@ -234,8 +324,10 @@ fn run_cluster_partition<E, F>(
     assert_eq!(node_stakes.len(), num_nodes);
     let cluster_lamports = node_stakes.iter().sum::<u64>() * 2;
     let enable_partition = Arc::new(AtomicBool::new(true));
-    let mut validator_config = ValidatorConfig::default();
-    validator_config.enable_partition = Some(enable_partition.clone());
+    let mut validator_config = ValidatorConfig {
+        enable_partition: Some(enable_partition.clone()),
+        ..ValidatorConfig::default()
+    };
 
     // Returns:
     // 1) The keys for the validators
@@ -265,7 +357,7 @@ fn run_cluster_partition<E, F>(
     };
 
     let slots_per_epoch = 2048;
-    let config = ClusterConfig {
+    let mut config = ClusterConfig {
         cluster_lamports,
         node_stakes,
         validator_configs: vec![validator_config; num_nodes],
@@ -278,6 +370,7 @@ fn run_cluster_partition<E, F>(
         slots_per_epoch,
         stakers_slot_offset: slots_per_epoch,
         skip_warmup_slots: true,
+        additional_accounts,
         ..ClusterConfig::default()
     };
 
@@ -285,7 +378,7 @@ fn run_cluster_partition<E, F>(
         "PARTITION_TEST starting cluster with {:?} partitions slots_per_epoch: {}",
         partitions, config.slots_per_epoch,
     );
-    let mut cluster = LocalCluster::new(&config);
+    let mut cluster = LocalCluster::new(&mut config);
 
     info!("PARTITION_TEST spend_and_verify_all_nodes(), ensure all nodes are caught up");
     cluster_tests::spend_and_verify_all_nodes(
@@ -342,7 +435,7 @@ fn test_cluster_partition_1_2() {
     let on_partition_resolved = |cluster: &mut LocalCluster| {
         cluster.check_for_new_roots(16, &"PARTITION_TEST");
     };
-    run_cluster_partition(&[&[1], &[1, 1]], None, empty, on_partition_resolved)
+    run_cluster_partition(&[&[1], &[1, 1]], None, empty, on_partition_resolved, vec![])
 }
 
 #[allow(unused_attributes)]
@@ -354,7 +447,7 @@ fn test_cluster_partition_1_1() {
     let on_partition_resolved = |cluster: &mut LocalCluster| {
         cluster.check_for_new_roots(16, &"PARTITION_TEST");
     };
-    run_cluster_partition(&[&[1], &[1]], None, empty, on_partition_resolved)
+    run_cluster_partition(&[&[1], &[1]], None, empty, on_partition_resolved, vec![])
 }
 
 #[test]
@@ -364,7 +457,42 @@ fn test_cluster_partition_1_1_1() {
     let on_partition_resolved = |cluster: &mut LocalCluster| {
         cluster.check_for_new_roots(16, &"PARTITION_TEST");
     };
-    run_cluster_partition(&[&[1], &[1], &[1]], None, empty, on_partition_resolved)
+    run_cluster_partition(
+        &[&[1], &[1], &[1]],
+        None,
+        empty,
+        on_partition_resolved,
+        vec![],
+    )
+}
+
+fn create_custom_leader_schedule(
+    num_validators: usize,
+    num_slots_per_validator: usize,
+) -> (LeaderSchedule, Vec<Arc<Keypair>>) {
+    let mut leader_schedule = vec![];
+    let validator_keys: Vec<_> = iter::repeat_with(|| Arc::new(Keypair::new()))
+        .take(num_validators)
+        .collect();
+    for (i, k) in validator_keys.iter().enumerate() {
+        let num_slots = {
+            if i == 0 {
+                // Set up the leader to have 50% of the slots
+                num_slots_per_validator * (num_validators - 1)
+            } else {
+                num_slots_per_validator
+            }
+        };
+        for _ in 0..num_slots {
+            leader_schedule.push(k.pubkey())
+        }
+    }
+
+    info!("leader_schedule: {}", leader_schedule.len());
+    (
+        LeaderSchedule::new_from_schedule(leader_schedule),
+        validator_keys,
+    )
 }
 
 #[test]
@@ -378,26 +506,10 @@ fn test_kill_heaviest_partition() {
     // 3) Kills the most staked partition. Validators are locked out, but should all
     // eventually choose the major partition
     // 4) Check for recovery
-    let mut leader_schedule = vec![];
     let num_slots_per_validator = 8;
     let partitions: [&[usize]; 4] = [&[11], &[10], &[10], &[10]];
-    let validator_keys: Vec<_> = iter::repeat_with(|| Arc::new(Keypair::new()))
-        .take(partitions.len())
-        .collect();
-    for (i, k) in validator_keys.iter().enumerate() {
-        let num_slots = {
-            if i == 0 {
-                // Set up the leader to have 50% of the slots
-                num_slots_per_validator * (partitions.len() - 1)
-            } else {
-                num_slots_per_validator
-            }
-        };
-        for _ in 0..num_slots {
-            leader_schedule.push(k.pubkey())
-        }
-    }
-    info!("leader_schedule: {}", leader_schedule.len());
+    let (leader_schedule, validator_keys) =
+        create_custom_leader_schedule(partitions.len(), num_slots_per_validator);
 
     let empty = |_: &mut LocalCluster| {};
     let validator_to_kill = validator_keys[0].pubkey();
@@ -408,12 +520,10 @@ fn test_kill_heaviest_partition() {
     };
     run_cluster_partition(
         &partitions,
-        Some((
-            LeaderSchedule::new_from_schedule(leader_schedule),
-            validator_keys,
-        )),
+        Some((leader_schedule, validator_keys)),
         empty,
         on_partition_resolved,
+        vec![],
     )
 }
 
@@ -438,30 +548,14 @@ fn run_kill_partition_switch_threshold<F>(
     // 1) Spins up three partitions
     // 2) Kills the first partition with the stake `failures_stake`
     // 5) runs `on_partition_resolved`
-    let mut leader_schedule = vec![];
     let num_slots_per_validator = 8;
     let partitions: [&[usize]; 3] = [
         &[(failures_stake as usize)],
         &[(alive_stake_1 as usize)],
         &[(alive_stake_2 as usize)],
     ];
-    let validator_keys: Vec<_> = iter::repeat_with(|| Arc::new(Keypair::new()))
-        .take(partitions.len())
-        .collect();
-    for (i, k) in validator_keys.iter().enumerate() {
-        let num_slots = {
-            if i == 0 {
-                // Set up the leader to have 50% of the slots
-                num_slots_per_validator * (partitions.len() - 1)
-            } else {
-                num_slots_per_validator
-            }
-        };
-        for _ in 0..num_slots {
-            leader_schedule.push(k.pubkey())
-        }
-    }
-    info!("leader_schedule: {}", leader_schedule.len());
+    let (leader_schedule, validator_keys) =
+        create_custom_leader_schedule(partitions.len(), num_slots_per_validator);
 
     let validator_to_kill = validator_keys[0].pubkey();
     let on_partition_start = |cluster: &mut LocalCluster| {
@@ -470,12 +564,10 @@ fn run_kill_partition_switch_threshold<F>(
     };
     run_cluster_partition(
         &partitions,
-        Some((
-            LeaderSchedule::new_from_schedule(leader_schedule),
-            validator_keys,
-        )),
+        Some((leader_schedule, validator_keys)),
         on_partition_start,
         on_partition_resolved,
+        vec![],
     )
 }
 
@@ -559,7 +651,7 @@ fn test_two_unbalanced_stakes() {
     let num_slots_per_epoch = MINIMUM_SLOTS_PER_EPOCH as u64;
 
     validator_config.rpc_config.enable_validator_exit = true;
-    let mut cluster = LocalCluster::new(&ClusterConfig {
+    let mut cluster = LocalCluster::new(&mut ClusterConfig {
         node_stakes: vec![999_990, 3],
         cluster_lamports: 1_000_000,
         validator_configs: vec![validator_config; 2],
@@ -587,13 +679,13 @@ fn test_two_unbalanced_stakes() {
 fn test_forwarding() {
     // Set up a cluster where one node is never the leader, so all txs sent to this node
     // will be have to be forwarded in order to be confirmed
-    let config = ClusterConfig {
+    let mut config = ClusterConfig {
         node_stakes: vec![999_990, 3],
         cluster_lamports: 2_000_000,
         validator_configs: vec![ValidatorConfig::default(); 2],
         ..ClusterConfig::default()
     };
-    let cluster = LocalCluster::new(&config);
+    let cluster = LocalCluster::new(&mut config);
 
     let cluster_nodes = discover_cluster(&cluster.entry_point_info.gossip, 2).unwrap();
     assert!(cluster_nodes.len() >= 2);
@@ -614,10 +706,10 @@ fn test_forwarding() {
 fn test_restart_node() {
     solana_logger::setup();
     error!("test_restart_node");
-    let slots_per_epoch = MINIMUM_SLOTS_PER_EPOCH * 2 as u64;
+    let slots_per_epoch = MINIMUM_SLOTS_PER_EPOCH * 2;
     let ticks_per_slot = 16;
     let validator_config = ValidatorConfig::default();
-    let mut cluster = LocalCluster::new(&ClusterConfig {
+    let mut cluster = LocalCluster::new(&mut ClusterConfig {
         node_stakes: vec![100; 1],
         cluster_lamports: 100,
         validator_configs: vec![validator_config.clone()],
@@ -651,31 +743,31 @@ fn test_restart_node() {
 #[test]
 #[serial]
 fn test_listener_startup() {
-    let config = ClusterConfig {
+    let mut config = ClusterConfig {
         node_stakes: vec![100; 1],
         cluster_lamports: 1_000,
         num_listeners: 3,
         validator_configs: vec![ValidatorConfig::default(); 1],
         ..ClusterConfig::default()
     };
-    let cluster = LocalCluster::new(&config);
+    let cluster = LocalCluster::new(&mut config);
     let cluster_nodes = discover_cluster(&cluster.entry_point_info.gossip, 4).unwrap();
     assert_eq!(cluster_nodes.len(), 4);
 }
 
 #[test]
 #[serial]
-fn test_stable_operating_mode() {
+fn test_mainnet_beta_cluster_type() {
     solana_logger::setup();
 
-    let config = ClusterConfig {
-        operating_mode: OperatingMode::Stable,
+    let mut config = ClusterConfig {
+        cluster_type: ClusterType::MainnetBeta,
         node_stakes: vec![100; 1],
         cluster_lamports: 1_000,
         validator_configs: vec![ValidatorConfig::default(); 1],
         ..ClusterConfig::default()
     };
-    let cluster = LocalCluster::new(&config);
+    let cluster = LocalCluster::new(&mut config);
     let cluster_nodes = discover_cluster(&cluster.entry_point_info.gossip, 1).unwrap();
     assert_eq!(cluster_nodes.len(), 1);
 
@@ -690,6 +782,8 @@ fn test_stable_operating_mode() {
         &solana_sdk::system_program::id(),
         &solana_stake_program::id(),
         &solana_vote_program::id(),
+        &solana_sdk::bpf_loader_deprecated::id(),
+        &solana_sdk::bpf_loader::id(),
     ]
     .iter()
     {
@@ -697,7 +791,7 @@ fn test_stable_operating_mode() {
             (
                 program_id,
                 client
-                    .get_account_with_commitment(program_id, CommitmentConfig::recent())
+                    .get_account_with_commitment(program_id, CommitmentConfig::processed())
                     .unwrap()
             ),
             (_program_id, Some(_))
@@ -706,8 +800,7 @@ fn test_stable_operating_mode() {
 
     // Programs that are not available at epoch 0
     for program_id in [
-        &solana_sdk::bpf_loader::id(),
-        &solana_sdk::bpf_loader_deprecated::id(),
+        &solana_sdk::bpf_loader_upgradeable::id(),
         &solana_vest_program::id(),
     ]
     .iter()
@@ -716,7 +809,7 @@ fn test_stable_operating_mode() {
             (
                 program_id,
                 client
-                    .get_account_with_commitment(program_id, CommitmentConfig::recent())
+                    .get_account_with_commitment(program_id, CommitmentConfig::processed())
                     .unwrap()
             ),
             (program_id, None)
@@ -733,7 +826,7 @@ fn generate_frozen_account_panic(mut cluster: LocalCluster, frozen_account: Arc<
     trace!(
         "validator slot: {}",
         client
-            .get_slot_with_commitment(CommitmentConfig::recent())
+            .get_slot_with_commitment(CommitmentConfig::processed())
             .expect("get slot")
     );
 
@@ -745,10 +838,15 @@ fn generate_frozen_account_panic(mut cluster: LocalCluster, frozen_account: Arc<
     while !solana_runtime::accounts_db::FROZEN_ACCOUNT_PANIC.load(Ordering::Relaxed) {
         // Transfer from frozen account
         let (blockhash, _fee_calculator, _last_valid_slot) = client
-            .get_recent_blockhash_with_commitment(CommitmentConfig::recent())
+            .get_recent_blockhash_with_commitment(CommitmentConfig::processed())
             .unwrap();
         client
-            .async_transfer(1, &frozen_account, &Pubkey::new_rand(), blockhash)
+            .async_transfer(
+                1,
+                &frozen_account,
+                &solana_sdk::pubkey::new_rand(),
+                blockhash,
+            )
             .unwrap();
 
         sleep(Duration::from_secs(1));
@@ -771,7 +869,7 @@ fn test_frozen_account_from_genesis() {
     let validator_identity =
         Arc::new(solana_sdk::signature::keypair_from_seed(&[0u8; 32]).unwrap());
 
-    let config = ClusterConfig {
+    let mut config = ClusterConfig {
         validator_keys: Some(vec![(validator_identity.clone(), true)]),
         node_stakes: vec![100; 1],
         cluster_lamports: 1_000,
@@ -785,7 +883,7 @@ fn test_frozen_account_from_genesis() {
         ],
         ..ClusterConfig::default()
     };
-    generate_frozen_account_panic(LocalCluster::new(&config), validator_identity);
+    generate_frozen_account_panic(LocalCluster::new(&mut config), validator_identity);
 }
 
 #[test]
@@ -799,14 +897,14 @@ fn test_frozen_account_from_snapshot() {
     // Freeze the validator identity account
     snapshot_test_config.validator_config.frozen_accounts = vec![validator_identity.pubkey()];
 
-    let config = ClusterConfig {
+    let mut config = ClusterConfig {
         validator_keys: Some(vec![(validator_identity.clone(), true)]),
         node_stakes: vec![100; 1],
         cluster_lamports: 1_000,
         validator_configs: vec![snapshot_test_config.validator_config.clone()],
         ..ClusterConfig::default()
     };
-    let mut cluster = LocalCluster::new(&config);
+    let mut cluster = LocalCluster::new(&mut config);
 
     let snapshot_package_output_path = &snapshot_test_config
         .validator_config
@@ -843,14 +941,14 @@ fn test_consistency_halt() {
         .accounts_hash_fault_injection_slots = 40;
 
     let validator_stake = 10_000;
-    let config = ClusterConfig {
+    let mut config = ClusterConfig {
         node_stakes: vec![validator_stake],
         cluster_lamports: 100_000,
         validator_configs: vec![leader_snapshot_test_config.validator_config],
         ..ClusterConfig::default()
     };
 
-    let mut cluster = LocalCluster::new(&config);
+    let mut cluster = LocalCluster::new(&mut config);
 
     sleep(Duration::from_millis(5000));
     let cluster_nodes = discover_cluster(&cluster.entry_point_info.gossip, 1).unwrap();
@@ -931,14 +1029,14 @@ fn test_snapshot_download() {
         setup_snapshot_validator_config(snapshot_interval_slots, num_account_paths);
 
     let stake = 10_000;
-    let config = ClusterConfig {
+    let mut config = ClusterConfig {
         node_stakes: vec![stake],
         cluster_lamports: 1_000_000,
         validator_configs: vec![leader_snapshot_test_config.validator_config.clone()],
         ..ClusterConfig::default()
     };
 
-    let mut cluster = LocalCluster::new(&config);
+    let mut cluster = LocalCluster::new(&mut config);
 
     // Get slot after which this was generated
     let snapshot_package_output_path = &leader_snapshot_test_config
@@ -954,9 +1052,12 @@ fn test_snapshot_download() {
 
     trace!("found: {:?}", archive_filename);
     let validator_archive_path = snapshot_utils::get_snapshot_archive_path(
-        &validator_snapshot_test_config.snapshot_output_path,
+        validator_snapshot_test_config
+            .snapshot_output_path
+            .path()
+            .to_path_buf(),
         &archive_snapshot_hash,
-        &CompressionType::Bzip2,
+        ArchiveFormat::TarBzip2,
     );
 
     // Download the snapshot, then boot a validator from it.
@@ -964,6 +1065,7 @@ fn test_snapshot_download() {
         &cluster.entry_point_info.rpc,
         &validator_archive_path,
         archive_snapshot_hash,
+        false,
     )
     .unwrap();
 
@@ -989,7 +1091,7 @@ fn test_snapshot_restart_tower() {
     let validator_snapshot_test_config =
         setup_snapshot_validator_config(snapshot_interval_slots, num_account_paths);
 
-    let config = ClusterConfig {
+    let mut config = ClusterConfig {
         node_stakes: vec![10000, 10],
         cluster_lamports: 100_000,
         validator_configs: vec![
@@ -999,7 +1101,7 @@ fn test_snapshot_restart_tower() {
         ..ClusterConfig::default()
     };
 
-    let mut cluster = LocalCluster::new(&config);
+    let mut cluster = LocalCluster::new(&mut config);
 
     // Let the nodes run for a while, then stop one of the validators
     sleep(Duration::from_millis(5000));
@@ -1023,9 +1125,12 @@ fn test_snapshot_restart_tower() {
 
     // Copy archive to validator's snapshot output directory
     let validator_archive_path = snapshot_utils::get_snapshot_archive_path(
-        &validator_snapshot_test_config.snapshot_output_path,
+        validator_snapshot_test_config
+            .snapshot_output_path
+            .path()
+            .to_path_buf(),
         &archive_snapshot_hash,
-        &CompressionType::Bzip2,
+        ArchiveFormat::TarBzip2,
     );
     fs::hard_link(archive_filename, &validator_archive_path).unwrap();
 
@@ -1065,14 +1170,14 @@ fn test_snapshots_blockstore_floor() {
         .unwrap()
         .snapshot_package_output_path;
 
-    let config = ClusterConfig {
+    let mut config = ClusterConfig {
         node_stakes: vec![10000],
         cluster_lamports: 100_000,
         validator_configs: vec![leader_snapshot_test_config.validator_config.clone()],
         ..ClusterConfig::default()
     };
 
-    let mut cluster = LocalCluster::new(&config);
+    let mut cluster = LocalCluster::new(&mut config);
 
     trace!("Waiting for snapshot tar to be generated with slot",);
 
@@ -1088,9 +1193,12 @@ fn test_snapshots_blockstore_floor() {
 
     // Copy archive to validator's snapshot output directory
     let validator_archive_path = snapshot_utils::get_snapshot_archive_path(
-        &validator_snapshot_test_config.snapshot_output_path,
+        validator_snapshot_test_config
+            .snapshot_output_path
+            .path()
+            .to_path_buf(),
         &(archive_slot, archive_hash),
-        &CompressionType::Bzip2,
+        ArchiveFormat::TarBzip2,
     );
     fs::hard_link(archive_filename, &validator_archive_path).unwrap();
     let slot_floor = archive_slot;
@@ -1123,7 +1231,7 @@ fn test_snapshots_blockstore_floor() {
     let target_slot = slot_floor + 40;
     while current_slot <= target_slot {
         trace!("current_slot: {}", current_slot);
-        if let Ok(slot) = validator_client.get_slot_with_commitment(CommitmentConfig::recent()) {
+        if let Ok(slot) = validator_client.get_slot_with_commitment(CommitmentConfig::processed()) {
             current_slot = slot;
         } else {
             continue;
@@ -1165,7 +1273,7 @@ fn test_snapshots_restart_validity() {
         &mut snapshot_test_config.account_storage_dirs,
     );
 
-    let config = ClusterConfig {
+    let mut config = ClusterConfig {
         node_stakes: vec![10000],
         cluster_lamports: 100_000,
         validator_configs: vec![snapshot_test_config.validator_config.clone()],
@@ -1175,7 +1283,7 @@ fn test_snapshots_restart_validity() {
     // Create and reboot the node from snapshot `num_runs` times
     let num_runs = 3;
     let mut expected_balances = HashMap::new();
-    let mut cluster = LocalCluster::new(&config);
+    let mut cluster = LocalCluster::new(&mut config);
     for i in 1..num_runs {
         info!("run {}", i);
         // Push transactions to one of the nodes and confirm that transactions were
@@ -1237,27 +1345,50 @@ fn test_fake_shreds_broadcast_leader() {
 fn test_faulty_node(faulty_node_type: BroadcastStageType) {
     solana_logger::setup();
     let num_nodes = 2;
-    let validator_config = ValidatorConfig::default();
-    let mut error_validator_config = ValidatorConfig::default();
-    error_validator_config.broadcast_stage_type = faulty_node_type;
-    let mut validator_configs = vec![validator_config; num_nodes - 1];
+    let error_validator_config = ValidatorConfig {
+        broadcast_stage_type: faulty_node_type,
+        ..ValidatorConfig::default()
+    };
+    let mut validator_configs = Vec::with_capacity(num_nodes - 1);
+    validator_configs.resize_with(num_nodes - 1, ValidatorConfig::default);
+
     // Push a faulty_bootstrap = vec![error_validator_config];
     validator_configs.insert(0, error_validator_config);
     let node_stakes = vec![300, 100];
     assert_eq!(node_stakes.len(), num_nodes);
-    let cluster_config = ClusterConfig {
+    let mut cluster_config = ClusterConfig {
         cluster_lamports: 10_000,
         node_stakes,
         validator_configs,
-        slots_per_epoch: MINIMUM_SLOTS_PER_EPOCH * 2 as u64,
-        stakers_slot_offset: MINIMUM_SLOTS_PER_EPOCH * 2 as u64,
+        slots_per_epoch: MINIMUM_SLOTS_PER_EPOCH * 2,
+        stakers_slot_offset: MINIMUM_SLOTS_PER_EPOCH * 2,
         ..ClusterConfig::default()
     };
 
-    let cluster = LocalCluster::new(&cluster_config);
+    let cluster = LocalCluster::new(&mut cluster_config);
 
     // Check for new roots
     cluster.check_for_new_roots(16, &"test_faulty_node");
+}
+
+#[test]
+fn test_wait_for_max_stake() {
+    solana_logger::setup();
+    let mut validator_config = ValidatorConfig::default();
+    validator_config.rpc_config.enable_validator_exit = true;
+    let mut config = ClusterConfig {
+        cluster_lamports: 10_000,
+        node_stakes: vec![100; 4],
+        validator_configs: vec![validator_config; 4],
+        ..ClusterConfig::default()
+    };
+    let cluster = LocalCluster::new(&mut config);
+    let client = RpcClient::new_socket(cluster.entry_point_info.rpc);
+
+    assert!(client
+        .wait_for_max_stake(CommitmentConfig::default(), 33.0f32)
+        .is_ok());
+    assert!(client.get_slot().unwrap() > 10);
 }
 
 #[test]
@@ -1268,19 +1399,19 @@ fn test_no_voting() {
     let mut validator_config = ValidatorConfig::default();
     validator_config.rpc_config.enable_validator_exit = true;
     validator_config.voting_disabled = true;
-    let config = ClusterConfig {
+    let mut config = ClusterConfig {
         cluster_lamports: 10_000,
         node_stakes: vec![100],
         validator_configs: vec![validator_config],
         ..ClusterConfig::default()
     };
-    let mut cluster = LocalCluster::new(&config);
+    let mut cluster = LocalCluster::new(&mut config);
     let client = cluster
         .get_validator_client(&cluster.entry_point_info.id)
         .unwrap();
     loop {
         let last_slot = client
-            .get_slot_with_commitment(CommitmentConfig::recent())
+            .get_slot_with_commitment(CommitmentConfig::processed())
             .expect("Couldn't get slot");
         if last_slot > 4 * VOTE_THRESHOLD_DEPTH as u64 {
             break;
@@ -1301,18 +1432,26 @@ fn test_no_voting() {
 }
 
 #[test]
-fn test_optimistic_confirmation_violation() {
+#[serial]
+fn test_optimistic_confirmation_violation_detection() {
     solana_logger::setup();
-    let mut buf = BufferRedirect::stderr().unwrap();
+    let buf = std::env::var("OPTIMISTIC_CONF_TEST_DUMP_LOG")
+        .err()
+        .map(|_| BufferRedirect::stderr().unwrap());
     // First set up the cluster with 2 nodes
     let slots_per_epoch = 2048;
-    let node_stakes = vec![50, 51];
-    let validator_keys: Vec<_> = iter::repeat_with(|| (Arc::new(Keypair::new()), true))
-        .take(node_stakes.len())
-        .collect();
-    let config = ClusterConfig {
+    let node_stakes = vec![51, 50];
+    let validator_keys: Vec<_> = vec![
+        "4qhhXNTbKD1a5vxDDLZcHKj7ELNeiivtUBxn3wUK1F5VRsQVP89VUhfXqSfgiFB14GfuBgtrQ96n9NvWQADVkcCg",
+        "3kHBzVwie5vTEaY6nFCPeFT8qDpoXzn7dCEioGRNBTnUDpvwnG85w8Wq63gVWpVTP8k2a8cgcWRjSXyUkEygpXWS",
+    ]
+    .iter()
+    .map(|s| (Arc::new(Keypair::from_base58_string(s)), true))
+    .take(node_stakes.len())
+    .collect();
+    let mut config = ClusterConfig {
         cluster_lamports: 100_000,
-        node_stakes: vec![51, 50],
+        node_stakes: node_stakes.clone(),
         validator_configs: vec![ValidatorConfig::default(); node_stakes.len()],
         validator_keys: Some(validator_keys),
         slots_per_epoch,
@@ -1320,7 +1459,7 @@ fn test_optimistic_confirmation_violation() {
         skip_warmup_slots: true,
         ..ClusterConfig::default()
     };
-    let mut cluster = LocalCluster::new(&config);
+    let mut cluster = LocalCluster::new(&mut config);
     let entry_point_id = cluster.entry_point_info.id;
     // Let the nodes run for a while. Wait for validators to vote on slot `S`
     // so that the vote on `S-1` is definitely in gossip and optimistic confirmation is
@@ -1330,7 +1469,7 @@ fn test_optimistic_confirmation_violation() {
     let mut prev_voted_slot = 0;
     loop {
         let last_voted_slot = client
-            .get_slot_with_commitment(CommitmentConfig::recent())
+            .get_slot_with_commitment(CommitmentConfig::processed())
             .unwrap();
         if last_voted_slot > 50 {
             if prev_voted_slot == 0 {
@@ -1346,23 +1485,18 @@ fn test_optimistic_confirmation_violation() {
 
     // Mark fork as dead on the heavier validator, this should make the fork effectively
     // dead, even though it was optimistically confirmed. The smaller validator should
-    // jump over to the new fork
+    // create and jump over to a new fork
+    // Also, remove saved tower to intentionally make the restarted validator to violate the
+    // optimistic confirmation
     {
-        let blockstore = Blockstore::open_with_access_type(
-            &exited_validator_info.info.ledger_path,
-            AccessType::PrimaryOnly,
-            None,
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "Failed to open ledger at {:?}, err: {}",
-                exited_validator_info.info.ledger_path, e
-            );
-        });
+        let blockstore = open_blockstore(&exited_validator_info.info.ledger_path);
         info!(
             "Setting slot: {} on main fork as dead, should cause fork",
             prev_voted_slot
         );
+        // marking this voted slot as dead makes the saved tower garbage
+        // effectively. That's because its stray last vote becomes stale (= no
+        // ancestor in bank forks).
         blockstore.set_dead_slot(prev_voted_slot).unwrap();
     }
     cluster.restart_node(&entry_point_id, exited_validator_info);
@@ -1373,7 +1507,7 @@ fn test_optimistic_confirmation_violation() {
     let client = cluster.get_validator_client(&entry_point_id).unwrap();
     loop {
         let last_root = client
-            .get_slot_with_commitment(CommitmentConfig::max())
+            .get_slot_with_commitment(CommitmentConfig::finalized())
             .unwrap();
         if last_root > prev_voted_slot {
             break;
@@ -1390,10 +1524,874 @@ fn test_optimistic_confirmation_violation() {
 
     // Check to see that validator detected optimistic confirmation for
     // `prev_voted_slot` failed
-    let expected_log = format!("Optimistic slot {} was not rooted", prev_voted_slot);
-    let mut output = String::new();
-    buf.read_to_string(&mut output).unwrap();
-    assert!(output.contains(&expected_log));
+    let expected_log =
+        OptimisticConfirmationVerifier::format_optimistic_confirmd_slot_violation_log(
+            prev_voted_slot,
+        );
+    if let Some(mut buf) = buf {
+        let mut output = String::new();
+        buf.read_to_string(&mut output).unwrap();
+        assert!(output.contains(&expected_log));
+    } else {
+        panic!("dumped log and disaled testing");
+    }
+}
+
+#[test]
+#[serial]
+fn test_validator_saves_tower() {
+    solana_logger::setup();
+
+    let validator_config = ValidatorConfig {
+        require_tower: true,
+        ..ValidatorConfig::default()
+    };
+    let validator_identity_keypair = Arc::new(Keypair::new());
+    let validator_id = validator_identity_keypair.pubkey();
+    let mut config = ClusterConfig {
+        cluster_lamports: 10_000,
+        node_stakes: vec![100],
+        validator_configs: vec![validator_config],
+        validator_keys: Some(vec![(validator_identity_keypair.clone(), true)]),
+        ..ClusterConfig::default()
+    };
+    let mut cluster = LocalCluster::new(&mut config);
+
+    let validator_client = cluster.get_validator_client(&validator_id).unwrap();
+
+    let ledger_path = cluster
+        .validators
+        .get(&validator_id)
+        .unwrap()
+        .info
+        .ledger_path
+        .clone();
+
+    // Wait for some votes to be generated
+    let mut last_replayed_root;
+    loop {
+        if let Ok(slot) = validator_client.get_slot_with_commitment(CommitmentConfig::processed()) {
+            trace!("current slot: {}", slot);
+            if slot > 2 {
+                // this will be the root next time a validator starts
+                last_replayed_root = slot;
+                break;
+            }
+        }
+        sleep(Duration::from_millis(10));
+    }
+
+    // Stop validator and check saved tower
+    let validator_info = cluster.exit_node(&validator_id);
+    let tower1 = Tower::restore(&ledger_path, &validator_id).unwrap();
+    trace!("tower1: {:?}", tower1);
+    assert_eq!(tower1.root(), 0);
+
+    // Restart the validator and wait for a new root
+    cluster.restart_node(&validator_id, validator_info);
+    let validator_client = cluster.get_validator_client(&validator_id).unwrap();
+
+    // Wait for the first root
+    loop {
+        #[allow(deprecated)]
+        // This test depends on knowing the immediate root, without any delay from the commitment
+        // service, so the deprecated CommitmentConfig::root() is retained
+        if let Ok(root) = validator_client.get_slot_with_commitment(CommitmentConfig::root()) {
+            trace!("current root: {}", root);
+            if root > last_replayed_root + 1 {
+                last_replayed_root = root;
+                break;
+            }
+        }
+        sleep(Duration::from_millis(50));
+    }
+
+    // Stop validator, and check saved tower
+    let recent_slot = validator_client
+        .get_slot_with_commitment(CommitmentConfig::processed())
+        .unwrap();
+    let validator_info = cluster.exit_node(&validator_id);
+    let tower2 = Tower::restore(&ledger_path, &validator_id).unwrap();
+    trace!("tower2: {:?}", tower2);
+    assert_eq!(tower2.root(), last_replayed_root);
+    last_replayed_root = recent_slot;
+
+    // Rollback saved tower to `tower1` to simulate a validator starting from a newer snapshot
+    // without having to wait for that snapshot to be generated in this test
+    tower1.save(&validator_identity_keypair).unwrap();
+
+    cluster.restart_node(&validator_id, validator_info);
+    let validator_client = cluster.get_validator_client(&validator_id).unwrap();
+
+    // Wait for a new root, demonstrating the validator was able to make progress from the older `tower1`
+    loop {
+        #[allow(deprecated)]
+        // This test depends on knowing the immediate root, without any delay from the commitment
+        // service, so the deprecated CommitmentConfig::root() is retained
+        if let Ok(root) = validator_client.get_slot_with_commitment(CommitmentConfig::root()) {
+            trace!(
+                "current root: {}, last_replayed_root: {}",
+                root,
+                last_replayed_root
+            );
+            if root > last_replayed_root {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(50));
+    }
+
+    // Check the new root is reflected in the saved tower state
+    let mut validator_info = cluster.exit_node(&validator_id);
+    let tower3 = Tower::restore(&ledger_path, &validator_id).unwrap();
+    trace!("tower3: {:?}", tower3);
+    assert!(tower3.root() > last_replayed_root);
+
+    // Remove the tower file entirely and allow the validator to start without a tower.  It will
+    // rebuild tower from its vote account contents
+    remove_tower(&ledger_path, &validator_id);
+    validator_info.config.require_tower = false;
+
+    cluster.restart_node(&validator_id, validator_info);
+    let validator_client = cluster.get_validator_client(&validator_id).unwrap();
+
+    // Wait for a couple more slots to pass so another vote occurs
+    let current_slot = validator_client
+        .get_slot_with_commitment(CommitmentConfig::processed())
+        .unwrap();
+    loop {
+        if let Ok(slot) = validator_client.get_slot_with_commitment(CommitmentConfig::processed()) {
+            trace!("current_slot: {}, slot: {}", current_slot, slot);
+            if slot > current_slot + 1 {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(50));
+    }
+
+    cluster.close_preserve_ledgers();
+
+    let tower4 = Tower::restore(&ledger_path, &validator_id).unwrap();
+    trace!("tower4: {:?}", tower4);
+    // should tower4 advance 1 slot compared to tower3????
+    assert_eq!(tower4.root(), tower3.root() + 1);
+}
+
+fn open_blockstore(ledger_path: &Path) -> Blockstore {
+    Blockstore::open_with_access_type(ledger_path, AccessType::PrimaryOnly, None, true)
+        .unwrap_or_else(|e| {
+            panic!("Failed to open ledger at {:?}, err: {}", ledger_path, e);
+        })
+}
+
+fn purge_slots(blockstore: &Blockstore, start_slot: Slot, slot_count: Slot) {
+    blockstore.purge_from_next_slots(start_slot, start_slot + slot_count);
+    blockstore.purge_slots(start_slot, start_slot + slot_count, PurgeType::Exact);
+}
+
+fn restore_tower(ledger_path: &Path, node_pubkey: &Pubkey) -> Option<Tower> {
+    let tower = Tower::restore(&ledger_path, &node_pubkey);
+    if let Err(tower_err) = tower {
+        if tower_err.is_file_missing() {
+            return None;
+        } else {
+            panic!("tower restore failed...: {:?}", tower_err);
+        }
+    }
+    // actually saved tower must have at least one vote.
+    Tower::restore(&ledger_path, &node_pubkey).ok()
+}
+
+fn last_vote_in_tower(ledger_path: &Path, node_pubkey: &Pubkey) -> Option<Slot> {
+    restore_tower(ledger_path, node_pubkey).map(|tower| tower.last_voted_slot().unwrap())
+}
+
+fn root_in_tower(ledger_path: &Path, node_pubkey: &Pubkey) -> Option<Slot> {
+    restore_tower(ledger_path, node_pubkey).map(|tower| tower.root())
+}
+
+fn remove_tower(ledger_path: &Path, node_pubkey: &Pubkey) {
+    fs::remove_file(Tower::get_filename(&ledger_path, &node_pubkey)).unwrap();
+}
+
+// A bit convoluted test case; but this roughly follows this test theoretical scenario:
+//
+// Step 1: You have validator A + B with 31% and 36% of the stake:
+//
+//  S0 -> S1 -> S2 -> S3 (A + B vote, optimistically confirmed)
+//
+// Step 2: Turn off A + B, and truncate the ledger after slot `S3` (simulate votes not
+// landing in next slot).
+// Start validator C with 33% of the stake with same ledger, but only up to slot S2.
+// Have `C` generate some blocks like:
+//
+// S0 -> S1 -> S2 -> S4
+//
+// Step 3: Then restart `A` which had 31% of the stake. With the tower, from `A`'s
+// perspective it sees:
+//
+// S0 -> S1 -> S2 -> S3 (voted)
+//             |
+//             -> S4 -> S5 (C's vote for S4)
+//
+// The fork choice rule weights look like:
+//
+// S0 -> S1 -> S2 (ABC) -> S3
+//             |
+//             -> S4 (C) -> S5
+//
+// Step 4:
+// Without the persisted tower:
+//    `A` would choose to vote on the fork with `S4 -> S5`. This is true even if `A`
+//    generates a new fork starting at slot `S3` because `C` has more stake than `A`
+//    so `A` will eventually pick the fork `C` is on.
+//
+//    Furthermore `B`'s vote on `S3` is not observable because there are no
+//    descendants of slot `S3`, so that fork will not be chosen over `C`'s fork
+//
+// With the persisted tower:
+//    `A` should not be able to generate a switching proof.
+//
+fn do_test_optimistic_confirmation_violation_with_or_without_tower(with_tower: bool) {
+    solana_logger::setup();
+
+    // First set up the cluster with 4 nodes
+    let slots_per_epoch = 2048;
+    let node_stakes = vec![31, 36, 33, 0];
+
+    // Each pubkeys are prefixed with A, B, C and D.
+    // D is needed to:
+    // 1) Propagate A's votes for S2 to validator C after A shuts down so that
+    // C can avoid NoPropagatedConfirmation errors and continue to generate blocks
+    // 2) Provide gossip discovery for `A` when it restarts because `A` will restart
+    // at a different gossip port than the entrypoint saved in C's gossip table
+    let validator_keys = vec![
+        "28bN3xyvrP4E8LwEgtLjhnkb7cY4amQb6DrYAbAYjgRV4GAGgkVM2K7wnxnAS7WDneuavza7x21MiafLu1HkwQt4",
+        "2saHBBoTkLMmttmPQP8KfBkcCw45S5cwtV3wTdGCscRC8uxdgvHxpHiWXKx4LvJjNJtnNcbSv5NdheokFFqnNDt8",
+        "4mx9yoFBeYasDKBGDWCTWGJdWuJCKbgqmuP8bN9umybCh5Jzngw7KQxe99Rf5uzfyzgba1i65rJW4Wqk7Ab5S8ye",
+        "3zsEPEDsjfEay7te9XqNjRTCE7vwuT6u4DHzBJC19yp7GS8BuNRMRjnpVrKCBzb3d44kxc4KPGSHkCmk6tEfswCg",
+    ]
+    .iter()
+    .map(|s| (Arc::new(Keypair::from_base58_string(s)), true))
+    .take(node_stakes.len())
+    .collect::<Vec<_>>();
+    let validators = validator_keys
+        .iter()
+        .map(|(kp, _)| kp.pubkey())
+        .collect::<Vec<_>>();
+    let (validator_a_pubkey, validator_b_pubkey, validator_c_pubkey) =
+        (validators[0], validators[1], validators[2]);
+
+    let mut config = ClusterConfig {
+        cluster_lamports: 100_000,
+        node_stakes: node_stakes.clone(),
+        validator_configs: vec![ValidatorConfig::default(); node_stakes.len()],
+        validator_keys: Some(validator_keys),
+        slots_per_epoch,
+        stakers_slot_offset: slots_per_epoch,
+        skip_warmup_slots: true,
+        ..ClusterConfig::default()
+    };
+    let mut cluster = LocalCluster::new(&mut config);
+
+    let base_slot = 26; // S2
+    let next_slot_on_a = 27; // S3
+    let truncated_slots = 100; // just enough to purge all following slots after the S2 and S3
+
+    let val_a_ledger_path = cluster.ledger_path(&validator_a_pubkey);
+    let val_b_ledger_path = cluster.ledger_path(&validator_b_pubkey);
+    let val_c_ledger_path = cluster.ledger_path(&validator_c_pubkey);
+
+    // Immediately kill validator C
+    let validator_c_info = cluster.exit_node(&validator_c_pubkey);
+
+    // Step 1:
+    // Let validator A, B, (D) run for a while.
+    let (mut validator_a_finished, mut validator_b_finished) = (false, false);
+    while !(validator_a_finished && validator_b_finished) {
+        sleep(Duration::from_millis(100));
+
+        if let Some(last_vote) = last_vote_in_tower(&val_a_ledger_path, &validator_a_pubkey) {
+            if !validator_a_finished && last_vote >= next_slot_on_a {
+                validator_a_finished = true;
+            }
+        }
+        if let Some(last_vote) = last_vote_in_tower(&val_b_ledger_path, &validator_b_pubkey) {
+            if !validator_b_finished && last_vote >= next_slot_on_a {
+                validator_b_finished = true;
+            }
+        }
+    }
+    // kill them at once after the above loop; otherwise one might stall the other!
+    let validator_a_info = cluster.exit_node(&validator_a_pubkey);
+    let _validator_b_info = cluster.exit_node(&validator_b_pubkey);
+
+    // Step 2:
+    // Stop validator and truncate ledger
+    info!("truncate validator C's ledger");
+    {
+        // first copy from validator A's ledger
+        std::fs::remove_dir_all(&validator_c_info.info.ledger_path).unwrap();
+        let mut opt = fs_extra::dir::CopyOptions::new();
+        opt.copy_inside = true;
+        fs_extra::dir::copy(&val_a_ledger_path, &val_c_ledger_path, &opt).unwrap();
+        // Remove A's tower in the C's new copied ledger
+        remove_tower(&validator_c_info.info.ledger_path, &validator_a_pubkey);
+
+        let blockstore = open_blockstore(&validator_c_info.info.ledger_path);
+        purge_slots(&blockstore, base_slot + 1, truncated_slots);
+    }
+    info!("truncate validator A's ledger");
+    {
+        let blockstore = open_blockstore(&val_a_ledger_path);
+        purge_slots(&blockstore, next_slot_on_a + 1, truncated_slots);
+        if !with_tower {
+            info!("Removing tower!");
+            remove_tower(&val_a_ledger_path, &validator_a_pubkey);
+
+            // Remove next_slot_on_a from ledger to force validator A to select
+            // votes_on_c_fork. Otherwise the validator A will immediately vote
+            // for 27 on restart, because it hasn't gotten the heavier fork from
+            // validator C yet.
+            // Then it will be stuck on 27 unable to switch because C doesn't
+            // have enough stake to generate a switching proof
+            purge_slots(&blockstore, next_slot_on_a, truncated_slots);
+        } else {
+            info!("Not removing tower!");
+        }
+    }
+
+    // Step 3:
+    // Run validator C only to make it produce and vote on its own fork.
+    info!("Restart validator C again!!!");
+    let val_c_ledger_path = validator_c_info.info.ledger_path.clone();
+    cluster.restart_node(&validator_c_pubkey, validator_c_info);
+
+    let mut votes_on_c_fork = std::collections::BTreeSet::new(); // S4 and S5
+    for _ in 0..100 {
+        sleep(Duration::from_millis(100));
+
+        if let Some(last_vote) = last_vote_in_tower(&val_c_ledger_path, &validator_c_pubkey) {
+            if last_vote != base_slot {
+                votes_on_c_fork.insert(last_vote);
+                // Collect 4 votes
+                if votes_on_c_fork.len() >= 4 {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(!votes_on_c_fork.is_empty());
+    info!("collected validator C's votes: {:?}", votes_on_c_fork);
+
+    // Step 4:
+    // verify whether there was violation or not
+    info!("Restart validator A again!!!");
+    cluster.restart_node(&validator_a_pubkey, validator_a_info);
+
+    // monitor for actual votes from validator A
+    let mut bad_vote_detected = false;
+    let mut a_votes = vec![];
+    for _ in 0..100 {
+        sleep(Duration::from_millis(100));
+
+        if let Some(last_vote) = last_vote_in_tower(&val_a_ledger_path, &validator_a_pubkey) {
+            a_votes.push(last_vote);
+            let blockstore = Blockstore::open_with_access_type(
+                &val_a_ledger_path,
+                AccessType::TryPrimaryThenSecondary,
+                None,
+                true,
+            )
+            .unwrap();
+            let mut ancestors = AncestorIterator::new(last_vote, &blockstore);
+            if ancestors.any(|a| votes_on_c_fork.contains(&a)) {
+                bad_vote_detected = true;
+                break;
+            }
+        }
+    }
+
+    info!("Observed A's votes on: {:?}", a_votes);
+
+    // an elaborate way of assert!(with_tower && !bad_vote_detected || ...)
+    let expects_optimistic_confirmation_violation = !with_tower;
+    if bad_vote_detected != expects_optimistic_confirmation_violation {
+        if bad_vote_detected {
+            panic!("No violation expected because of persisted tower!");
+        } else {
+            panic!("Violation expected because of removed persisted tower!");
+        }
+    } else if bad_vote_detected {
+        info!("THIS TEST expected violations. And indeed, there was some, because of removed persisted tower.");
+    } else {
+        info!("THIS TEST expected no violation. And indeed, there was none, thanks to persisted tower.");
+    }
+}
+
+enum ClusterMode {
+    MasterOnly,
+    MasterSlave,
+}
+
+fn do_test_future_tower(cluster_mode: ClusterMode) {
+    solana_logger::setup();
+
+    // First set up the cluster with 4 nodes
+    let slots_per_epoch = 2048;
+    let node_stakes = match cluster_mode {
+        ClusterMode::MasterOnly => vec![100],
+        ClusterMode::MasterSlave => vec![100, 0],
+    };
+
+    let validator_keys = vec![
+        "28bN3xyvrP4E8LwEgtLjhnkb7cY4amQb6DrYAbAYjgRV4GAGgkVM2K7wnxnAS7WDneuavza7x21MiafLu1HkwQt4",
+        "2saHBBoTkLMmttmPQP8KfBkcCw45S5cwtV3wTdGCscRC8uxdgvHxpHiWXKx4LvJjNJtnNcbSv5NdheokFFqnNDt8",
+    ]
+    .iter()
+    .map(|s| (Arc::new(Keypair::from_base58_string(s)), true))
+    .take(node_stakes.len())
+    .collect::<Vec<_>>();
+    let validators = validator_keys
+        .iter()
+        .map(|(kp, _)| kp.pubkey())
+        .collect::<Vec<_>>();
+    let validator_a_pubkey = match cluster_mode {
+        ClusterMode::MasterOnly => validators[0],
+        ClusterMode::MasterSlave => validators[1],
+    };
+
+    let mut config = ClusterConfig {
+        cluster_lamports: 100_000,
+        node_stakes: node_stakes.clone(),
+        validator_configs: vec![ValidatorConfig::default(); node_stakes.len()],
+        validator_keys: Some(validator_keys),
+        slots_per_epoch,
+        stakers_slot_offset: slots_per_epoch,
+        skip_warmup_slots: true,
+        ..ClusterConfig::default()
+    };
+    let mut cluster = LocalCluster::new(&mut config);
+
+    let val_a_ledger_path = cluster.ledger_path(&validator_a_pubkey);
+
+    loop {
+        sleep(Duration::from_millis(100));
+
+        if let Some(root) = root_in_tower(&val_a_ledger_path, &validator_a_pubkey) {
+            if root >= 15 {
+                break;
+            }
+        }
+    }
+    let purged_slot_before_restart = 10;
+    let validator_a_info = cluster.exit_node(&validator_a_pubkey);
+    {
+        // create a warped future tower without mangling the tower itself
+        info!(
+            "Revert blockstore before slot {} and effectively create a future tower",
+            purged_slot_before_restart,
+        );
+        let blockstore = open_blockstore(&val_a_ledger_path);
+        purge_slots(&blockstore, purged_slot_before_restart, 100);
+    }
+
+    cluster.restart_node(&validator_a_pubkey, validator_a_info);
+
+    let mut newly_rooted = false;
+    let some_root_after_restart = purged_slot_before_restart + 25; // 25 is arbitrary; just wait a bit
+    for _ in 0..600 {
+        sleep(Duration::from_millis(100));
+
+        if let Some(root) = root_in_tower(&val_a_ledger_path, &validator_a_pubkey) {
+            if root >= some_root_after_restart {
+                newly_rooted = true;
+                break;
+            }
+        }
+    }
+    let _validator_a_info = cluster.exit_node(&validator_a_pubkey);
+    if newly_rooted {
+        // there should be no forks; i.e. monotonically increasing ancestor chain
+        let last_vote = last_vote_in_tower(&val_a_ledger_path, &validator_a_pubkey).unwrap();
+        let blockstore = open_blockstore(&val_a_ledger_path);
+        let actual_block_ancestors = AncestorIterator::new_inclusive(last_vote, &blockstore)
+            .take_while(|a| *a >= some_root_after_restart)
+            .collect::<Vec<_>>();
+        let expected_countinuous_no_fork_votes = (some_root_after_restart..=last_vote)
+            .rev()
+            .collect::<Vec<_>>();
+        assert_eq!(actual_block_ancestors, expected_countinuous_no_fork_votes);
+        assert!(actual_block_ancestors.len() > MAX_LOCKOUT_HISTORY);
+        info!("validator managed to handle future tower!");
+    } else {
+        panic!("no root detected");
+    }
+}
+
+#[test]
+#[serial]
+fn test_future_tower_master_only() {
+    do_test_future_tower(ClusterMode::MasterOnly);
+}
+
+#[test]
+#[serial]
+fn test_future_tower_master_slave() {
+    do_test_future_tower(ClusterMode::MasterSlave);
+}
+
+#[test]
+fn test_hard_fork_invalidates_tower() {
+    solana_logger::setup();
+
+    // First set up the cluster with 2 nodes
+    let slots_per_epoch = 2048;
+    let node_stakes = vec![60, 40];
+
+    let validator_keys = vec![
+        "28bN3xyvrP4E8LwEgtLjhnkb7cY4amQb6DrYAbAYjgRV4GAGgkVM2K7wnxnAS7WDneuavza7x21MiafLu1HkwQt4",
+        "2saHBBoTkLMmttmPQP8KfBkcCw45S5cwtV3wTdGCscRC8uxdgvHxpHiWXKx4LvJjNJtnNcbSv5NdheokFFqnNDt8",
+    ]
+    .iter()
+    .map(|s| (Arc::new(Keypair::from_base58_string(s)), true))
+    .take(node_stakes.len())
+    .collect::<Vec<_>>();
+    let validators = validator_keys
+        .iter()
+        .map(|(kp, _)| kp.pubkey())
+        .collect::<Vec<_>>();
+
+    let validator_a_pubkey = validators[0];
+    let validator_b_pubkey = validators[1];
+
+    let mut config = ClusterConfig {
+        cluster_lamports: 100_000,
+        node_stakes: node_stakes.clone(),
+        validator_configs: vec![ValidatorConfig::default(); node_stakes.len()],
+        validator_keys: Some(validator_keys),
+        slots_per_epoch,
+        stakers_slot_offset: slots_per_epoch,
+        skip_warmup_slots: true,
+        ..ClusterConfig::default()
+    };
+    let cluster = std::sync::Arc::new(std::sync::Mutex::new(LocalCluster::new(&mut config)));
+
+    let val_a_ledger_path = cluster.lock().unwrap().ledger_path(&validator_a_pubkey);
+
+    let min_root = 15;
+    loop {
+        sleep(Duration::from_millis(100));
+
+        if let Some(root) = root_in_tower(&val_a_ledger_path, &validator_a_pubkey) {
+            if root >= min_root {
+                break;
+            }
+        }
+    }
+
+    let mut validator_a_info = cluster.lock().unwrap().exit_node(&validator_a_pubkey);
+    let mut validator_b_info = cluster.lock().unwrap().exit_node(&validator_b_pubkey);
+
+    // setup hard fork at slot < a previously rooted slot!
+    let hard_fork_slot = min_root - 5;
+    let hard_fork_slots = Some(vec![hard_fork_slot]);
+    let mut hard_forks = solana_sdk::hard_forks::HardForks::default();
+    hard_forks.register(hard_fork_slot);
+
+    let expected_shred_version = solana_sdk::shred_version::compute_shred_version(
+        &cluster.lock().unwrap().genesis_config.hash(),
+        Some(&hard_forks),
+    );
+
+    validator_a_info.config.new_hard_forks = hard_fork_slots.clone();
+    validator_a_info.config.wait_for_supermajority = Some(hard_fork_slot);
+    validator_a_info.config.expected_shred_version = Some(expected_shred_version);
+
+    validator_b_info.config.new_hard_forks = hard_fork_slots;
+    validator_b_info.config.wait_for_supermajority = Some(hard_fork_slot);
+    validator_b_info.config.expected_shred_version = Some(expected_shred_version);
+
+    // restart validator A first
+    let cluster_for_a = cluster.clone();
+    // Spawn a thread because wait_for_supermajority blocks in Validator::new()!
+    let thread = std::thread::spawn(move || {
+        let restart_context = cluster_for_a
+            .lock()
+            .unwrap()
+            .create_restart_context(&validator_a_pubkey, &mut validator_a_info);
+        let restarted_validator_info =
+            LocalCluster::restart_node_with_context(validator_a_info, restart_context);
+        cluster_for_a
+            .lock()
+            .unwrap()
+            .add_node(&validator_a_pubkey, restarted_validator_info);
+    });
+
+    // test validator A actually to wait for supermajority
+    let mut last_vote = None;
+    for _ in 0..10 {
+        sleep(Duration::from_millis(1000));
+
+        let new_last_vote = last_vote_in_tower(&val_a_ledger_path, &validator_a_pubkey).unwrap();
+        if let Some(last_vote) = last_vote {
+            assert_eq!(last_vote, new_last_vote);
+        } else {
+            last_vote = Some(new_last_vote);
+        }
+    }
+
+    // restart validator B normally
+    cluster
+        .lock()
+        .unwrap()
+        .restart_node(&validator_b_pubkey, validator_b_info);
+
+    // validator A should now start so join its thread here
+    thread.join().unwrap();
+
+    // new slots should be rooted after hard-fork cluster relaunch
+    cluster
+        .lock()
+        .unwrap()
+        .check_for_new_roots(16, &"hard fork");
+}
+
+#[test]
+#[serial]
+fn test_no_optimistic_confirmation_violation_with_tower() {
+    do_test_optimistic_confirmation_violation_with_or_without_tower(true);
+}
+
+#[test]
+#[serial]
+fn test_optimistic_confirmation_violation_without_tower() {
+    do_test_optimistic_confirmation_violation_with_or_without_tower(false);
+}
+
+#[test]
+#[serial]
+fn test_run_test_load_program_accounts_root() {
+    run_test_load_program_accounts(CommitmentConfig::finalized());
+}
+
+#[test]
+#[serial]
+fn test_run_test_load_program_accounts_partition_root() {
+    run_test_load_program_accounts_partition(CommitmentConfig::finalized());
+}
+
+fn run_test_load_program_accounts_partition(scan_commitment: CommitmentConfig) {
+    let num_slots_per_validator = 8;
+    let partitions: [&[usize]; 2] = [&[(1)], &[(1)]];
+    let (leader_schedule, validator_keys) =
+        create_custom_leader_schedule(partitions.len(), num_slots_per_validator);
+
+    let (update_client_sender, update_client_receiver) = unbounded();
+    let (scan_client_sender, scan_client_receiver) = unbounded();
+    let exit = Arc::new(AtomicBool::new(false));
+
+    let (t_update, t_scan, additional_accounts) = setup_transfer_scan_threads(
+        1000,
+        exit.clone(),
+        scan_commitment,
+        update_client_receiver,
+        scan_client_receiver,
+    );
+
+    let on_partition_start = |cluster: &mut LocalCluster| {
+        let update_client = cluster
+            .get_validator_client(&cluster.entry_point_info.id)
+            .unwrap();
+        update_client_sender.send(update_client).unwrap();
+        let scan_client = cluster
+            .get_validator_client(&cluster.entry_point_info.id)
+            .unwrap();
+        scan_client_sender.send(scan_client).unwrap();
+    };
+
+    let on_partition_resolved = |cluster: &mut LocalCluster| {
+        cluster.check_for_new_roots(20, &"run_test_load_program_accounts_partition");
+        exit.store(true, Ordering::Relaxed);
+        t_update.join().unwrap();
+        t_scan.join().unwrap();
+    };
+
+    run_cluster_partition(
+        &partitions,
+        Some((leader_schedule, validator_keys)),
+        on_partition_start,
+        on_partition_resolved,
+        additional_accounts,
+    );
+}
+
+fn setup_transfer_scan_threads(
+    num_starting_accounts: usize,
+    exit: Arc<AtomicBool>,
+    scan_commitment: CommitmentConfig,
+    update_client_receiver: Receiver<ThinClient>,
+    scan_client_receiver: Receiver<ThinClient>,
+) -> (JoinHandle<()>, JoinHandle<()>, Vec<(Pubkey, Account)>) {
+    let exit_ = exit.clone();
+    let starting_keypairs: Arc<Vec<Keypair>> = Arc::new(
+        iter::repeat_with(Keypair::new)
+            .take(num_starting_accounts)
+            .collect(),
+    );
+    let target_keypairs: Arc<Vec<Keypair>> = Arc::new(
+        iter::repeat_with(Keypair::new)
+            .take(num_starting_accounts)
+            .collect(),
+    );
+    let starting_accounts: Vec<(Pubkey, Account)> = starting_keypairs
+        .iter()
+        .map(|k| (k.pubkey(), Account::new(1, 0, &system_program::id())))
+        .collect();
+
+    let starting_keypairs_ = starting_keypairs.clone();
+    let target_keypairs_ = target_keypairs.clone();
+    let t_update = Builder::new()
+        .name("update".to_string())
+        .spawn(move || {
+            let client = update_client_receiver.recv().unwrap();
+            loop {
+                if exit_.load(Ordering::Relaxed) {
+                    return;
+                }
+                let (blockhash, _fee_calculator, _last_valid_slot) = client
+                    .get_recent_blockhash_with_commitment(CommitmentConfig::processed())
+                    .unwrap();
+                for i in 0..starting_keypairs_.len() {
+                    client
+                        .async_transfer(
+                            1,
+                            &starting_keypairs_[i],
+                            &target_keypairs_[i].pubkey(),
+                            blockhash,
+                        )
+                        .unwrap();
+                }
+                for i in 0..starting_keypairs_.len() {
+                    client
+                        .async_transfer(
+                            1,
+                            &target_keypairs_[i],
+                            &starting_keypairs_[i].pubkey(),
+                            blockhash,
+                        )
+                        .unwrap();
+                }
+            }
+        })
+        .unwrap();
+
+    // Scan, the total funds should add up to the original
+    let mut scan_commitment_config = RpcProgramAccountsConfig::default();
+    scan_commitment_config.account_config.commitment = Some(scan_commitment);
+    let tracked_pubkeys: HashSet<Pubkey> = starting_keypairs
+        .iter()
+        .chain(target_keypairs.iter())
+        .map(|k| k.pubkey())
+        .collect();
+    let expected_total_balance = num_starting_accounts as u64;
+    let t_scan = Builder::new()
+        .name("scan".to_string())
+        .spawn(move || {
+            let client = scan_client_receiver.recv().unwrap();
+            loop {
+                if exit.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Some(total_scan_balance) = client
+                    .get_program_accounts_with_config(
+                        &system_program::id(),
+                        scan_commitment_config.clone(),
+                    )
+                    .ok()
+                    .map(|result| {
+                        result
+                            .into_iter()
+                            .map(|(key, account)| {
+                                if tracked_pubkeys.contains(&key) {
+                                    account.lamports
+                                } else {
+                                    0
+                                }
+                            })
+                            .sum::<u64>()
+                    })
+                {
+                    assert_eq!(total_scan_balance, expected_total_balance);
+                }
+            }
+        })
+        .unwrap();
+
+    (t_update, t_scan, starting_accounts)
+}
+
+fn run_test_load_program_accounts(scan_commitment: CommitmentConfig) {
+    solana_logger::setup();
+    // First set up the cluster with 2 nodes
+    let slots_per_epoch = 2048;
+    let node_stakes = vec![51, 50];
+    let validator_keys: Vec<_> = vec![
+        "4qhhXNTbKD1a5vxDDLZcHKj7ELNeiivtUBxn3wUK1F5VRsQVP89VUhfXqSfgiFB14GfuBgtrQ96n9NvWQADVkcCg",
+        "3kHBzVwie5vTEaY6nFCPeFT8qDpoXzn7dCEioGRNBTnUDpvwnG85w8Wq63gVWpVTP8k2a8cgcWRjSXyUkEygpXWS",
+    ]
+    .iter()
+    .map(|s| (Arc::new(Keypair::from_base58_string(s)), true))
+    .take(node_stakes.len())
+    .collect();
+
+    let num_starting_accounts = 1000;
+    let exit = Arc::new(AtomicBool::new(false));
+    let (update_client_sender, update_client_receiver) = unbounded();
+    let (scan_client_sender, scan_client_receiver) = unbounded();
+
+    // Setup the update/scan threads
+    let (t_update, t_scan, starting_accounts) = setup_transfer_scan_threads(
+        num_starting_accounts,
+        exit.clone(),
+        scan_commitment,
+        update_client_receiver,
+        scan_client_receiver,
+    );
+
+    let mut config = ClusterConfig {
+        cluster_lamports: 100_000,
+        node_stakes: node_stakes.clone(),
+        validator_configs: vec![ValidatorConfig::default(); node_stakes.len()],
+        validator_keys: Some(validator_keys),
+        slots_per_epoch,
+        stakers_slot_offset: slots_per_epoch,
+        skip_warmup_slots: true,
+        additional_accounts: starting_accounts,
+        ..ClusterConfig::default()
+    };
+    let cluster = LocalCluster::new(&mut config);
+
+    // Give the threads a client to use for querying the cluster
+    let all_pubkeys = cluster.get_node_pubkeys();
+    let other_validator_id = all_pubkeys
+        .into_iter()
+        .find(|x| *x != cluster.entry_point_info.id)
+        .unwrap();
+    let client = cluster
+        .get_validator_client(&cluster.entry_point_info.id)
+        .unwrap();
+    update_client_sender.send(client).unwrap();
+    let scan_client = cluster.get_validator_client(&other_validator_id).unwrap();
+    scan_client_sender.send(scan_client).unwrap();
+
+    // Wait for some roots to pass
+    cluster.check_for_new_roots(40, &"run_test_load_program_accounts");
+
+    // Exit and ensure no violations of consistency were found
+    exit.store(true, Ordering::Relaxed);
+    t_update.join().unwrap();
+    t_scan.join().unwrap();
 }
 
 fn wait_for_next_snapshot(
@@ -1405,7 +2403,7 @@ fn wait_for_next_snapshot(
         .get_validator_client(&cluster.entry_point_info.id)
         .unwrap();
     let last_slot = client
-        .get_slot_with_commitment(CommitmentConfig::recent())
+        .get_slot_with_commitment(CommitmentConfig::processed())
         .expect("Couldn't get slot");
 
     // Wait for a snapshot for a bank >= last_slot to be made so we know that the snapshot
@@ -1463,7 +2461,7 @@ fn setup_snapshot_validator_config(
         snapshot_interval_slots,
         snapshot_package_output_path: PathBuf::from(snapshot_output_path.path()),
         snapshot_path: PathBuf::from(snapshot_dir.path()),
-        compression: CompressionType::Bzip2,
+        archive_format: ArchiveFormat::TarBzip2,
         snapshot_version: snapshot_utils::SnapshotVersion::default(),
     };
 

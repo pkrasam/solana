@@ -118,7 +118,7 @@ fn main() {
             let recyclers = VerifyRecyclers::default();
             for _ in 0..iterations {
                 assert!(ticks[..num_entries]
-                    .start_verify(&start_hash, recyclers.clone())
+                    .start_verify(&start_hash, recyclers.clone(), true)
                     .finish_verify(&ticks[..num_entries]));
             }
             time.stop();

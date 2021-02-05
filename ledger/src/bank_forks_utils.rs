@@ -13,7 +13,7 @@ use solana_runtime::{
     snapshot_utils,
 };
 use solana_sdk::{clock::Slot, genesis_config::GenesisConfig, hash::Hash};
-use std::{fs, path::PathBuf, process, result, sync::Arc};
+use std::{fs, path::PathBuf, process, result};
 
 pub type LoadResult = result::Result<
     (BankForks, LeaderScheduleCache, Option<(Slot, Hash)>),
@@ -33,6 +33,7 @@ pub fn load(
     genesis_config: &GenesisConfig,
     blockstore: &Blockstore,
     account_paths: Vec<PathBuf>,
+    shrink_paths: Option<Vec<PathBuf>>,
     snapshot_config: Option<&SnapshotConfig>,
     process_options: ProcessOptions,
     transaction_status_sender: Option<TransactionStatusSender>,
@@ -65,8 +66,15 @@ pub fn load(
                     &archive_filename,
                     compression,
                     genesis_config,
+                    process_options.debug_keys.clone(),
+                    Some(&crate::builtins::get(process_options.bpf_jit)),
+                    process_options.account_indexes.clone(),
+                    process_options.accounts_db_caching_enabled,
                 )
                 .expect("Load from snapshot failed");
+                if let Some(shrink_paths) = shrink_paths {
+                    deserialized_bank.set_shrink_paths(shrink_paths);
+                }
 
                 let deserialized_snapshot_hash = (
                     deserialized_bank.slot(),
@@ -83,9 +91,8 @@ pub fn load(
 
                 return to_loadresult(
                     blockstore_processor::process_blockstore_from_root(
-                        genesis_config,
                         blockstore,
-                        Arc::new(deserialized_bank),
+                        deserialized_bank,
                         &process_options,
                         &VerifyRecyclers::default(),
                         transaction_status_sender,

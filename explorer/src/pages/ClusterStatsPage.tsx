@@ -1,16 +1,18 @@
 import React from "react";
-import CountUp from "react-countup";
-
 import { TableCardBody } from "components/common/TableCardBody";
+import { Slot } from "components/common/Slot";
 import {
+  ClusterStatsStatus,
   useDashboardInfo,
   usePerformanceInfo,
-  PERF_UPDATE_SEC,
-  useSetActive,
-  PerformanceInfo,
-} from "providers/stats/solanaBeach";
+  useStatsProvider,
+} from "providers/stats/solanaClusterStats";
 import { slotsToHumanString } from "utils";
-import { useCluster, Cluster } from "providers/cluster";
+import { useCluster } from "providers/cluster";
+import { TpsCard } from "components/TpsCard";
+import { displayTimestampUtc } from "utils/date";
+
+const CLUSTER_STATS_TIMEOUT = 10000;
 
 export function ClusterStatsPage() {
   return (
@@ -25,6 +27,7 @@ export function ClusterStatsPage() {
         </div>
         <StatsCardBody />
       </div>
+      <TpsCard />
     </div>
   );
 }
@@ -32,126 +35,126 @@ export function ClusterStatsPage() {
 function StatsCardBody() {
   const dashboardInfo = useDashboardInfo();
   const performanceInfo = usePerformanceInfo();
-  const setSocketActive = useSetActive();
+  const { setActive } = useStatsProvider();
   const { cluster } = useCluster();
 
   React.useEffect(() => {
-    setSocketActive(true);
-    return () => setSocketActive(false);
-  }, [setSocketActive, cluster]);
+    setActive(true);
+    return () => setActive(false);
+  }, [setActive, cluster]);
 
-  const statsAvailable =
-    cluster === Cluster.MainnetBeta || cluster === Cluster.Testnet;
-  if (!statsAvailable) {
-    return (
-      <div className="card-body text-center">
-        <div className="text-muted">
-          Stats are not available for this cluster
-        </div>
-      </div>
-    );
+  if (
+    performanceInfo.status !== ClusterStatsStatus.Ready ||
+    dashboardInfo.status !== ClusterStatsStatus.Ready
+  ) {
+    const error =
+      performanceInfo.status === ClusterStatsStatus.Error ||
+      dashboardInfo.status === ClusterStatsStatus.Error;
+    return <StatsNotReady error={error} />;
   }
 
-  if (!dashboardInfo || !performanceInfo) {
-    return (
-      <div className="card-body text-center">
-        <span className="spinner-grow spinner-grow-sm mr-2"></span>
-        Loading
-      </div>
-    );
-  }
-
-  const { avgBlockTime_1h, avgBlockTime_1min, epochInfo } = dashboardInfo;
-  const hourlyBlockTime = Math.round(1000 * avgBlockTime_1h);
-  const averageBlockTime = Math.round(1000 * avgBlockTime_1min) + "ms";
+  const {
+    avgSlotTime_1h,
+    avgSlotTime_1min,
+    epochInfo,
+    blockTime,
+  } = dashboardInfo;
+  const hourlySlotTime = Math.round(1000 * avgSlotTime_1h);
+  const averageSlotTime = Math.round(1000 * avgSlotTime_1min);
   const { slotIndex, slotsInEpoch } = epochInfo;
   const currentEpoch = epochInfo.epoch.toString();
   const epochProgress = ((100 * slotIndex) / slotsInEpoch).toFixed(1) + "%";
   const epochTimeRemaining = slotsToHumanString(
     slotsInEpoch - slotIndex,
-    hourlyBlockTime
+    hourlySlotTime
   );
-  const averageTps = Math.round(performanceInfo.avgTPS);
-  const transactionCount = <AnimatedTransactionCount info={performanceInfo} />;
-  const blockHeight = epochInfo.blockHeight.toLocaleString("en-US");
-  const currentSlot = epochInfo.absoluteSlot.toLocaleString("en-US");
+  const { blockHeight, absoluteSlot } = epochInfo;
 
   return (
     <TableCardBody>
       <tr>
         <td className="w-100">Slot</td>
-        <td className="text-lg-right text-monospace">{currentSlot}</td>
+        <td className="text-lg-right text-monospace">
+          <Slot slot={absoluteSlot} link />
+        </td>
+      </tr>
+      {blockHeight !== undefined && (
+        <tr>
+          <td className="w-100">Block height</td>
+          <td className="text-lg-right text-monospace">
+            <Slot slot={blockHeight} />
+          </td>
+        </tr>
+      )}
+      {blockTime && (
+        <tr>
+          <td className="w-100">Cluster time</td>
+          <td className="text-lg-right text-monospace">
+            {displayTimestampUtc(blockTime)}
+          </td>
+        </tr>
+      )}
+      <tr>
+        <td className="w-100">Slot time (1min average)</td>
+        <td className="text-lg-right text-monospace">{averageSlotTime}ms</td>
       </tr>
       <tr>
-        <td className="w-100">Block height</td>
-        <td className="text-lg-right text-monospace">{blockHeight}</td>
-      </tr>
-      <tr>
-        <td className="w-100">Block time</td>
-        <td className="text-lg-right text-monospace">{averageBlockTime}</td>
+        <td className="w-100">Slot time (1hr average)</td>
+        <td className="text-lg-right text-monospace">{hourlySlotTime}ms</td>
       </tr>
       <tr>
         <td className="w-100">Epoch</td>
-        <td className="text-lg-right text-monospace">{currentEpoch} </td>
+        <td className="text-lg-right text-monospace">{currentEpoch}</td>
       </tr>
       <tr>
         <td className="w-100">Epoch progress</td>
-        <td className="text-lg-right text-monospace">{epochProgress} </td>
+        <td className="text-lg-right text-monospace">{epochProgress}</td>
       </tr>
       <tr>
-        <td className="w-100">Epoch time remaining</td>
-        <td className="text-lg-right text-monospace">{epochTimeRemaining} </td>
-      </tr>
-      <tr>
-        <td className="w-100">Transaction count</td>
-        <td className="text-lg-right text-monospace">{transactionCount} </td>
-      </tr>
-      <tr>
-        <td className="w-100">Transactions per second</td>
-        <td className="text-lg-right text-monospace">{averageTps} </td>
+        <td className="w-100">Epoch time remaining (approx.)</td>
+        <td className="text-lg-right text-monospace">~{epochTimeRemaining}</td>
       </tr>
     </TableCardBody>
   );
 }
 
-function AnimatedTransactionCount({ info }: { info: PerformanceInfo }) {
-  const txCountRef = React.useRef(0);
-  const countUpRef = React.useRef({ start: 0, period: 0, lastUpdate: 0 });
-  const countUp = countUpRef.current;
+export function StatsNotReady({ error }: { error: boolean }) {
+  const { setTimedOut, retry, active } = useStatsProvider();
+  const { cluster } = useCluster();
 
-  const { totalTransactionCount: txCount, avgTPS } = info;
-
-  // Track last tx count to reset count up options
-  if (txCount !== txCountRef.current) {
-    if (countUp.lastUpdate > 0) {
-      // Since we overshoot below, calculate the elapsed value
-      // and start from there.
-      const elapsed = Date.now() - countUp.lastUpdate;
-      const elapsedPeriods = elapsed / (PERF_UPDATE_SEC * 1000);
-      countUp.start = countUp.start + elapsedPeriods * countUp.period;
-      countUp.period = txCount - countUp.start;
-    } else {
-      // Since this is the first tx count value, estimate the previous
-      // tx count in order to have a starting point for our animation
-      countUp.period = PERF_UPDATE_SEC * avgTPS;
-      countUp.start = txCount - countUp.period;
+  React.useEffect(() => {
+    let timedOut = 0;
+    if (!error) {
+      timedOut = setTimeout(setTimedOut, CLUSTER_STATS_TIMEOUT);
     }
-    countUp.lastUpdate = Date.now();
-    txCountRef.current = txCount;
+    return () => {
+      if (timedOut) {
+        clearTimeout(timedOut);
+      }
+    };
+  }, [setTimedOut, cluster, error]);
+
+  if (error || !active) {
+    return (
+      <div className="card-body text-center">
+        There was a problem loading cluster stats.{" "}
+        <button
+          className="btn btn-white btn-sm"
+          onClick={() => {
+            retry();
+          }}
+        >
+          <span className="fe fe-refresh-cw mr-2"></span>
+          Try Again
+        </button>
+      </div>
+    );
   }
 
-  // Overshoot the target tx count in case the next update is delayed
-  const COUNT_PERIODS = 3;
-  const countUpEnd = countUp.start + COUNT_PERIODS * countUp.period;
   return (
-    <CountUp
-      start={countUp.start}
-      end={countUpEnd}
-      duration={PERF_UPDATE_SEC * COUNT_PERIODS}
-      delay={0}
-      useEasing={false}
-      preserveValue={true}
-      separator=","
-    />
+    <div className="card-body text-center">
+      <span className="spinner-grow spinner-grow-sm mr-2"></span>
+      Loading
+    </div>
   );
 }

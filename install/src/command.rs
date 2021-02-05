@@ -23,7 +23,7 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant, SystemTime},
 };
-use tempdir::TempDir;
+use tempfile::TempDir;
 use url::Url;
 
 #[derive(Deserialize, Debug)]
@@ -39,6 +39,7 @@ static BULLET: Emoji = Emoji("• ", "* ");
 static SPARKLE: Emoji = Emoji("✨ ", "");
 static PACKAGE: Emoji = Emoji("📦 ", "");
 static INFORMATION: Emoji = Emoji("ℹ️  ", "");
+static RECYCLING: Emoji = Emoji("♻️  ", "");
 
 /// Creates a new process bar for processing that will take an unknown amount of time
 fn new_spinner_progress_bar() -> ProgressBar {
@@ -84,7 +85,7 @@ fn download_to_temp(
 
     let url = Url::parse(url).map_err(|err| format!("Unable to parse {}: {}", url, err))?;
 
-    let temp_dir = TempDir::new(clap::crate_name!())?;
+    let temp_dir = TempDir::new()?;
     let temp_file = temp_dir.path().join("download");
 
     let client = reqwest::blocking::Client::new();
@@ -158,13 +159,22 @@ fn extract_release_archive(
     let progress_bar = new_spinner_progress_bar();
     progress_bar.set_message(&format!("{}Extracting...", PACKAGE));
 
-    let _ = fs::remove_dir_all(extract_dir);
-    fs::create_dir_all(extract_dir)?;
+    if extract_dir.exists() {
+        let _ = fs::remove_dir_all(&extract_dir);
+    }
+
+    let tmp_extract_dir = extract_dir.with_file_name("tmp-extract");
+    if tmp_extract_dir.exists() {
+        let _ = fs::remove_dir_all(&tmp_extract_dir);
+    }
+    fs::create_dir_all(&tmp_extract_dir)?;
 
     let tar_bz2 = File::open(archive)?;
     let tar = BzDecoder::new(BufReader::new(tar_bz2));
     let mut release = Archive::new(tar);
-    release.unpack(extract_dir)?;
+    release.unpack(&tmp_extract_dir)?;
+
+    fs::rename(&tmp_extract_dir, extract_dir)?;
 
     progress_bar.finish_and_clear();
     Ok(())
@@ -360,7 +370,7 @@ fn get_windows_path_var() -> Result<Option<String>, String> {
 }
 
 #[cfg(windows)]
-fn add_to_path(new_path: &str) -> Result<bool, String> {
+fn add_to_path(new_path: &str) -> bool {
     use std::ptr;
     use winapi::shared::minwindef::*;
     use winapi::um::winuser::{
@@ -369,10 +379,12 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
     use winreg::enums::{RegType, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
     use winreg::{RegKey, RegValue};
 
-    let old_path = if let Some(s) = get_windows_path_var()? {
+    let old_path = if let Some(s) =
+        get_windows_path_var().unwrap_or_else(|err| panic!("Unable to get PATH: {}", err))
+    {
         s
     } else {
-        return Ok(false);
+        return false;
     };
 
     if !old_path.contains(&new_path) {
@@ -385,7 +397,7 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
         let root = RegKey::predef(HKEY_CURRENT_USER);
         let environment = root
             .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-            .map_err(|err| format!("Unable to open HKEY_CURRENT_USER\\Environment: {}", err))?;
+            .unwrap_or_else(|err| panic!("Unable to open HKEY_CURRENT_USER\\Environment: {}", err));
 
         let reg_value = RegValue {
             bytes: string_to_winreg_bytes(&new_path),
@@ -394,7 +406,9 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
 
         environment
             .set_raw_value("PATH", &reg_value)
-            .map_err(|err| format!("Unable set HKEY_CURRENT_USER\\Environment\\PATH: {}", err))?;
+            .unwrap_or_else(|err| {
+                panic!("Unable set HKEY_CURRENT_USER\\Environment\\PATH: {}", err)
+            });
 
         // Tell other processes to update their environment
         unsafe {
@@ -416,28 +430,28 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
         new_path,
         style("Future applications will automatically have the correct environment, but you may need to restart your current shell.").bold()
     );
-    Ok(true)
+    true
 }
 
 #[cfg(unix)]
-fn add_to_path(new_path: &str) -> Result<bool, String> {
+fn add_to_path(new_path: &str) -> bool {
     let shell_export_string = format!(r#"export PATH="{}:$PATH""#, new_path);
     let mut modified_rcfiles = false;
 
     // Look for sh, bash, and zsh rc files
-    let mut rcfiles = vec![dirs::home_dir().map(|p| p.join(".profile"))];
+    let mut rcfiles = vec![dirs_next::home_dir().map(|p| p.join(".profile"))];
     if let Ok(shell) = std::env::var("SHELL") {
         if shell.contains("zsh") {
             let zdotdir = std::env::var("ZDOTDIR")
                 .ok()
                 .map(PathBuf::from)
-                .or_else(dirs::home_dir);
+                .or_else(dirs_next::home_dir);
             let zprofile = zdotdir.map(|p| p.join(".zprofile"));
             rcfiles.push(zprofile);
         }
     }
 
-    if let Some(bash_profile) = dirs::home_dir().map(|p| p.join(".bash_profile")) {
+    if let Some(bash_profile) = dirs_next::home_dir().map(|p| p.join(".bash_profile")) {
         // Only update .bash_profile if it exists because creating .bash_profile
         // will cause .profile to not be read
         if bash_profile.exists() {
@@ -502,7 +516,7 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
        );
     }
 
-    Ok(modified_rcfiles)
+    modified_rcfiles
 }
 
 pub fn init(
@@ -533,7 +547,7 @@ pub fn init(
     update(config_file)?;
 
     let path_modified = if !no_modify_path {
-        add_to_path(&config.active_release_bin_dir().to_str().unwrap())?
+        add_to_path(&config.active_release_bin_dir().to_str().unwrap())
     } else {
         false
     };
@@ -568,8 +582,30 @@ fn release_channel_version_url(release_channel: &str) -> String {
     )
 }
 
-pub fn info(config_file: &str, local_info_only: bool) -> Result<Option<UpdateManifest>, String> {
+pub fn info(
+    config_file: &str,
+    local_info_only: bool,
+    eval: bool,
+) -> Result<Option<UpdateManifest>, String> {
     let config = Config::load(config_file)?;
+
+    if eval {
+        println!(
+            "SOLANA_INSTALL_ACTIVE_RELEASE={}",
+            &config.active_release_dir().to_str().unwrap_or("")
+        );
+        config
+            .explicit_release
+            .map(|er| match er {
+                ExplicitRelease::Semver(semver) => semver,
+                ExplicitRelease::Channel(channel) => channel,
+            })
+            .and_then(|channel| {
+                println!("SOLANA_INSTALL_ACTIVE_CHANNEL={}", channel,);
+                Option::<String>::None
+            });
+        return Ok(None);
+    }
 
     println_name_value("Configuration:", &config_file);
     println_name_value(
@@ -751,19 +787,77 @@ fn symlink_dir<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> std::io::Resul
     std::os::unix::fs::symlink(src, dst)
 }
 
+pub fn gc(config_file: &str) -> Result<(), String> {
+    let config = Config::load(config_file)?;
+
+    let entries = fs::read_dir(&config.releases_dir)
+        .map_err(|err| format!("Unable to read {}: {}", config.releases_dir.display(), err))?;
+
+    let mut releases = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .metadata()
+                .ok()
+                .map(|metadata| (entry.path(), metadata))
+        })
+        .filter_map(|(release_path, metadata)| {
+            if metadata.is_dir() {
+                Some((release_path, metadata))
+            } else {
+                None
+            }
+        })
+        .filter_map(|(release_path, metadata)| {
+            metadata
+                .modified()
+                .ok()
+                .map(|modified_time| (release_path, modified_time))
+        })
+        .collect::<Vec<_>>();
+    releases.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); // order by newest releases
+
+    const MAX_CACHE_LEN: usize = 5;
+    if releases.len() > MAX_CACHE_LEN {
+        let old_releases = releases.split_off(MAX_CACHE_LEN);
+
+        if !old_releases.is_empty() {
+            let progress_bar = new_spinner_progress_bar();
+            progress_bar.set_length(old_releases.len() as u64);
+            progress_bar.set_style(
+                ProgressStyle::default_bar()
+                    .template(&format!(
+                        "{}{}{}",
+                        "{spinner:.green} ",
+                        RECYCLING,
+                        "Removing old releases [{bar:40.cyan/blue}] {pos}/{len} ({eta})"
+                    ))
+                    .progress_chars("=> "),
+            );
+            for (release, _modified_type) in old_releases {
+                progress_bar.inc(1);
+                let _ = fs::remove_dir_all(&release);
+            }
+            progress_bar.finish_and_clear();
+        }
+    }
+
+    Ok(())
+}
+
 pub fn update(config_file: &str) -> Result<bool, String> {
     let mut config = Config::load(config_file)?;
-    let update_manifest = info(config_file, false)?;
+    let update_manifest = info(config_file, false, false)?;
 
     let release_dir = if let Some(explicit_release) = &config.explicit_release {
         let (download_url, release_dir) = match explicit_release {
             ExplicitRelease::Semver(release_semver) => {
                 let download_url = github_release_download_url(release_semver);
                 let release_dir = config.release_dir(&release_semver);
-                let download_url = if release_dir.join(".ok").exists() {
+                let download_url = if release_dir.exists() {
                     // If this release_semver has already been successfully downloaded, no update
                     // needed
-                    println!("{} is present, no download required.", release_semver);
+                    println!("{} found in cache", release_semver);
                     None
                 } else {
                     Some(download_url)
@@ -771,33 +865,48 @@ pub fn update(config_file: &str) -> Result<bool, String> {
                 (download_url, release_dir)
             }
             ExplicitRelease::Channel(release_channel) => {
-                let release_dir = config.release_dir(&release_channel);
+                let version_url = release_channel_version_url(release_channel);
+
+                let (_temp_dir, temp_file, _temp_archive_sha256) =
+                    download_to_temp(&version_url, None)
+                        .map_err(|err| format!("Unable to download {}: {}", version_url, err))?;
+
+                let update_release_version = load_release_version(&temp_file)?;
+
+                let release_id = format!("{}-{}", release_channel, update_release_version.commit);
+                let release_dir = config.release_dir(&release_id);
                 let current_release_version_yml =
                     release_dir.join("solana-release").join("version.yml");
+
                 let download_url = Some(release_channel_download_url(release_channel));
 
                 if !current_release_version_yml.exists() {
+                    println_name_value(
+                        &format!("{}Release commit:", BULLET),
+                        &update_release_version.commit[0..7],
+                    );
                     (download_url, release_dir)
                 } else {
-                    let version_url = release_channel_version_url(release_channel);
-
-                    let (_temp_dir, temp_file, _temp_archive_sha256) =
-                        download_to_temp(&version_url, None).map_err(|err| {
-                            format!("Unable to download {}: {}", version_url, err)
-                        })?;
-
-                    let update_release_version = load_release_version(&temp_file)?;
                     let current_release_version =
                         load_release_version(&current_release_version_yml)?;
-
                     if update_release_version.commit == current_release_version.commit {
                         // Same commit, no update required
                         println!(
-                            "Latest {} build is already present, no download required.",
-                            release_channel
+                            "Latest {} build ({}) found in cache",
+                            release_channel,
+                            &current_release_version.commit[0..7],
                         );
                         (None, release_dir)
                     } else {
+                        println_name_value(
+                            &format!("{}Release commit:", BULLET),
+                            &format!(
+                                "{} => {}:",
+                                &current_release_version.commit[0..7],
+                                &update_release_version.commit[0..7],
+                            ),
+                        );
+
                         (download_url, release_dir)
                     }
                 }
@@ -814,7 +923,6 @@ pub fn update(config_file: &str) -> Result<bool, String> {
                     temp_archive, release_dir, err
                 )
             })?;
-            let _ = fs::create_dir_all(release_dir.join(".ok"));
         }
 
         release_dir
@@ -868,6 +976,13 @@ pub fn update(config_file: &str) -> Result<bool, String> {
         return Err(format!("Incompatible update target: {}", release_target));
     }
 
+    // Trigger an update to the modification time for `release_dir`
+    {
+        let path = &release_dir.join(".touch");
+        let _ = fs::OpenOptions::new().create(true).write(true).open(path);
+        let _ = fs::remove_file(path);
+    }
+
     let _ = fs::remove_dir_all(config.active_release_dir());
     symlink_dir(
         release_dir.join("solana-release"),
@@ -883,6 +998,7 @@ pub fn update(config_file: &str) -> Result<bool, String> {
     })?;
 
     config.save(config_file)?;
+    gc(config_file)?;
 
     println!("  {}{}", SPARKLE, style("Update successful").bold());
     Ok(true)

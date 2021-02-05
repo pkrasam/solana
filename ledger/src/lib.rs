@@ -1,4 +1,9 @@
+#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(specialization))]
+#[macro_use]
+extern crate solana_bpf_loader_program;
+
 pub mod bank_forks_utils;
+pub mod bigtable_upload;
 pub mod block_error;
 #[macro_use]
 pub mod blockstore;
@@ -6,6 +11,7 @@ pub mod ancestor_iterator;
 pub mod blockstore_db;
 pub mod blockstore_meta;
 pub mod blockstore_processor;
+pub mod builtins;
 pub mod entry;
 pub mod erasure;
 pub mod genesis_utils;
@@ -27,3 +33,6 @@ extern crate log;
 
 #[macro_use]
 extern crate lazy_static;
+
+#[macro_use]
+extern crate solana_frozen_abi_macro;

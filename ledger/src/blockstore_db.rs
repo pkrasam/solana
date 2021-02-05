@@ -2,6 +2,7 @@ use crate::blockstore_meta;
 use bincode::{deserialize, serialize};
 use byteorder::{BigEndian, ByteOrder};
 use log::*;
+use prost::Message;
 pub use rocksdb::Direction as IteratorDirection;
 use rocksdb::{
     self, ColumnFamily, ColumnFamilyDescriptor, DBIterator, DBRawIterator, DBRecoveryMode,
@@ -10,8 +11,13 @@ use rocksdb::{
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use solana_runtime::hardened_unpack::UnpackError;
-use solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Signature};
-use solana_transaction_status::{Rewards, TransactionStatusMeta};
+use solana_sdk::{
+    clock::{Slot, UnixTimestamp},
+    pubkey::Pubkey,
+    signature::Signature,
+};
+use solana_storage_proto::convert::generated;
+use solana_transaction_status::TransactionStatusMeta;
 use std::{collections::HashMap, fs, marker::PhantomData, path::Path, sync::Arc};
 use thiserror::Error;
 
@@ -46,6 +52,10 @@ const ADDRESS_SIGNATURES_CF: &str = "address_signatures";
 const TRANSACTION_STATUS_INDEX_CF: &str = "transaction_status_index";
 /// Column family for Rewards
 const REWARDS_CF: &str = "rewards";
+/// Column family for Blocktime
+const BLOCKTIME_CF: &str = "blocktime";
+/// Column family for Performance Samples
+const PERF_SAMPLES_CF: &str = "perf_samples";
 
 #[derive(Error, Debug)]
 pub enum BlockstoreError {
@@ -61,6 +71,10 @@ pub enum BlockstoreError {
     UnpackError(#[from] UnpackError),
     UnableToSetOpenFileDescriptorLimit,
     TransactionStatusSlotMismatch,
+    EmptyEpochStakes,
+    NoVoteTimestampsInRange,
+    ProtobufEncodeError(#[from] prost::EncodeError),
+    ProtobufDecodeError(#[from] prost::DecodeError),
 }
 pub type Result<T> = std::result::Result<T, BlockstoreError>;
 
@@ -128,10 +142,19 @@ pub mod columns {
     #[derive(Debug)]
     /// The rewards column
     pub struct Rewards;
+
+    #[derive(Debug)]
+    /// The blocktime column
+    pub struct Blocktime;
+
+    #[derive(Debug)]
+    /// The performance samples column
+    pub struct PerfSamples;
 }
 
 pub enum AccessType {
     PrimaryOnly,
+    PrimaryOnlyForMaintenance, // this indicates no compaction
     TryPrimaryThenSecondary,
 }
 
@@ -162,9 +185,10 @@ impl From<&str> for BlockstoreRecoveryMode {
         }
     }
 }
-impl Into<DBRecoveryMode> for BlockstoreRecoveryMode {
-    fn into(self) -> DBRecoveryMode {
-        match self {
+
+impl From<BlockstoreRecoveryMode> for DBRecoveryMode {
+    fn from(brm: BlockstoreRecoveryMode) -> Self {
+        match brm {
             BlockstoreRecoveryMode::TolerateCorruptedTailRecords => {
                 DBRecoveryMode::TolerateCorruptedTailRecords
             }
@@ -187,40 +211,53 @@ impl Rocks {
         recovery_mode: Option<BlockstoreRecoveryMode>,
     ) -> Result<Rocks> {
         use columns::{
-            AddressSignatures, DeadSlots, DuplicateSlots, ErasureMeta, Index, Orphans, Rewards,
-            Root, ShredCode, ShredData, SlotMeta, TransactionStatus, TransactionStatusIndex,
+            AddressSignatures, Blocktime, DeadSlots, DuplicateSlots, ErasureMeta, Index, Orphans,
+            PerfSamples, Rewards, Root, ShredCode, ShredData, SlotMeta, TransactionStatus,
+            TransactionStatusIndex,
         };
 
         fs::create_dir_all(&path)?;
 
         // Use default database options
-        let mut db_options = get_db_options();
+        if matches!(access_type, AccessType::PrimaryOnlyForMaintenance) {
+            warn!("Disabling rocksdb's auto compaction for maintenance bulk ledger update...");
+        }
+        let mut db_options = get_db_options(&access_type);
         if let Some(recovery_mode) = recovery_mode {
             db_options.set_wal_recovery_mode(recovery_mode.into());
         }
 
         // Column family names
-        let meta_cf_descriptor = ColumnFamilyDescriptor::new(SlotMeta::NAME, get_cf_options());
+        let meta_cf_descriptor =
+            ColumnFamilyDescriptor::new(SlotMeta::NAME, get_cf_options(&access_type));
         let dead_slots_cf_descriptor =
-            ColumnFamilyDescriptor::new(DeadSlots::NAME, get_cf_options());
+            ColumnFamilyDescriptor::new(DeadSlots::NAME, get_cf_options(&access_type));
         let duplicate_slots_cf_descriptor =
-            ColumnFamilyDescriptor::new(DuplicateSlots::NAME, get_cf_options());
+            ColumnFamilyDescriptor::new(DuplicateSlots::NAME, get_cf_options(&access_type));
         let erasure_meta_cf_descriptor =
-            ColumnFamilyDescriptor::new(ErasureMeta::NAME, get_cf_options());
-        let orphans_cf_descriptor = ColumnFamilyDescriptor::new(Orphans::NAME, get_cf_options());
-        let root_cf_descriptor = ColumnFamilyDescriptor::new(Root::NAME, get_cf_options());
-        let index_cf_descriptor = ColumnFamilyDescriptor::new(Index::NAME, get_cf_options());
+            ColumnFamilyDescriptor::new(ErasureMeta::NAME, get_cf_options(&access_type));
+        let orphans_cf_descriptor =
+            ColumnFamilyDescriptor::new(Orphans::NAME, get_cf_options(&access_type));
+        let root_cf_descriptor =
+            ColumnFamilyDescriptor::new(Root::NAME, get_cf_options(&access_type));
+        let index_cf_descriptor =
+            ColumnFamilyDescriptor::new(Index::NAME, get_cf_options(&access_type));
         let shred_data_cf_descriptor =
-            ColumnFamilyDescriptor::new(ShredData::NAME, get_cf_options());
+            ColumnFamilyDescriptor::new(ShredData::NAME, get_cf_options(&access_type));
         let shred_code_cf_descriptor =
-            ColumnFamilyDescriptor::new(ShredCode::NAME, get_cf_options());
+            ColumnFamilyDescriptor::new(ShredCode::NAME, get_cf_options(&access_type));
         let transaction_status_cf_descriptor =
-            ColumnFamilyDescriptor::new(TransactionStatus::NAME, get_cf_options());
+            ColumnFamilyDescriptor::new(TransactionStatus::NAME, get_cf_options(&access_type));
         let address_signatures_cf_descriptor =
-            ColumnFamilyDescriptor::new(AddressSignatures::NAME, get_cf_options());
+            ColumnFamilyDescriptor::new(AddressSignatures::NAME, get_cf_options(&access_type));
         let transaction_status_index_cf_descriptor =
-            ColumnFamilyDescriptor::new(TransactionStatusIndex::NAME, get_cf_options());
-        let rewards_cf_descriptor = ColumnFamilyDescriptor::new(Rewards::NAME, get_cf_options());
+            ColumnFamilyDescriptor::new(TransactionStatusIndex::NAME, get_cf_options(&access_type));
+        let rewards_cf_descriptor =
+            ColumnFamilyDescriptor::new(Rewards::NAME, get_cf_options(&access_type));
+        let blocktime_cf_descriptor =
+            ColumnFamilyDescriptor::new(Blocktime::NAME, get_cf_options(&access_type));
+        let perf_samples_cf_descriptor =
+            ColumnFamilyDescriptor::new(PerfSamples::NAME, get_cf_options(&access_type));
 
         let cfs = vec![
             (SlotMeta::NAME, meta_cf_descriptor),
@@ -239,11 +276,13 @@ impl Rocks {
                 transaction_status_index_cf_descriptor,
             ),
             (Rewards::NAME, rewards_cf_descriptor),
+            (Blocktime::NAME, blocktime_cf_descriptor),
+            (PerfSamples::NAME, perf_samples_cf_descriptor),
         ];
 
         // Open the database
         let db = match access_type {
-            AccessType::PrimaryOnly => Rocks(
+            AccessType::PrimaryOnly | AccessType::PrimaryOnlyForMaintenance => Rocks(
                 DB::open_cf_descriptors(&db_options, path, cfs.into_iter().map(|c| c.1))?,
                 ActualAccessType::Primary,
             ),
@@ -276,8 +315,9 @@ impl Rocks {
 
     fn columns(&self) -> Vec<&'static str> {
         use columns::{
-            AddressSignatures, DeadSlots, DuplicateSlots, ErasureMeta, Index, Orphans, Rewards,
-            Root, ShredCode, ShredData, SlotMeta, TransactionStatus, TransactionStatusIndex,
+            AddressSignatures, Blocktime, DeadSlots, DuplicateSlots, ErasureMeta, Index, Orphans,
+            PerfSamples, Rewards, Root, ShredCode, ShredData, SlotMeta, TransactionStatus,
+            TransactionStatusIndex,
         };
 
         vec![
@@ -294,6 +334,8 @@ impl Rocks {
             AddressSignatures::NAME,
             TransactionStatusIndex::NAME,
             Rewards::NAME,
+            Blocktime::NAME,
+            PerfSamples::NAME,
         ]
     }
 
@@ -319,11 +361,7 @@ impl Rocks {
         Ok(())
     }
 
-    fn iterator_cf<C>(
-        &self,
-        cf: &ColumnFamily,
-        iterator_mode: IteratorMode<C::Index>,
-    ) -> Result<DBIterator>
+    fn iterator_cf<C>(&self, cf: &ColumnFamily, iterator_mode: IteratorMode<C::Index>) -> DBIterator
     where
         C: Column,
     {
@@ -336,18 +374,15 @@ impl Rocks {
             IteratorMode::Start => RocksIteratorMode::Start,
             IteratorMode::End => RocksIteratorMode::End,
         };
-        let iter = self.0.iterator_cf(cf, iterator_mode);
-        Ok(iter)
+        self.0.iterator_cf(cf, iterator_mode)
     }
 
-    fn raw_iterator_cf(&self, cf: &ColumnFamily) -> Result<DBRawIterator> {
-        let raw_iter = self.0.raw_iterator_cf(cf);
-
-        Ok(raw_iter)
+    fn raw_iterator_cf(&self, cf: &ColumnFamily) -> DBRawIterator {
+        self.0.raw_iterator_cf(cf)
     }
 
-    fn batch(&self) -> Result<RWriteBatch> {
-        Ok(RWriteBatch::default())
+    fn batch(&self) -> RWriteBatch {
+        RWriteBatch::default()
     }
 
     fn write(&self, batch: RWriteBatch) -> Result<()> {
@@ -370,6 +405,7 @@ pub trait Column {
     fn key(index: Self::Index) -> Vec<u8>;
     fn index(key: &[u8]) -> Self::Index;
     fn primary_index(index: Self::Index) -> Slot;
+    #[allow(clippy::wrong_self_convention)]
     fn as_index(slot: Slot) -> Self::Index;
 }
 
@@ -391,6 +427,10 @@ impl TypedColumn for columns::AddressSignatures {
 
 impl TypedColumn for columns::TransactionStatusIndex {
     type Type = blockstore_meta::TransactionStatusIndexMeta;
+}
+
+pub trait ProtobufColumn: Column {
+    type Type: prost::Message + Default;
 }
 
 pub trait SlotColumn<Index = u64> {}
@@ -515,8 +555,24 @@ impl SlotColumn for columns::Rewards {}
 impl ColumnName for columns::Rewards {
     const NAME: &'static str = REWARDS_CF;
 }
-impl TypedColumn for columns::Rewards {
-    type Type = Rewards;
+impl ProtobufColumn for columns::Rewards {
+    type Type = generated::Rewards;
+}
+
+impl SlotColumn for columns::Blocktime {}
+impl ColumnName for columns::Blocktime {
+    const NAME: &'static str = BLOCKTIME_CF;
+}
+impl TypedColumn for columns::Blocktime {
+    type Type = UnixTimestamp;
+}
+
+impl SlotColumn for columns::PerfSamples {}
+impl ColumnName for columns::PerfSamples {
+    const NAME: &'static str = PERF_SAMPLES_CF;
+}
+impl TypedColumn for columns::PerfSamples {
+    type Type = blockstore_meta::PerfSample;
 }
 
 impl Column for columns::ShredCode {
@@ -705,15 +761,15 @@ impl Database {
         }
     }
 
-    pub fn iter<'a, C>(
-        &'a self,
+    pub fn iter<C>(
+        &self,
         iterator_mode: IteratorMode<C::Index>,
-    ) -> Result<impl Iterator<Item = (C::Index, Box<[u8]>)> + 'a>
+    ) -> Result<impl Iterator<Item = (C::Index, Box<[u8]>)> + '_>
     where
         C: Column + ColumnName,
     {
         let cf = self.cf_handle::<C>();
-        let iter = self.backend.iterator_cf::<C>(cf, iterator_mode)?;
+        let iter = self.backend.iterator_cf::<C>(cf, iterator_mode);
         Ok(iter.map(|(key, value)| (C::index(&key), value)))
     }
 
@@ -737,11 +793,11 @@ impl Database {
 
     #[inline]
     pub fn raw_iterator_cf(&self, cf: &ColumnFamily) -> Result<DBRawIterator> {
-        self.backend.raw_iterator_cf(cf)
+        Ok(self.backend.raw_iterator_cf(cf))
     }
 
     pub fn batch(&self) -> Result<WriteBatch> {
-        let write_batch = self.backend.batch()?;
+        let write_batch = self.backend.batch();
         let map = self
             .backend
             .columns()
@@ -784,12 +840,12 @@ where
         self.backend.get_cf(self.handle(), &C::key(key))
     }
 
-    pub fn iter<'a>(
-        &'a self,
+    pub fn iter(
+        &self,
         iterator_mode: IteratorMode<C::Index>,
-    ) -> Result<impl Iterator<Item = (C::Index, Box<[u8]>)> + 'a> {
+    ) -> Result<impl Iterator<Item = (C::Index, Box<[u8]>)> + '_> {
         let cf = self.handle();
-        let iter = self.backend.iterator_cf::<C>(cf, iterator_mode)?;
+        let iter = self.backend.iterator_cf::<C>(cf, iterator_mode);
         Ok(iter.map(|(key, value)| (C::index(&key), value)))
     }
 
@@ -845,7 +901,7 @@ where
 
     #[cfg(test)]
     pub fn is_empty(&self) -> Result<bool> {
-        let mut iter = self.backend.raw_iterator_cf(self.handle())?;
+        let mut iter = self.backend.raw_iterator_cf(self.handle());
         iter.seek_to_first();
         Ok(!iter.valid())
     }
@@ -874,6 +930,40 @@ where
 
         self.backend
             .put_cf(self.handle(), &C::key(key), &serialized_value)
+    }
+}
+
+impl<C> LedgerColumn<C>
+where
+    C: ProtobufColumn + ColumnName,
+{
+    pub fn get_protobuf_or_bincode<T: DeserializeOwned + Into<C::Type>>(
+        &self,
+        key: C::Index,
+    ) -> Result<Option<C::Type>> {
+        if let Some(serialized_value) = self.backend.get_cf(self.handle(), &C::key(key))? {
+            let value = match C::Type::decode(&serialized_value[..]) {
+                Ok(value) => value,
+                Err(_) => deserialize::<T>(&serialized_value)?.into(),
+            };
+            Ok(Some(value))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_protobuf(&self, key: C::Index) -> Result<Option<C::Type>> {
+        if let Some(serialized_value) = self.backend.get_cf(self.handle(), &C::key(key))? {
+            Ok(Some(C::Type::decode(&serialized_value[..])?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn put_protobuf(&self, key: C::Index, value: &C::Type) -> Result<()> {
+        let mut buf = Vec::with_capacity(value.encoded_len());
+        value.encode(&mut buf)?;
+        self.backend.put_cf(self.handle(), &C::key(key), &buf)
     }
 }
 
@@ -917,7 +1007,7 @@ impl<'a> WriteBatch<'a> {
     }
 }
 
-fn get_cf_options() -> Options {
+fn get_cf_options(access_type: &AccessType) -> Options {
     let mut options = Options::default();
     // 256 * 8 = 2GB. 6 of these columns should take at most 12GB of RAM
     options.set_max_write_buffer_number(8);
@@ -931,18 +1021,34 @@ fn get_cf_options() -> Options {
     options.set_level_zero_file_num_compaction_trigger(file_num_compaction_trigger as i32);
     options.set_max_bytes_for_level_base(total_size_base);
     options.set_target_file_size_base(file_size_base);
+    if matches!(access_type, AccessType::PrimaryOnlyForMaintenance) {
+        options.set_disable_auto_compactions(true);
+    }
+
     options
 }
 
-fn get_db_options() -> Options {
+fn get_db_options(access_type: &AccessType) -> Options {
     let mut options = Options::default();
     options.create_if_missing(true);
     options.create_missing_column_families(true);
     // A good value for this is the number of cores on the machine
     options.increase_parallelism(num_cpus::get() as i32);
 
+    let mut env = rocksdb::Env::default().unwrap();
+
+    // While a compaction is ongoing, all the background threads
+    // could be used by the compaction. This can stall writes which
+    // need to flush the memtable. Add some high-priority background threads
+    // which can service these writes.
+    env.set_high_priority_background_threads(4);
+    options.set_env(&env);
+
     // Set max total wal size to 4G.
     options.set_max_total_wal_size(4 * 1024 * 1024 * 1024);
+    if matches!(access_type, AccessType::PrimaryOnlyForMaintenance) {
+        options.set_disable_auto_compactions(true);
+    }
 
     options
 }

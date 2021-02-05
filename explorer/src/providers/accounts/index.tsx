@@ -1,29 +1,63 @@
 import React from "react";
-import * as Sentry from "@sentry/react";
-import { StakeAccount as StakeAccountWasm } from "solana-sdk-wasm";
-import { PublicKey, Connection, StakeProgram } from "@solana/web3.js";
-import { useCluster } from "../cluster";
+import { PublicKey, Connection, StakeActivationData } from "@solana/web3.js";
+import { useCluster, Cluster } from "../cluster";
 import { HistoryProvider } from "./history";
-import { TokensProvider, TOKEN_PROGRAM_ID } from "./tokens";
+import { TokensProvider } from "./tokens";
 import { coerce } from "superstruct";
 import { ParsedInfo } from "validators";
 import { StakeAccount } from "validators/accounts/stake";
-import { TokenAccount } from "validators/accounts/token";
+import {
+  TokenAccount,
+  MintAccountInfo,
+  TokenAccountInfo,
+} from "validators/accounts/token";
 import * as Cache from "providers/cache";
 import { ActionType, FetchStatus } from "providers/cache";
+import { reportError } from "utils/sentry";
+import { VoteAccount } from "validators/accounts/vote";
+import { NonceAccount } from "validators/accounts/nonce";
+import { SysvarAccount } from "validators/accounts/sysvar";
+import { ConfigAccount } from "validators/accounts/config";
 export { useAccountHistory } from "./history";
 
 export type StakeProgramData = {
-  name: "stake";
-  parsed: StakeAccount | StakeAccountWasm;
+  program: "stake";
+  parsed: StakeAccount;
+  activation?: StakeActivationData;
 };
 
 export type TokenProgramData = {
-  name: "spl-token";
+  program: "spl-token";
   parsed: TokenAccount;
 };
 
-export type ProgramData = StakeProgramData | TokenProgramData;
+export type VoteProgramData = {
+  program: "vote";
+  parsed: VoteAccount;
+};
+
+export type NonceProgramData = {
+  program: "nonce";
+  parsed: NonceAccount;
+};
+
+export type SysvarProgramData = {
+  program: "sysvar";
+  parsed: SysvarAccount;
+};
+
+export type ConfigProgramData = {
+  program: "config";
+  parsed: ConfigAccount;
+};
+
+export type ProgramData =
+  | StakeProgramData
+  | TokenProgramData
+  | VoteProgramData
+  | NonceProgramData
+  | SysvarProgramData
+  | ConfigProgramData;
 
 export interface Details {
   executable: boolean;
@@ -68,6 +102,7 @@ export function AccountsProvider({ children }: AccountsProviderProps) {
 async function fetchAccountInfo(
   dispatch: Dispatch,
   pubkey: PublicKey,
+  cluster: Cluster,
   url: string
 ) {
   dispatch({
@@ -80,9 +115,8 @@ async function fetchAccountInfo(
   let data;
   let fetchStatus;
   try {
-    const result = (
-      await new Connection(url, "single").getParsedAccountInfo(pubkey)
-    ).value;
+    const connection = new Connection(url, "single");
+    const result = (await connection.getParsedAccountInfo(pubkey)).value;
 
     let lamports, details;
     if (result === null) {
@@ -97,41 +131,60 @@ async function fetchAccountInfo(
       }
 
       let data: ProgramData | undefined;
-      if (result.owner.equals(StakeProgram.programId)) {
+      if ("parsed" in result.data) {
         try {
-          let parsed;
-          if ("parsed" in result.data) {
-            const info = coerce(result.data.parsed, ParsedInfo);
-            parsed = coerce(info, StakeAccount);
-          } else {
-            const wasm = await import("solana-sdk-wasm");
-            parsed = wasm.StakeAccount.fromAccountData(result.data);
+          const info = coerce(result.data.parsed, ParsedInfo);
+          switch (result.data.program) {
+            case "stake": {
+              const parsed = coerce(info, StakeAccount);
+              const isDelegated = parsed.type === "delegated";
+              const activation = isDelegated
+                ? await connection.getStakeActivation(pubkey)
+                : undefined;
+
+              data = {
+                program: result.data.program,
+                parsed,
+                activation,
+              };
+              break;
+            }
+            case "vote":
+              data = {
+                program: result.data.program,
+                parsed: coerce(info, VoteAccount),
+              };
+              break;
+            case "nonce":
+              data = {
+                program: result.data.program,
+                parsed: coerce(info, NonceAccount),
+              };
+              break;
+            case "sysvar":
+              data = {
+                program: result.data.program,
+                parsed: coerce(info, SysvarAccount),
+              };
+              break;
+            case "config":
+              data = {
+                program: result.data.program,
+                parsed: coerce(info, ConfigAccount),
+              };
+              break;
+
+            case "spl-token":
+              data = {
+                program: result.data.program,
+                parsed: coerce(info, TokenAccount),
+              };
+              break;
+            default:
+              data = undefined;
           }
-          data = {
-            name: "stake",
-            parsed,
-          };
-        } catch (err) {
-          Sentry.captureException(err, {
-            tags: { url, address: pubkey.toBase58() },
-          });
-          // TODO store error state in Account info
-        }
-      } else if ("parsed" in result.data) {
-        if (result.owner.equals(TOKEN_PROGRAM_ID)) {
-          try {
-            const info = coerce(result.data.parsed, ParsedInfo);
-            const parsed = coerce(info, TokenAccount);
-            data = {
-              name: "spl-token",
-              parsed,
-            };
-          } catch (err) {
-            Sentry.captureException(err, {
-              tags: { url, address: pubkey.toBase58() },
-            });
-            // TODO store error state in Account info
-          }
+        } catch (error) {
+          reportError(error, { url, address: pubkey.toBase58() });
         }
       }
 
@@ -145,7 +198,9 @@ async function fetchAccountInfo(
     data = { pubkey, lamports, details };
     fetchStatus = FetchStatus.Fetched;
   } catch (error) {
-    Sentry.captureException(error, { tags: { url } });
+    if (cluster !== Cluster.Custom) {
+      reportError(error, { url });
+    }
     fetchStatus = FetchStatus.FetchFailed;
   }
   dispatch({
@@ -166,15 +221,55 @@ export function useAccounts() {
 }
 
 export function useAccountInfo(
-  address: string
+  address: string | undefined
 ): Cache.CacheEntry<Account> | undefined {
   const context = React.useContext(StateContext);
 
   if (!context) {
     throw new Error(`useAccountInfo must be used within a AccountsProvider`);
   }
-
+  if (address === undefined) return;
   return context.entries[address];
+}
+
+export function useMintAccountInfo(
+  address: string | undefined
+): MintAccountInfo | undefined {
+  const accountInfo = useAccountInfo(address);
+  return React.useMemo(() => {
+    if (address === undefined) return;
+
+    try {
+      const data = accountInfo?.data?.details?.data;
+      if (!data) return;
+      if (data.program !== "spl-token" || data.parsed.type !== "mint") {
+        return;
+      }
+
+      return coerce(data.parsed.info, MintAccountInfo);
+    } catch (err) {
+      reportError(err, { address });
+    }
+  }, [address, accountInfo]);
+}
+
+export function useTokenAccountInfo(
+  address: string | undefined
+): TokenAccountInfo | undefined {
+  const accountInfo = useAccountInfo(address);
+  if (address === undefined) return;
+
+  try {
+    const data = accountInfo?.data?.details?.data;
+    if (!data) return;
+    if (data.program !== "spl-token" || data.parsed.type !== "account") {
+      return;
+    }
+
+    return coerce(data.parsed.info, TokenAccountInfo);
+  } catch (err) {
+    reportError(err, { address });
+  }
 }
 
 export function useFetchAccountInfo() {
@@ -185,8 +280,11 @@ export function useFetchAccountInfo() {
     );
   }
 
-  const { url } = useCluster();
-  return (pubkey: PublicKey) => {
-    fetchAccountInfo(dispatch, pubkey, url);
-  };
+  const { cluster, url } = useCluster();
+  return React.useCallback(
+    (pubkey: PublicKey) => {
+      fetchAccountInfo(dispatch, pubkey, cluster, url);
+    },
+    [dispatch, cluster, url]
+  );
 }

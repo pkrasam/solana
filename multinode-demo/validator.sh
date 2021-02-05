@@ -109,9 +109,6 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --rpc-faucet-address ]]; then
       args+=("$1" "$2")
       shift 2
-    elif [[ $1 = --vote-signer-address ]]; then
-      args+=("$1" "$2")
-      shift 2
     elif [[ $1 = --accounts ]]; then
       args+=("$1" "$2")
       shift 2
@@ -133,6 +130,9 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --enable-rpc-transaction-history ]]; then
       args+=("$1")
       shift
+    elif [[ $1 = --enable-cpi-and-log-storage ]]; then
+      args+=("$1")
+      shift
     elif [[ $1 = --skip-poh-verify ]]; then
       args+=("$1")
       shift
@@ -149,6 +149,9 @@ while [[ -n $1 ]]; do
       args+=("$1" "$2")
       shift 2
     elif [[ $1 == --wait-for-supermajority ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --expected-bank-hash ]]; then
       args+=("$1" "$2")
       shift 2
     elif [[ $1 = -h ]]; then
@@ -225,6 +228,7 @@ default_arg --ledger "$ledger_dir"
 default_arg --log -
 default_arg --enable-rpc-exit
 default_arg --enable-rpc-set-log-filter
+default_arg --require-tower
 
 if [[ -n $SOLANA_CUDA ]]; then
   program=$solana_validator_cuda
@@ -264,6 +268,10 @@ wallet() {
 
 setup_validator_accounts() {
   declare node_sol=$1
+
+  if [[ -n "$SKIP_ACCOUNTS_CREATION" ]]; then
+    return 0
+  fi
 
   if ! wallet vote-account "$vote_account"; then
     if ((airdrops_enabled)); then

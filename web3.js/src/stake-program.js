@@ -116,12 +116,35 @@ export type DelegateStakeParams = {|
  * @property {PublicKey} authorizedPubkey
  * @property {PublicKey} newAuthorizedPubkey
  * @property {StakeAuthorizationType} stakeAuthorizationType
+ * @property {PublicKey} custodianPubkey
  */
 export type AuthorizeStakeParams = {|
   stakePubkey: PublicKey,
   authorizedPubkey: PublicKey,
   newAuthorizedPubkey: PublicKey,
   stakeAuthorizationType: StakeAuthorizationType,
+  custodianPubkey?: PublicKey,
+|};
+
+/**
+ * Authorize stake instruction params using a derived key
+ * @typedef {Object} AuthorizeWithSeedStakeParams
+ * @property {PublicKey} stakePubkey
+ * @property {PublicKey} authorityBase
+ * @property {string} authoritySeed
+ * @property {PublicKey} authorityOwner
+ * @property {PublicKey} newAuthorizedPubkey
+ * @property {StakeAuthorizationType} stakeAuthorizationType
+ * @property {PublicKey} custodianPubkey
+ */
+export type AuthorizeWithSeedStakeParams = {|
+  stakePubkey: PublicKey,
+  authorityBase: PublicKey,
+  authoritySeed: string,
+  authorityOwner: PublicKey,
+  newAuthorizedPubkey: PublicKey,
+  stakeAuthorizationType: StakeAuthorizationType,
+  custodianPubkey?: PublicKey,
 |};
 
 /**
@@ -146,12 +169,14 @@ export type SplitStakeParams = {|
  * @property {PublicKey} authorizedPubkey
  * @property {PublicKey} toPubkey
  * @property {number} lamports
+ * @property {PublicKey} custodianPubkey
  */
 export type WithdrawStakeParams = {|
   stakePubkey: PublicKey,
   authorizedPubkey: PublicKey,
   toPubkey: PublicKey,
   lamports: number,
+  custodianPubkey?: PublicKey,
 |};
 
 /**
@@ -252,7 +277,7 @@ export class StakeInstruction {
       instruction.data,
     );
 
-    return {
+    const o: AuthorizeStakeParams = {
       stakePubkey: instruction.keys[0].pubkey,
       authorizedPubkey: instruction.keys[2].pubkey,
       newAuthorizedPubkey: new PublicKey(newAuthorized),
@@ -260,6 +285,45 @@ export class StakeInstruction {
         index: stakeAuthorizationType,
       },
     };
+    if (instruction.keys.length > 3) {
+      o.custodianPubkey = instruction.keys[3].pubkey;
+    }
+    return o;
+  }
+
+  /**
+   * Decode an authorize-with-seed stake instruction and retrieve the instruction params.
+   */
+  static decodeAuthorizeWithSeed(
+    instruction: TransactionInstruction,
+  ): AuthorizeWithSeedStakeParams {
+    this.checkProgramId(instruction.programId);
+    this.checkKeyLength(instruction.keys, 2);
+
+    const {
+      newAuthorized,
+      stakeAuthorizationType,
+      authoritySeed,
+      authorityOwner,
+    } = decodeData(
+      STAKE_INSTRUCTION_LAYOUTS.AuthorizeWithSeed,
+      instruction.data,
+    );
+
+    const o: AuthorizeWithSeedStakeParams = {
+      stakePubkey: instruction.keys[0].pubkey,
+      authorityBase: instruction.keys[1].pubkey,
+      authoritySeed: authoritySeed,
+      authorityOwner: new PublicKey(authorityOwner),
+      newAuthorizedPubkey: new PublicKey(newAuthorized),
+      stakeAuthorizationType: {
+        index: stakeAuthorizationType,
+      },
+    };
+    if (instruction.keys.length > 3) {
+      o.custodianPubkey = instruction.keys[3].pubkey;
+    }
+    return o;
   }
 
   /**
@@ -294,12 +358,16 @@ export class StakeInstruction {
       instruction.data,
     );
 
-    return {
+    const o: WithdrawStakeParams = {
       stakePubkey: instruction.keys[0].pubkey,
       toPubkey: instruction.keys[1].pubkey,
       authorizedPubkey: instruction.keys[4].pubkey,
       lamports,
     };
+    if (instruction.keys.length > 5) {
+      o.custodianPubkey = instruction.keys[5].pubkey;
+    }
+    return o;
   }
 
   /**
@@ -341,7 +409,7 @@ export class StakeInstruction {
 
 /**
  * An enumeration of valid StakeInstructionType's
- * @typedef { 'Initialize' | 'Authorize' | 'Delegate' | 'Split' | 'Withdraw'
+ * @typedef { 'Initialize' | 'Authorize' | 'AuthorizeWithSeed' | 'Delegate' | 'Split' | 'Withdraw'
  | 'Deactivate' } StakeInstructionType
  */
 export type StakeInstructionType = $Keys<typeof STAKE_INSTRUCTION_LAYOUTS>;
@@ -388,6 +456,16 @@ export const STAKE_INSTRUCTION_LAYOUTS = Object.freeze({
     index: 5,
     layout: BufferLayout.struct([BufferLayout.u32('instruction')]),
   },
+  AuthorizeWithSeed: {
+    index: 8,
+    layout: BufferLayout.struct([
+      BufferLayout.u32('instruction'),
+      Layout.publicKey('newAuthorized'),
+      BufferLayout.u32('stakeAuthorizationType'),
+      Layout.rustString('authoritySeed'),
+      Layout.publicKey('authorityOwner'),
+    ]),
+  },
 });
 
 /**
@@ -423,9 +501,13 @@ export class StakeProgram {
 
   /**
    * Max space of a Stake account
+   *
+   * This is generated from the solana-stake-program StakeState struct as
+   * `std::mem::size_of::<StakeState>()`:
+   * https://docs.rs/solana-stake-program/1.4.4/solana_stake_program/stake_state/enum.StakeState.html
    */
   static get space(): number {
-    return 4008;
+    return 200;
   }
 
   /**
@@ -463,15 +545,18 @@ export class StakeProgram {
   static createAccountWithSeed(
     params: CreateStakeAccountWithSeedParams,
   ): Transaction {
-    let transaction = SystemProgram.createAccountWithSeed({
-      fromPubkey: params.fromPubkey,
-      newAccountPubkey: params.stakePubkey,
-      basePubkey: params.basePubkey,
-      seed: params.seed,
-      lamports: params.lamports,
-      space: this.space,
-      programId: this.programId,
-    });
+    const transaction = new Transaction();
+    transaction.add(
+      SystemProgram.createAccountWithSeed({
+        fromPubkey: params.fromPubkey,
+        newAccountPubkey: params.stakePubkey,
+        basePubkey: params.basePubkey,
+        seed: params.seed,
+        lamports: params.lamports,
+        space: this.space,
+        programId: this.programId,
+      }),
+    );
 
     const {stakePubkey, authorized, lockup} = params;
     return transaction.add(this.initialize({stakePubkey, authorized, lockup}));
@@ -481,13 +566,16 @@ export class StakeProgram {
    * Generate a Transaction that creates a new Stake account
    */
   static createAccount(params: CreateStakeAccountParams): Transaction {
-    let transaction = SystemProgram.createAccount({
-      fromPubkey: params.fromPubkey,
-      newAccountPubkey: params.stakePubkey,
-      lamports: params.lamports,
-      space: this.space,
-      programId: this.programId,
-    });
+    const transaction = new Transaction();
+    transaction.add(
+      SystemProgram.createAccount({
+        fromPubkey: params.fromPubkey,
+        newAccountPubkey: params.stakePubkey,
+        lamports: params.lamports,
+        space: this.space,
+        programId: this.programId,
+      }),
+    );
 
     const {stakePubkey, authorized, lockup} = params;
     return transaction.add(this.initialize({stakePubkey, authorized, lockup}));
@@ -532,6 +620,7 @@ export class StakeProgram {
       authorizedPubkey,
       newAuthorizedPubkey,
       stakeAuthorizationType,
+      custodianPubkey,
     } = params;
 
     const type = STAKE_INSTRUCTION_LAYOUTS.Authorize;
@@ -540,12 +629,54 @@ export class StakeProgram {
       stakeAuthorizationType: stakeAuthorizationType.index,
     });
 
+    const keys = [
+      {pubkey: stakePubkey, isSigner: false, isWritable: true},
+      {pubkey: SYSVAR_CLOCK_PUBKEY, isSigner: false, isWritable: true},
+      {pubkey: authorizedPubkey, isSigner: true, isWritable: false},
+    ];
+    if (custodianPubkey) {
+      keys.push({pubkey: custodianPubkey, isSigner: false, isWritable: false});
+    }
     return new Transaction().add({
-      keys: [
-        {pubkey: stakePubkey, isSigner: false, isWritable: true},
-        {pubkey: SYSVAR_CLOCK_PUBKEY, isSigner: false, isWritable: true},
-        {pubkey: authorizedPubkey, isSigner: true, isWritable: false},
-      ],
+      keys,
+      programId: this.programId,
+      data,
+    });
+  }
+
+  /**
+   * Generate a Transaction that authorizes a new PublicKey as Staker
+   * or Withdrawer on the Stake account.
+   */
+  static authorizeWithSeed(params: AuthorizeWithSeedStakeParams): Transaction {
+    const {
+      stakePubkey,
+      authorityBase,
+      authoritySeed,
+      authorityOwner,
+      newAuthorizedPubkey,
+      stakeAuthorizationType,
+      custodianPubkey,
+    } = params;
+
+    const type = STAKE_INSTRUCTION_LAYOUTS.AuthorizeWithSeed;
+    const data = encodeData(type, {
+      newAuthorized: newAuthorizedPubkey.toBuffer(),
+      stakeAuthorizationType: stakeAuthorizationType.index,
+      authoritySeed: authoritySeed,
+      authorityOwner: authorityOwner.toBuffer(),
+    });
+
+    const keys = [
+      {pubkey: stakePubkey, isSigner: false, isWritable: true},
+      {pubkey: authorityBase, isSigner: true, isWritable: false},
+      {pubkey: SYSVAR_CLOCK_PUBKEY, isSigner: false, isWritable: false},
+    ];
+    if (custodianPubkey) {
+      keys.push({pubkey: custodianPubkey, isSigner: false, isWritable: false});
+    }
+    return new Transaction().add({
+      keys,
       programId: this.programId,
       data,
     });
@@ -557,13 +688,16 @@ export class StakeProgram {
   static split(params: SplitStakeParams): Transaction {
     const {stakePubkey, authorizedPubkey, splitStakePubkey, lamports} = params;
 
-    let transaction = SystemProgram.createAccount({
-      fromPubkey: authorizedPubkey,
-      newAccountPubkey: splitStakePubkey,
-      lamports: 0,
-      space: this.space,
-      programId: this.programId,
-    });
+    const transaction = new Transaction();
+    transaction.add(
+      SystemProgram.createAccount({
+        fromPubkey: authorizedPubkey,
+        newAccountPubkey: splitStakePubkey,
+        lamports: 0,
+        space: this.space,
+        programId: this.programId,
+      }),
+    );
     const type = STAKE_INSTRUCTION_LAYOUTS.Split;
     const data = encodeData(type, {lamports});
 
@@ -582,22 +716,32 @@ export class StakeProgram {
    * Generate a Transaction that withdraws deactivated Stake tokens.
    */
   static withdraw(params: WithdrawStakeParams): Transaction {
-    const {stakePubkey, authorizedPubkey, toPubkey, lamports} = params;
+    const {
+      stakePubkey,
+      authorizedPubkey,
+      toPubkey,
+      lamports,
+      custodianPubkey,
+    } = params;
     const type = STAKE_INSTRUCTION_LAYOUTS.Withdraw;
     const data = encodeData(type, {lamports});
 
+    const keys = [
+      {pubkey: stakePubkey, isSigner: false, isWritable: true},
+      {pubkey: toPubkey, isSigner: false, isWritable: true},
+      {pubkey: SYSVAR_CLOCK_PUBKEY, isSigner: false, isWritable: false},
+      {
+        pubkey: SYSVAR_STAKE_HISTORY_PUBKEY,
+        isSigner: false,
+        isWritable: false,
+      },
+      {pubkey: authorizedPubkey, isSigner: true, isWritable: false},
+    ];
+    if (custodianPubkey) {
+      keys.push({pubkey: custodianPubkey, isSigner: false, isWritable: false});
+    }
     return new Transaction().add({
-      keys: [
-        {pubkey: stakePubkey, isSigner: false, isWritable: true},
-        {pubkey: toPubkey, isSigner: false, isWritable: true},
-        {pubkey: SYSVAR_CLOCK_PUBKEY, isSigner: false, isWritable: false},
-        {
-          pubkey: SYSVAR_STAKE_HISTORY_PUBKEY,
-          isSigner: false,
-          isWritable: false,
-        },
-        {pubkey: authorizedPubkey, isSigner: true, isWritable: false},
-      ],
+      keys,
       programId: this.programId,
       data,
     });

@@ -1,5 +1,7 @@
 // @flow
-import {PublicKey} from '../src/publickey';
+import BN from 'bn.js';
+
+import {PublicKey, MAX_SEED_LENGTH} from '../src/publickey';
 
 test('invalid', () => {
   expect(() => {
@@ -276,6 +278,30 @@ test('createProgramAddress', async () => {
     programId,
   );
   expect(programAddress.equals(programAddress2)).toBe(false);
+
+  await expect(
+    PublicKey.createProgramAddress(
+      [Buffer.alloc(MAX_SEED_LENGTH + 1)],
+      programId,
+    ),
+  ).rejects.toThrow('Max seed length exceeded');
+
+  // https://github.com/solana-labs/solana/issues/11950
+  {
+    let seeds = [
+      new PublicKey('H4snTKK9adiU15gP22ErfZYtro3aqR9BTMXiH3AwiUTQ').toBuffer(),
+      new BN(2).toArrayLike(Buffer, 'le', 8),
+    ];
+    let programId = new PublicKey(
+      '4ckmDgGdxQoPDLUkDT3vHgSAkzA3QRdNq5ywwY4sUSJn',
+    );
+    programAddress = await PublicKey.createProgramAddress(seeds, programId);
+    expect(
+      programAddress.equals(
+        new PublicKey('12rqwuEgBYiGhBrDJStCiqEtzQpTTiZbh7teNVLuYcFA'),
+      ),
+    ).toBe(true);
+  }
 });
 
 test('findProgramAddress', async () => {

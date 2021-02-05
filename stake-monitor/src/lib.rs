@@ -7,7 +7,9 @@ use solana_sdk::{
     pubkey::Pubkey, signature::Signature, transaction::Transaction,
 };
 use solana_stake_program::{stake_instruction::StakeInstruction, stake_state::Lockup};
-use solana_transaction_status::{ConfirmedBlock, UiTransactionEncoding, UiTransactionStatusMeta};
+use solana_transaction_status::{
+    EncodedConfirmedBlock, UiTransactionEncoding, UiTransactionStatusMeta,
+};
 use std::{collections::HashMap, thread::sleep, time::Duration};
 
 pub type PubkeyString = String;
@@ -133,6 +135,7 @@ fn process_transaction(
                         );
                     }
                     StakeInstruction::Authorize(_, _)
+                    | StakeInstruction::AuthorizeWithSeed(_)
                     | StakeInstruction::DelegateStake
                     | StakeInstruction::Deactivate => {
                         // These instructions are always permitted
@@ -243,7 +246,7 @@ fn process_transaction(
 
 fn process_confirmed_block(
     slot: Slot,
-    confirmed_block: ConfirmedBlock,
+    confirmed_block: EncodedConfirmedBlock,
     accounts: &mut HashMap<PubkeyString, AccountInfo>,
 ) {
     for rpc_transaction in confirmed_block.transactions {
@@ -267,6 +270,8 @@ fn process_confirmed_block(
                                 ("err", "Transaction signature verification failed", String)
                             );
                         }
+                    } else {
+                        error!("Transaction decode failed");
                     }
                 }
             }
@@ -278,7 +283,7 @@ fn load_blocks(
     rpc_client: &RpcClient,
     start_slot: Slot,
     end_slot: Slot,
-) -> ClientResult<Vec<(Slot, ConfirmedBlock)>> {
+) -> ClientResult<Vec<(Slot, EncodedConfirmedBlock)>> {
     info!(
         "Loading confirmed blocks between slots: {} - {}",
         start_slot, end_slot
@@ -289,7 +294,7 @@ fn load_blocks(
     let mut blocks = vec![];
     for slot in slots.into_iter() {
         let block =
-            rpc_client.get_confirmed_block_with_encoding(slot, UiTransactionEncoding::Binary)?;
+            rpc_client.get_confirmed_block_with_encoding(slot, UiTransactionEncoding::Base64)?;
         blocks.push((slot, block));
     }
     Ok(blocks)
@@ -352,13 +357,13 @@ pub fn process_slots(rpc_client: &RpcClient, accounts_info: &mut AccountsInfo, b
 #[cfg(test)]
 mod test {
     use super::*;
-    use serial_test_derive::serial;
+    use serial_test::serial;
     use solana_client::rpc_config::RpcSendTransactionConfig;
     use solana_core::{rpc::JsonRpcConfig, validator::ValidatorConfig};
     use solana_local_cluster::local_cluster::{ClusterConfig, LocalCluster};
     use solana_sdk::{
         commitment_config::CommitmentConfig,
-        genesis_config::OperatingMode,
+        genesis_config::ClusterType,
         message::Message,
         native_token::sol_to_lamports,
         signature::{Keypair, Signer},
@@ -374,8 +379,8 @@ mod test {
         let mut accounts_info = AccountsInfo::default();
 
         let one_sol = sol_to_lamports(1.0);
-        let cluster = LocalCluster::new(&ClusterConfig {
-            operating_mode: OperatingMode::Stable,
+        let cluster = LocalCluster::new(&mut ClusterConfig {
+            cluster_type: ClusterType::MainnetBeta,
             node_stakes: vec![10; 1],
             cluster_lamports: sol_to_lamports(1_000_000_000.0),
             validator_configs: vec![ValidatorConfig {
@@ -413,7 +418,7 @@ mod test {
             .unwrap();
 
         rpc_client
-            .poll_for_signature_with_commitment(&stake1_signature, CommitmentConfig::recent())
+            .poll_for_signature_with_commitment(&stake1_signature, CommitmentConfig::processed())
             .unwrap();
 
         // A balance increase by system transfer is ignored
@@ -468,7 +473,7 @@ mod test {
         rpc_client
             .poll_for_signature_with_commitment(
                 &stake3_initialize_signature,
-                CommitmentConfig::recent(),
+                CommitmentConfig::processed(),
             )
             .unwrap();
 
@@ -491,6 +496,7 @@ mod test {
                 ),
                 RpcSendTransactionConfig {
                     skip_preflight: true,
+                    ..RpcSendTransactionConfig::default()
                 },
             )
             .unwrap();
@@ -498,7 +504,7 @@ mod test {
         rpc_client
             .poll_for_signature_with_commitment(
                 &stake3_withdraw_signature,
-                CommitmentConfig::recent(),
+                CommitmentConfig::processed(),
             )
             .unwrap();
 
@@ -523,7 +529,7 @@ mod test {
         rpc_client
             .poll_for_signature_with_commitment(
                 &stake4_initialize_signature,
-                CommitmentConfig::recent(),
+                CommitmentConfig::processed(),
             )
             .unwrap();
 
@@ -546,6 +552,7 @@ mod test {
                 ),
                 RpcSendTransactionConfig {
                     skip_preflight: true,
+                    ..RpcSendTransactionConfig::default()
                 },
             )
             .unwrap();
@@ -553,7 +560,7 @@ mod test {
         rpc_client
             .poll_for_signature_with_commitment(
                 &stake45_split_signature,
-                CommitmentConfig::recent(),
+                CommitmentConfig::processed(),
             )
             .unwrap();
 
@@ -570,12 +577,15 @@ mod test {
             ))
             .unwrap();
         rpc_client
-            .poll_for_signature_with_commitment(&fund_system1_signature, CommitmentConfig::recent())
+            .poll_for_signature_with_commitment(
+                &fund_system1_signature,
+                CommitmentConfig::processed(),
+            )
             .unwrap();
         accounts_info.enroll_system_account(
             &system1_keypair.pubkey(),
             rpc_client
-                .get_slot_with_commitment(CommitmentConfig::recent())
+                .get_slot_with_commitment(CommitmentConfig::processed())
                 .unwrap(),
             2 * one_sol,
         );
@@ -591,6 +601,7 @@ mod test {
                 ),
                 RpcSendTransactionConfig {
                     skip_preflight: true,
+                    ..RpcSendTransactionConfig::default()
                 },
             )
             .unwrap();
@@ -608,12 +619,15 @@ mod test {
             ))
             .unwrap();
         rpc_client
-            .poll_for_signature_with_commitment(&fund_system2_signature, CommitmentConfig::recent())
+            .poll_for_signature_with_commitment(
+                &fund_system2_signature,
+                CommitmentConfig::processed(),
+            )
             .unwrap();
         accounts_info.enroll_system_account(
             &system2_keypair.pubkey(),
             rpc_client
-                .get_slot_with_commitment(CommitmentConfig::recent())
+                .get_slot_with_commitment(CommitmentConfig::processed())
                 .unwrap(),
             2 * one_sol,
         );
@@ -629,13 +643,14 @@ mod test {
                 ),
                 RpcSendTransactionConfig {
                     skip_preflight: true,
+                    ..RpcSendTransactionConfig::default()
                 },
             )
             .unwrap();
 
         // Process all the transactions
         let current_slot = rpc_client
-            .get_slot_with_commitment(CommitmentConfig::recent())
+            .get_slot_with_commitment(CommitmentConfig::processed())
             .unwrap();
         process_slots(&rpc_client, &mut accounts_info, current_slot + 1);
 

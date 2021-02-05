@@ -85,7 +85,7 @@ impl ClusterSlots {
     }
 
     fn update_peers(&self, cluster_info: &ClusterInfo, bank_forks: &RwLock<BankForks>) {
-        let root_bank = bank_forks.read().unwrap().root_bank().clone();
+        let root_bank = bank_forks.read().unwrap().root_bank();
         let root_epoch = root_bank.epoch();
         let my_epoch = *self.epoch.read().unwrap();
 
@@ -106,28 +106,30 @@ impl ClusterSlots {
         }
     }
 
-    pub fn compute_weights(&self, slot: Slot, repair_peers: &[ContactInfo]) -> Vec<(u64, usize)> {
-        let slot_peers = self.lookup(slot);
+    pub fn compute_weights(&self, slot: Slot, repair_peers: &[ContactInfo]) -> Vec<u64> {
+        let stakes = {
+            let validator_stakes = self.validator_stakes.read().unwrap();
+            repair_peers
+                .iter()
+                .map(|peer| {
+                    validator_stakes
+                        .get(&peer.id)
+                        .map(|node| node.total_stake)
+                        .unwrap_or(0)
+                        + 1
+                })
+                .collect()
+        };
+        let slot_peers = match self.lookup(slot) {
+            None => return stakes,
+            Some(slot_peers) => slot_peers,
+        };
+        let slot_peers = slot_peers.read().unwrap();
         repair_peers
             .iter()
-            .enumerate()
-            .map(|(i, x)| {
-                let peer_stake = slot_peers
-                    .as_ref()
-                    .and_then(|v| v.read().unwrap().get(&x.id).cloned())
-                    .unwrap_or(0);
-                (
-                    1 + peer_stake
-                        + self
-                            .validator_stakes
-                            .read()
-                            .unwrap()
-                            .get(&x.id)
-                            .map(|v| v.total_stake)
-                            .unwrap_or(0),
-                    i,
-                )
-            })
+            .map(|peer| slot_peers.get(&peer.id).cloned().unwrap_or(0))
+            .zip(stakes)
+            .map(|(a, b)| a + b)
             .collect()
     }
 
@@ -228,7 +230,7 @@ mod tests {
     fn test_compute_weights() {
         let cs = ClusterSlots::default();
         let ci = ContactInfo::default();
-        assert_eq!(cs.compute_weights(0, &[ci]), vec![(1, 0)]);
+        assert_eq!(cs.compute_weights(0, &[ci]), vec![1]);
     }
 
     #[test]
@@ -237,8 +239,8 @@ mod tests {
         let mut c1 = ContactInfo::default();
         let mut c2 = ContactInfo::default();
         let mut map = HashMap::new();
-        let k1 = Pubkey::new_rand();
-        let k2 = Pubkey::new_rand();
+        let k1 = solana_sdk::pubkey::new_rand();
+        let k2 = solana_sdk::pubkey::new_rand();
         map.insert(Arc::new(k1), std::u64::MAX / 2);
         map.insert(Arc::new(k2), 0);
         cs.cluster_slots
@@ -249,7 +251,7 @@ mod tests {
         c2.id = k2;
         assert_eq!(
             cs.compute_weights(0, &[c1, c2]),
-            vec![(std::u64::MAX / 2 + 1, 0), (1, 1)]
+            vec![std::u64::MAX / 2 + 1, 1]
         );
     }
 
@@ -259,8 +261,8 @@ mod tests {
         let mut c1 = ContactInfo::default();
         let mut c2 = ContactInfo::default();
         let mut map = HashMap::new();
-        let k1 = Pubkey::new_rand();
-        let k2 = Pubkey::new_rand();
+        let k1 = solana_sdk::pubkey::new_rand();
+        let k2 = solana_sdk::pubkey::new_rand();
         map.insert(Arc::new(k2), 0);
         cs.cluster_slots
             .write()
@@ -281,7 +283,7 @@ mod tests {
         c2.id = k2;
         assert_eq!(
             cs.compute_weights(0, &[c1, c2]),
-            vec![(std::u64::MAX / 2 + 1, 0), (1, 1)]
+            vec![std::u64::MAX / 2 + 1, 1]
         );
     }
 
@@ -290,7 +292,7 @@ mod tests {
         let cs = ClusterSlots::default();
         let mut contact_infos = vec![ContactInfo::default(); 2];
         for ci in contact_infos.iter_mut() {
-            ci.id = Pubkey::new_rand();
+            ci.id = solana_sdk::pubkey::new_rand();
         }
         let slot = 9;
 
@@ -359,7 +361,7 @@ mod tests {
         let mut epoch_slot = EpochSlots::default();
         epoch_slot.fill(&[1], 0);
         cs.update_internal(0, (vec![epoch_slot], None));
-        let self_id = Pubkey::new_rand();
+        let self_id = solana_sdk::pubkey::new_rand();
         assert_eq!(
             cs.generate_repairs_for_missing_slots(&self_id, 0),
             vec![RepairType::HighestShred(1, 0)]

@@ -3,7 +3,8 @@ import {
   SystemProgram,
   StakeProgram,
   VOTE_PROGRAM_ID,
-  BpfLoader,
+  BPF_LOADER_PROGRAM_ID,
+  BPF_LOADER_DEPRECATED_PROGRAM_ID,
   SYSVAR_CLOCK_PUBKEY,
   SYSVAR_RENT_PUBKEY,
   SYSVAR_REWARDS_PUBKEY,
@@ -11,22 +12,17 @@ import {
   ParsedTransaction,
   TransactionInstruction,
   Transaction,
+  PartiallyDecodedInstruction,
+  ParsedInstruction,
 } from "@solana/web3.js";
 import { TokenRegistry } from "tokenRegistry";
 import { Cluster } from "providers/cluster";
+import { SerumMarketRegistry } from "serumMarketRegistry";
 
-export type ProgramName =
-  | "Budget Program"
-  | "Config Program"
-  | "Exchange Program"
-  | "Stake Program"
-  | "Storage Program"
-  | "System Program"
-  | "Vest Program"
-  | "Vote Program"
-  | "SPL Token";
+export type ProgramName = typeof PROGRAM_IDS[keyof typeof PROGRAM_IDS];
 
-export const PROGRAM_IDS: { [key: string]: ProgramName } = {
+export const PROGRAM_IDS = {
+  BrEAK7zGZ6dM71zUDACDqJnekihmwF15noTddWTsknjC: "Break Solana Program",
   Budget1111111111111111111111111111111111111: "Budget Program",
   Config1111111111111111111111111111111111111: "Config Program",
   Exchange11111111111111111111111111111111111: "Exchange Program",
@@ -35,49 +31,60 @@ export const PROGRAM_IDS: { [key: string]: ProgramName } = {
   [SystemProgram.programId.toBase58()]: "System Program",
   Vest111111111111111111111111111111111111111: "Vest Program",
   [VOTE_PROGRAM_ID.toBase58()]: "Vote Program",
-  TokenSVp5gheXUvJ6jGWGeCsgPKgnE3YgdGKRVCMY9o: "SPL Token",
-};
+  TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA: "SPL Token Program",
+  ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL:
+    "SPL Associated Token Account Program",
+  Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo: "Memo Program",
+  SwaPpA9LAaLfeLi3a68M4DjnLqgtticKg6CnyNwgAC8: "Token Swap Program",
+} as const;
 
-const LOADER_IDS = {
+export type LoaderName = typeof LOADER_IDS[keyof typeof LOADER_IDS];
+export const LOADER_IDS = {
   MoveLdr111111111111111111111111111111111111: "Move Loader",
   NativeLoader1111111111111111111111111111111: "Native Loader",
-  [BpfLoader.programId().toBase58()]: "BPF Loader",
-  [BpfLoader.programId(2).toBase58()]: "BPF Loader 2",
-};
+  [BPF_LOADER_DEPRECATED_PROGRAM_ID.toBase58()]: "BPF Loader",
+  [BPF_LOADER_PROGRAM_ID.toBase58()]: "BPF Loader 2",
+} as const;
 
 const SYSVAR_ID: { [key: string]: string } = {
   Sysvar1111111111111111111111111111111111111: "SYSVAR",
 };
 
 export const SYSVAR_IDS = {
-  [SYSVAR_CLOCK_PUBKEY.toBase58()]: "SYSVAR_CLOCK",
-  SysvarEpochSchedu1e111111111111111111111111: "SYSVAR_EPOCH_SCHEDULE",
-  SysvarFees111111111111111111111111111111111: "SYSVAR_FEES",
-  SysvarRecentB1ockHashes11111111111111111111: "SYSVAR_RECENT_BLOCKHASHES",
-  [SYSVAR_RENT_PUBKEY.toBase58()]: "SYSVAR_RENT",
-  [SYSVAR_REWARDS_PUBKEY.toBase58()]: "SYSVAR_REWARDS",
-  SysvarS1otHashes111111111111111111111111111: "SYSVAR_SLOT_HASHES",
-  SysvarS1otHistory11111111111111111111111111: "SYSVAR_SLOT_HISTORY",
-  [SYSVAR_STAKE_HISTORY_PUBKEY.toBase58()]: "SYSVAR_STAKE_HISTORY",
+  [SYSVAR_CLOCK_PUBKEY.toBase58()]: "Sysvar: Clock",
+  SysvarEpochSchedu1e111111111111111111111111: "Sysvar: Epoch Schedule",
+  SysvarFees111111111111111111111111111111111: "Sysvar: Fees",
+  SysvarRecentB1ockHashes11111111111111111111: "Sysvar: Recent Blockhashes",
+  [SYSVAR_RENT_PUBKEY.toBase58()]: "Sysvar: Rent",
+  [SYSVAR_REWARDS_PUBKEY.toBase58()]: "Sysvar: Rewards",
+  SysvarS1otHashes111111111111111111111111111: "Sysvar: Slot Hashes",
+  SysvarS1otHistory11111111111111111111111111: "Sysvar: Slot History",
+  [SYSVAR_STAKE_HISTORY_PUBKEY.toBase58()]: "Sysvar: Stake History",
 };
 
-export function displayAddress(address: string, cluster: Cluster): string {
+export function addressLabel(
+  address: string,
+  cluster: Cluster
+): string | undefined {
   return (
     PROGRAM_IDS[address] ||
     LOADER_IDS[address] ||
     SYSVAR_IDS[address] ||
     SYSVAR_ID[address] ||
     TokenRegistry.get(address, cluster)?.name ||
-    address
+    SerumMarketRegistry.get(address, cluster)
   );
+}
+
+export function displayAddress(address: string, cluster: Cluster): string {
+  return addressLabel(address, cluster) || address;
 }
 
 export function intoTransactionInstruction(
   tx: ParsedTransaction,
-  index: number
+  instruction: ParsedInstruction | PartiallyDecodedInstruction
 ): TransactionInstruction | undefined {
   const message = tx.message;
-  const instruction = message.instructions[index];
   if ("parsed" in instruction) return;
 
   const keys = [];

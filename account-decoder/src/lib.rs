@@ -12,9 +12,14 @@ pub mod parse_token;
 pub mod parse_vote;
 pub mod validator_info;
 
-use crate::parse_account_data::{parse_account_data, AccountAdditionalData, ParsedAccount};
-use solana_sdk::{account::Account, clock::Epoch, fee_calculator::FeeCalculator, pubkey::Pubkey};
-use std::str::FromStr;
+use {
+    crate::parse_account_data::{parse_account_data, AccountAdditionalData, ParsedAccount},
+    solana_sdk::{account::Account, clock::Epoch, fee_calculator::FeeCalculator, pubkey::Pubkey},
+    std::{
+        io::{Read, Write},
+        str::FromStr,
+    },
+};
 
 pub type StringAmount = String;
 
@@ -32,17 +37,20 @@ pub struct UiAccount {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", untagged)]
 pub enum UiAccountData {
-    Binary(String),
+    LegacyBinary(String), // Legacy. Retained for RPC backwards compatibility
     Json(ParsedAccount),
-    Binary64(String),
+    Binary(String, UiAccountEncoding),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum UiAccountEncoding {
-    Binary, // SLOW! Avoid this encoding
+    Binary, // Legacy. Retained for RPC backwards compatibility
+    Base58,
+    Base64,
     JsonParsed,
-    Binary64,
+    #[serde(rename = "base64+zstd")]
+    Base64Zstd,
 }
 
 impl UiAccount {
@@ -54,20 +62,37 @@ impl UiAccount {
         data_slice_config: Option<UiDataSliceConfig>,
     ) -> Self {
         let data = match encoding {
-            UiAccountEncoding::Binary => UiAccountData::Binary(
+            UiAccountEncoding::Binary => UiAccountData::LegacyBinary(
                 bs58::encode(slice_data(&account.data, data_slice_config)).into_string(),
             ),
-            UiAccountEncoding::Binary64 => UiAccountData::Binary64(base64::encode(slice_data(
-                &account.data,
-                data_slice_config,
-            ))),
+            UiAccountEncoding::Base58 => UiAccountData::Binary(
+                bs58::encode(slice_data(&account.data, data_slice_config)).into_string(),
+                encoding,
+            ),
+            UiAccountEncoding::Base64 => UiAccountData::Binary(
+                base64::encode(slice_data(&account.data, data_slice_config)),
+                encoding,
+            ),
+            UiAccountEncoding::Base64Zstd => {
+                let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+                match encoder
+                    .write_all(slice_data(&account.data, data_slice_config))
+                    .and_then(|()| encoder.finish())
+                {
+                    Ok(zstd_data) => UiAccountData::Binary(base64::encode(zstd_data), encoding),
+                    Err(_) => UiAccountData::Binary(
+                        base64::encode(slice_data(&account.data, data_slice_config)),
+                        UiAccountEncoding::Base64,
+                    ),
+                }
+            }
             UiAccountEncoding::JsonParsed => {
                 if let Ok(parsed_data) =
                     parse_account_data(pubkey, &account.owner, &account.data, additional_data)
                 {
                     UiAccountData::Json(parsed_data)
                 } else {
-                    UiAccountData::Binary64(base64::encode(&account.data))
+                    UiAccountData::Binary(base64::encode(&account.data), UiAccountEncoding::Base64)
                 }
             }
         };
@@ -83,8 +108,22 @@ impl UiAccount {
     pub fn decode(&self) -> Option<Account> {
         let data = match &self.data {
             UiAccountData::Json(_) => None,
-            UiAccountData::Binary(blob) => bs58::decode(blob).into_vec().ok(),
-            UiAccountData::Binary64(blob) => base64::decode(blob).ok(),
+            UiAccountData::LegacyBinary(blob) => bs58::decode(blob).into_vec().ok(),
+            UiAccountData::Binary(blob, encoding) => match encoding {
+                UiAccountEncoding::Base58 => bs58::decode(blob).into_vec().ok(),
+                UiAccountEncoding::Base64 => base64::decode(blob).ok(),
+                UiAccountEncoding::Base64Zstd => base64::decode(blob)
+                    .ok()
+                    .map(|zstd_data| {
+                        let mut data = vec![];
+                        zstd::stream::read::Decoder::new(zstd_data.as_slice())
+                            .and_then(|mut reader| reader.read_to_end(&mut data))
+                            .map(|_| data)
+                            .ok()
+                    })
+                    .flatten(),
+                UiAccountEncoding::Binary | UiAccountEncoding::JsonParsed => None,
+            },
         }?;
         Some(Account {
             lamports: self.lamports,
@@ -169,5 +208,26 @@ mod test {
             length: 2,
         });
         assert_eq!(slice_data(&data, slice_config), &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_base64_zstd() {
+        let encoded_account = UiAccount::encode(
+            &Pubkey::default(),
+            Account {
+                data: vec![0; 1024],
+                ..Account::default()
+            },
+            UiAccountEncoding::Base64Zstd,
+            None,
+            None,
+        );
+        assert!(matches!(
+            encoded_account.data,
+            UiAccountData::Binary(_, UiAccountEncoding::Base64Zstd)
+        ));
+
+        let decoded_account = encoded_account.decode().unwrap();
+        assert_eq!(decoded_account.data, vec![0; 1024]);
     }
 }

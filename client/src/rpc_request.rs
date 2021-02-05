@@ -1,5 +1,6 @@
+use crate::rpc_response::RpcSimulateTransactionResult;
 use serde_json::{json, Value};
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{clock::Slot, pubkey::Pubkey};
 use std::fmt;
 use thiserror::Error;
 
@@ -13,6 +14,7 @@ pub enum RpcRequest {
     GetClusterNodes,
     GetConfirmedBlock,
     GetConfirmedBlocks,
+    GetConfirmedBlocksWithLimit,
     GetConfirmedSignaturesForAddress,
     GetConfirmedSignaturesForAddress2,
     GetConfirmedTransaction,
@@ -21,15 +23,19 @@ pub enum RpcRequest {
     GetFeeCalculatorForBlockhash,
     GetFeeRateGovernor,
     GetFees,
+    GetFirstAvailableBlock,
     GetGenesisHash,
+    GetHealth,
     GetIdentity,
     GetInflationGovernor,
     GetInflationRate,
     GetLargestAccounts,
     GetLeaderSchedule,
     GetMinimumBalanceForRentExemption,
+    GetMultipleAccounts,
     GetProgramAccounts,
     GetRecentBlockhash,
+    GetSnapshotSlot,
     GetSignatureStatuses,
     GetSlot,
     GetSlotLeader,
@@ -65,6 +71,7 @@ impl fmt::Display for RpcRequest {
             RpcRequest::GetClusterNodes => "getClusterNodes",
             RpcRequest::GetConfirmedBlock => "getConfirmedBlock",
             RpcRequest::GetConfirmedBlocks => "getConfirmedBlocks",
+            RpcRequest::GetConfirmedBlocksWithLimit => "getConfirmedBlocksWithLimit",
             RpcRequest::GetConfirmedSignaturesForAddress => "getConfirmedSignaturesForAddress",
             RpcRequest::GetConfirmedSignaturesForAddress2 => "getConfirmedSignaturesForAddress2",
             RpcRequest::GetConfirmedTransaction => "getConfirmedTransaction",
@@ -73,15 +80,19 @@ impl fmt::Display for RpcRequest {
             RpcRequest::GetFeeCalculatorForBlockhash => "getFeeCalculatorForBlockhash",
             RpcRequest::GetFeeRateGovernor => "getFeeRateGovernor",
             RpcRequest::GetFees => "getFees",
+            RpcRequest::GetFirstAvailableBlock => "getFirstAvailableBlock",
             RpcRequest::GetGenesisHash => "getGenesisHash",
+            RpcRequest::GetHealth => "getHealth",
             RpcRequest::GetIdentity => "getIdentity",
             RpcRequest::GetInflationGovernor => "getInflationGovernor",
             RpcRequest::GetInflationRate => "getInflationRate",
             RpcRequest::GetLargestAccounts => "getLargestAccounts",
             RpcRequest::GetLeaderSchedule => "getLeaderSchedule",
             RpcRequest::GetMinimumBalanceForRentExemption => "getMinimumBalanceForRentExemption",
+            RpcRequest::GetMultipleAccounts => "getMultipleAccounts",
             RpcRequest::GetProgramAccounts => "getProgramAccounts",
             RpcRequest::GetRecentBlockhash => "getRecentBlockhash",
+            RpcRequest::GetSnapshotSlot => "getSnapshotSlot",
             RpcRequest::GetSignatureStatuses => "getSignatureStatuses",
             RpcRequest::GetSlot => "getSlot",
             RpcRequest::GetSlotLeader => "getSlotLeader",
@@ -110,11 +121,12 @@ impl fmt::Display for RpcRequest {
     }
 }
 
-pub const NUM_LARGEST_ACCOUNTS: usize = 20;
 pub const MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS: usize = 256;
 pub const MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS_SLOT_RANGE: u64 = 10_000;
 pub const MAX_GET_CONFIRMED_BLOCKS_RANGE: u64 = 500_000;
 pub const MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT: usize = 1_000;
+pub const MAX_MULTIPLE_ACCOUNTS: usize = 100;
+pub const NUM_LARGEST_ACCOUNTS: usize = 20;
 
 // Validators that are this number of slots behind are considered delinquent
 pub const DELINQUENT_VALIDATOR_SLOT_DISTANCE: u64 = 128;
@@ -131,10 +143,43 @@ impl RpcRequest {
     }
 }
 
+#[derive(Debug)]
+pub enum RpcResponseErrorData {
+    Empty,
+    SendTransactionPreflightFailure(RpcSimulateTransactionResult),
+    NodeUnhealthy { num_slots_behind: Option<Slot> },
+}
+
+impl fmt::Display for RpcResponseErrorData {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            RpcResponseErrorData::SendTransactionPreflightFailure(
+                RpcSimulateTransactionResult {
+                    logs: Some(logs), ..
+                },
+            ) => {
+                if logs.is_empty() {
+                    Ok(())
+                } else {
+                    // Give the user a hint that there is more useful logging information available...
+                    write!(f, "[{} log messages]", logs.len())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RpcError {
-    #[error("rpc request error: {0}")]
+    #[error("RPC request error: {0}")]
     RpcRequestError(String),
+    #[error("RPC response error {code}: {message} {data}")]
+    RpcResponseError {
+        code: i64,
+        message: String,
+        data: RpcResponseErrorData,
+    },
     #[error("parse error: expected {0}")]
     ParseError(String), /* "expected" */
     // Anything in a `ForUser` needs to die.  The caller should be
@@ -203,7 +248,7 @@ mod tests {
     #[test]
     fn test_build_request_json_config_options() {
         let commitment_config = CommitmentConfig {
-            commitment: CommitmentLevel::Max,
+            commitment: CommitmentLevel::Finalized,
         };
         let addr = json!("deadbeefXjn8o3yroDHxUtKsZZgoy4GPkPPXfouKNHhx");
 
@@ -219,7 +264,7 @@ mod tests {
 
         // Test request with CommitmentConfig and params
         let test_request = RpcRequest::GetTokenAccountsByOwner;
-        let mint = Pubkey::new_rand();
+        let mint = solana_sdk::pubkey::new_rand();
         let token_account_filter = RpcTokenAccountsFilter::Mint(mint.to_string());
         let request = test_request
             .build_request_json(1, json!([addr, token_account_filter, commitment_config]));

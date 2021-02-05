@@ -1,7 +1,7 @@
 //! @brief Example Rust-based BPF program tests loop iteration
 
-extern crate solana_sdk;
-use solana_sdk::{entrypoint::SUCCESS, info};
+extern crate solana_program;
+use solana_program::{custom_panic_default, entrypoint::SUCCESS, msg};
 
 #[no_mangle]
 pub extern "C" fn entrypoint(_input: *mut u8) -> u64 {
@@ -12,17 +12,17 @@ pub extern "C" fn entrypoint(_input: *mut u8) -> u64 {
     for v in ones.iter() {
         sum += *v;
     }
-    info!(0xff, 0, 0, 0, sum);
+    msg!(0xff, 0, 0, 0, sum);
     assert_eq!(sum, ITERS as u64);
 
     SUCCESS
 }
 
+custom_panic_default!();
+
 #[cfg(test)]
 mod test {
     use super::*;
-    // Pull in syscall stubs when building for non-BPF targets
-    solana_sdk::program_stubs!();
 
     #[test]
     fn test_entrypoint() {

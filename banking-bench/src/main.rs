@@ -17,10 +17,11 @@ use solana_ledger::{
 };
 use solana_measure::measure::Measure;
 use solana_perf::packet::to_packets_chunked;
-use solana_runtime::{bank::Bank, bank_forks::BankForks};
+use solana_runtime::{
+    accounts_background_service::ABSRequestSender, bank::Bank, bank_forks::BankForks,
+};
 use solana_sdk::{
     hash::Hash,
-    pubkey::Pubkey,
     signature::Keypair,
     signature::Signature,
     system_transaction,
@@ -69,7 +70,7 @@ fn make_accounts_txs(
     hash: Hash,
     same_payer: bool,
 ) -> Vec<Transaction> {
-    let to_pubkey = Pubkey::new_rand();
+    let to_pubkey = solana_sdk::pubkey::new_rand();
     let payer_key = Keypair::new();
     let dummy = system_transaction::transfer(&payer_key, &to_pubkey, 1, hash);
     (0..total_num_transactions)
@@ -78,9 +79,9 @@ fn make_accounts_txs(
             let mut new = dummy.clone();
             let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen()).collect();
             if !same_payer {
-                new.message.account_keys[0] = Pubkey::new_rand();
+                new.message.account_keys[0] = solana_sdk::pubkey::new_rand();
             }
-            new.message.account_keys[1] = Pubkey::new_rand();
+            new.message.account_keys[1] = solana_sdk::pubkey::new_rand();
             new.signatures = vec![Signature::new(&sig[0..64])];
             new
         })
@@ -241,7 +242,7 @@ fn main() {
         let base_tx_count = bank.transaction_count();
         let mut txs_processed = 0;
         let mut root = 1;
-        let collector = Pubkey::new_rand();
+        let collector = solana_sdk::pubkey::new_rand();
         let config = Config {
             packets_per_batch: packets_per_chunk,
             chunk_len,
@@ -324,7 +325,7 @@ fn main() {
                 poh_recorder.lock().unwrap().set_bank(&bank);
                 assert!(poh_recorder.lock().unwrap().bank().is_some());
                 if bank.slot() > 32 {
-                    bank_forks.set_root(root, &None, None);
+                    bank_forks.set_root(root, &ABSRequestSender::default(), None);
                     root += 1;
                 }
                 debug!(

@@ -1,6 +1,8 @@
 use bincode::serialized_size;
 use log::*;
 use rayon::prelude::*;
+use rayon::{ThreadPool, ThreadPoolBuilder};
+use serial_test::serial;
 use solana_core::cluster_info;
 use solana_core::contact_info::ContactInfo;
 use solana_core::crds_gossip::*;
@@ -9,6 +11,7 @@ use solana_core::crds_gossip_pull::{ProcessPullStats, CRDS_GOSSIP_PULL_CRDS_TIME
 use solana_core::crds_gossip_push::CRDS_GOSSIP_PUSH_MSG_TIMEOUT_MS;
 use solana_core::crds_value::CrdsValueLabel;
 use solana_core::crds_value::{CrdsData, CrdsValue};
+use solana_rayon_threadlimit::get_thread_count;
 use solana_sdk::hash::hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::timing::timestamp;
@@ -74,26 +77,26 @@ fn stakes(network: &Network) -> HashMap<Pubkey, u64> {
 
 fn star_network_create(num: usize) -> Network {
     let entry = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-        &Pubkey::new_rand(),
+        &solana_sdk::pubkey::new_rand(),
         0,
     )));
     let mut network: HashMap<_, _> = (1..num)
         .map(|_| {
             let new = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-                &Pubkey::new_rand(),
+                &solana_sdk::pubkey::new_rand(),
                 0,
             )));
             let id = new.label().pubkey();
             let mut node = CrdsGossip::default();
-            node.crds.insert(new.clone(), 0).unwrap();
-            node.crds.insert(entry.clone(), 0).unwrap();
+            node.crds.insert(new.clone(), timestamp()).unwrap();
+            node.crds.insert(entry.clone(), timestamp()).unwrap();
             node.set_self(&id);
             (new.label().pubkey(), Node::new(Arc::new(Mutex::new(node))))
         })
         .collect();
     let mut node = CrdsGossip::default();
     let id = entry.label().pubkey();
-    node.crds.insert(entry, 0).unwrap();
+    node.crds.insert(entry, timestamp()).unwrap();
     node.set_self(&id);
     network.insert(id, Node::new(Arc::new(Mutex::new(node))));
     Network::new(network)
@@ -101,23 +104,23 @@ fn star_network_create(num: usize) -> Network {
 
 fn rstar_network_create(num: usize) -> Network {
     let entry = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-        &Pubkey::new_rand(),
+        &solana_sdk::pubkey::new_rand(),
         0,
     )));
     let mut origin = CrdsGossip::default();
     let id = entry.label().pubkey();
-    origin.crds.insert(entry, 0).unwrap();
+    origin.crds.insert(entry, timestamp()).unwrap();
     origin.set_self(&id);
     let mut network: HashMap<_, _> = (1..num)
         .map(|_| {
             let new = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-                &Pubkey::new_rand(),
+                &solana_sdk::pubkey::new_rand(),
                 0,
             )));
             let id = new.label().pubkey();
             let mut node = CrdsGossip::default();
-            node.crds.insert(new.clone(), 0).unwrap();
-            origin.crds.insert(new.clone(), 0).unwrap();
+            node.crds.insert(new.clone(), timestamp()).unwrap();
+            origin.crds.insert(new.clone(), timestamp()).unwrap();
             node.set_self(&id);
             (new.label().pubkey(), Node::new(Arc::new(Mutex::new(node))))
         })
@@ -130,12 +133,12 @@ fn ring_network_create(num: usize) -> Network {
     let mut network: HashMap<_, _> = (0..num)
         .map(|_| {
             let new = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-                &Pubkey::new_rand(),
+                &solana_sdk::pubkey::new_rand(),
                 0,
             )));
             let id = new.label().pubkey();
             let mut node = CrdsGossip::default();
-            node.crds.insert(new.clone(), 0).unwrap();
+            node.crds.insert(new.clone(), timestamp()).unwrap();
             node.set_self(&id);
             (new.label().pubkey(), Node::new(Arc::new(Mutex::new(node))))
         })
@@ -154,7 +157,11 @@ fn ring_network_create(num: usize) -> Network {
                 .clone()
         };
         let end = network.get_mut(&keys[(k + 1) % keys.len()]).unwrap();
-        end.lock().unwrap().crds.insert(start_info, 0).unwrap();
+        end.lock()
+            .unwrap()
+            .crds
+            .insert(start_info, timestamp())
+            .unwrap();
     }
     Network::new(network)
 }
@@ -164,12 +171,12 @@ fn connected_staked_network_create(stakes: &[u64]) -> Network {
     let mut network: HashMap<_, _> = (0..num)
         .map(|n| {
             let new = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
-                &Pubkey::new_rand(),
+                &solana_sdk::pubkey::new_rand(),
                 0,
             )));
             let id = new.label().pubkey();
             let mut node = CrdsGossip::default();
-            node.crds.insert(new.clone(), 0).unwrap();
+            node.crds.insert(new.clone(), timestamp()).unwrap();
             node.set_self(&id);
             (
                 new.label().pubkey(),
@@ -193,16 +200,16 @@ fn connected_staked_network_create(stakes: &[u64]) -> Network {
             let mut end = end.lock().unwrap();
             if keys[k] != end.id {
                 let start_info = start_entries[k].clone();
-                end.crds.insert(start_info, 0).unwrap();
+                end.crds.insert(start_info, timestamp()).unwrap();
             }
         }
     }
     Network::new(network)
 }
 
-fn network_simulator_pull_only(network: &mut Network) {
+fn network_simulator_pull_only(thread_pool: &ThreadPool, network: &mut Network) {
     let num = network.len();
-    let (converged, bytes_tx) = network_run_pull(network, 0, num * 2, 0.9);
+    let (converged, bytes_tx) = network_run_pull(&thread_pool, network, 0, num * 2, 0.9);
     trace!(
         "network_simulator_pull_{}: converged: {} total_bytes: {}",
         num,
@@ -212,23 +219,25 @@ fn network_simulator_pull_only(network: &mut Network) {
     assert!(converged >= 0.9);
 }
 
-fn network_simulator(network: &mut Network, max_convergance: f64) {
+fn network_simulator(thread_pool: &ThreadPool, network: &mut Network, max_convergance: f64) {
     let num = network.len();
     // run for a small amount of time
-    let (converged, bytes_tx) = network_run_pull(network, 0, 10, 1.0);
+    let (converged, bytes_tx) = network_run_pull(&thread_pool, network, 0, 10, 1.0);
     trace!("network_simulator_push_{}: converged: {}", num, converged);
     // make sure there is someone in the active set
     let network_values: Vec<Node> = network.values().cloned().collect();
     network_values.par_iter().for_each(|node| {
         node.lock()
             .unwrap()
-            .refresh_push_active_set(&HashMap::new());
+            .refresh_push_active_set(&HashMap::new(), None);
     });
     let mut total_bytes = bytes_tx;
-    for second in 1..num {
-        let start = second * 10;
-        let end = (second + 1) * 10;
+    let mut ts = timestamp();
+    for _ in 1..num {
+        let start = ((ts + 99) / 100) as usize;
+        let end = start + 10;
         let now = (start * 100) as u64;
+        ts += 1000;
         // push a message to the network
         network_values.par_iter().for_each(|locked_node| {
             let node = &mut locked_node.lock().unwrap();
@@ -245,7 +254,7 @@ fn network_simulator(network: &mut Network, max_convergance: f64) {
             );
         });
         // push for a bit
-        let (queue_size, bytes_tx) = network_run_push(network, start, end);
+        let (queue_size, bytes_tx) = network_run_push(thread_pool, network, start, end);
         total_bytes += bytes_tx;
         trace!(
             "network_simulator_push_{}: queue_size: {} bytes: {}",
@@ -254,7 +263,7 @@ fn network_simulator(network: &mut Network, max_convergance: f64) {
             bytes_tx
         );
         // pull for a bit
-        let (converged, bytes_tx) = network_run_pull(network, start, end, 1.0);
+        let (converged, bytes_tx) = network_run_pull(&thread_pool, network, start, end, 1.0);
         total_bytes += bytes_tx;
         trace!(
             "network_simulator_push_{}: converged: {} bytes: {} total_bytes: {}",
@@ -269,7 +278,12 @@ fn network_simulator(network: &mut Network, max_convergance: f64) {
     }
 }
 
-fn network_run_push(network: &mut Network, start: usize, end: usize) -> (usize, usize) {
+fn network_run_push(
+    thread_pool: &ThreadPool,
+    network: &mut Network,
+    start: usize,
+    end: usize,
+) -> (usize, usize) {
     let mut bytes: usize = 0;
     let mut num_msgs: usize = 0;
     let mut total: usize = 0;
@@ -284,9 +298,10 @@ fn network_run_push(network: &mut Network, start: usize, end: usize) -> (usize, 
         let requests: Vec<_> = network_values
             .par_iter()
             .map(|node| {
-                let timeouts = node.lock().unwrap().make_timeouts_test();
-                node.lock().unwrap().purge(now, &timeouts);
-                node.lock().unwrap().new_push_messages(now)
+                let mut node_lock = node.lock().unwrap();
+                let timeouts = node_lock.make_timeouts_test();
+                node_lock.purge(thread_pool, now, &timeouts);
+                node_lock.new_push_messages(vec![], now)
             })
             .collect();
         let transfered: Vec<_> = requests
@@ -331,7 +346,7 @@ fn network_run_push(network: &mut Network, start: usize, end: usize) -> (usize, 
                         network
                             .get(&from)
                             .map(|node| {
-                                let mut node = node.lock().unwrap();
+                                let node = node.lock().unwrap();
                                 let destination = node.id;
                                 let now = timestamp();
                                 node.process_prune_msg(&to, &destination, &prune_keys, now, now)
@@ -361,7 +376,7 @@ fn network_run_push(network: &mut Network, start: usize, end: usize) -> (usize, 
             network_values.par_iter().for_each(|node| {
                 node.lock()
                     .unwrap()
-                    .refresh_push_active_set(&HashMap::new());
+                    .refresh_push_active_set(&HashMap::new(), None);
             });
         }
         total = network_values
@@ -386,6 +401,7 @@ fn network_run_push(network: &mut Network, start: usize, end: usize) -> (usize, 
 }
 
 fn network_run_pull(
+    thread_pool: &ThreadPool,
     network: &mut Network,
     start: usize,
     end: usize,
@@ -408,7 +424,13 @@ fn network_run_pull(
                 .filter_map(|from| {
                     from.lock()
                         .unwrap()
-                        .new_pull_request(now, &HashMap::new(), cluster_info::MAX_BLOOM_SIZE)
+                        .new_pull_request(
+                            &thread_pool,
+                            now,
+                            None,
+                            &HashMap::new(),
+                            cluster_info::MAX_BLOOM_SIZE,
+                        )
                         .ok()
                 })
                 .collect()
@@ -436,11 +458,18 @@ fn network_run_pull(
                         let rsp = node
                             .lock()
                             .unwrap()
-                            .generate_pull_responses(&filters, now)
+                            .generate_pull_responses(
+                                &filters,
+                                /*output_size_limit=*/ usize::MAX,
+                                now,
+                            )
                             .into_iter()
                             .flatten()
                             .collect();
-                        node.lock().unwrap().process_pull_requests(filters, now);
+                        node.lock().unwrap().process_pull_requests(
+                            filters.into_iter().map(|(caller, _)| caller),
+                            now,
+                        );
                         rsp
                     })
                     .unwrap();
@@ -450,9 +479,16 @@ fn network_run_pull(
                     let mut node = node.lock().unwrap();
                     node.mark_pull_request_creation_time(&from, now);
                     let mut stats = ProcessPullStats::default();
-                    let (vers, vers_expired_timeout) =
+                    let (vers, vers_expired_timeout, failed_inserts) =
                         node.filter_pull_responses(&timeouts, rsp, now, &mut stats);
-                    node.process_pull_responses(&from, vers, vers_expired_timeout, now, &mut stats);
+                    node.process_pull_responses(
+                        &from,
+                        vers,
+                        vers_expired_timeout,
+                        failed_inserts,
+                        now,
+                        &mut stats,
+                    );
                     overhead += stats.failed_insert;
                     overhead += stats.failed_timeout;
                 }
@@ -466,7 +502,7 @@ fn network_run_pull(
         }
         let total: usize = network_values
             .par_iter()
-            .map(|v| v.lock().unwrap().crds.table.len())
+            .map(|v| v.lock().unwrap().crds.len())
             .sum();
         convergance = total as f64 / ((num * num) as f64);
         if convergance > max_convergance {
@@ -486,35 +522,54 @@ fn network_run_pull(
     (convergance, bytes)
 }
 
+fn build_gossip_thread_pool() -> ThreadPool {
+    ThreadPoolBuilder::new()
+        .num_threads(get_thread_count().min(2))
+        .thread_name(|i| format!("crds_gossip_test_{}", i))
+        .build()
+        .unwrap()
+}
+
 #[test]
+#[serial]
 fn test_star_network_pull_50() {
     let mut network = star_network_create(50);
-    network_simulator_pull_only(&mut network);
+    let thread_pool = build_gossip_thread_pool();
+    network_simulator_pull_only(&thread_pool, &mut network);
 }
 #[test]
+#[serial]
 fn test_star_network_pull_100() {
     let mut network = star_network_create(100);
-    network_simulator_pull_only(&mut network);
+    let thread_pool = build_gossip_thread_pool();
+    network_simulator_pull_only(&thread_pool, &mut network);
 }
 #[test]
+#[serial]
 fn test_star_network_push_star_200() {
     let mut network = star_network_create(200);
-    network_simulator(&mut network, 0.9);
+    let thread_pool = build_gossip_thread_pool();
+    network_simulator(&thread_pool, &mut network, 0.9);
 }
 #[ignore]
 #[test]
 fn test_star_network_push_rstar_200() {
     let mut network = rstar_network_create(200);
-    network_simulator(&mut network, 0.9);
+    let thread_pool = build_gossip_thread_pool();
+    network_simulator(&thread_pool, &mut network, 0.9);
 }
 #[test]
+#[serial]
 fn test_star_network_push_ring_200() {
     let mut network = ring_network_create(200);
-    network_simulator(&mut network, 0.9);
+    let thread_pool = build_gossip_thread_pool();
+    network_simulator(&thread_pool, &mut network, 0.9);
 }
 #[test]
+#[serial]
 fn test_connected_staked_network() {
     solana_logger::setup();
+    let thread_pool = build_gossip_thread_pool();
     let stakes = [
         [1000; 2].to_vec(),
         [100; 3].to_vec(),
@@ -523,7 +578,7 @@ fn test_connected_staked_network() {
     ]
     .concat();
     let mut network = connected_staked_network_create(&stakes);
-    network_simulator(&mut network, 1.0);
+    network_simulator(&thread_pool, &mut network, 1.0);
 
     let stake_sum: u64 = stakes.iter().sum();
     let avg_stake: u64 = stake_sum / stakes.len() as u64;
@@ -544,33 +599,39 @@ fn test_connected_staked_network() {
 fn test_star_network_large_pull() {
     solana_logger::setup();
     let mut network = star_network_create(2000);
-    network_simulator_pull_only(&mut network);
+    let thread_pool = build_gossip_thread_pool();
+    network_simulator_pull_only(&thread_pool, &mut network);
 }
 #[test]
 #[ignore]
 fn test_rstar_network_large_push() {
     solana_logger::setup();
     let mut network = rstar_network_create(4000);
-    network_simulator(&mut network, 0.9);
+    let thread_pool = build_gossip_thread_pool();
+    network_simulator(&thread_pool, &mut network, 0.9);
 }
 #[test]
 #[ignore]
 fn test_ring_network_large_push() {
     solana_logger::setup();
     let mut network = ring_network_create(4001);
-    network_simulator(&mut network, 0.9);
+    let thread_pool = build_gossip_thread_pool();
+    network_simulator(&thread_pool, &mut network, 0.9);
 }
 #[test]
 #[ignore]
 fn test_star_network_large_push() {
     solana_logger::setup();
     let mut network = star_network_create(4002);
-    network_simulator(&mut network, 0.9);
+    let thread_pool = build_gossip_thread_pool();
+    network_simulator(&thread_pool, &mut network, 0.9);
 }
 #[test]
 fn test_prune_errors() {
-    let mut crds_gossip = CrdsGossip::default();
-    crds_gossip.id = Pubkey::new(&[0; 32]);
+    let mut crds_gossip = CrdsGossip {
+        id: Pubkey::new(&[0; 32]),
+        ..CrdsGossip::default()
+    };
     let id = crds_gossip.id;
     let ci = ContactInfo::new_localhost(&Pubkey::new(&[1; 32]), 0);
     let prune_pubkey = Pubkey::new(&[2; 32]);
@@ -581,7 +642,7 @@ fn test_prune_errors() {
             0,
         )
         .unwrap();
-    crds_gossip.refresh_push_active_set(&HashMap::new());
+    crds_gossip.refresh_push_active_set(&HashMap::new(), None);
     let now = timestamp();
     //incorrect dest
     let mut res = crds_gossip.process_prune_msg(

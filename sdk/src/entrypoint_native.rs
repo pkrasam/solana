@@ -1,10 +1,6 @@
 //! @brief Solana Native program entry point
 
-use crate::{
-    account::Account, account::KeyedAccount, instruction::CompiledInstruction,
-    instruction::InstructionError, message::Message, pubkey::Pubkey,
-};
-use std::{cell::RefCell, rc::Rc};
+use crate::{instruction::InstructionError, keyed_account::KeyedAccount, pubkey::Pubkey};
 
 // Prototype of a native program entry point
 ///
@@ -15,19 +11,6 @@ pub type ProgramEntrypoint = unsafe extern "C" fn(
     program_id: &Pubkey,
     keyed_accounts: &[KeyedAccount],
     instruction_data: &[u8],
-) -> Result<(), InstructionError>;
-
-// Prototype of a native loader entry point
-///
-/// program_id: Program ID of the currently executing program
-/// keyed_accounts: Accounts passed as part of the instruction
-/// instruction_data: Instruction data
-/// invoke_context: Invocation context
-pub type LoaderEntrypoint = unsafe extern "C" fn(
-    program_id: &Pubkey,
-    keyed_accounts: &[KeyedAccount],
-    instruction_data: &[u8],
-    invoke_context: &dyn InvokeContext,
 ) -> Result<(), InstructionError>;
 
 #[rustversion::since(1.46.0)]
@@ -103,15 +86,19 @@ macro_rules! declare_name {
 /// # // wrapper is used so that the macro invocation occurs in the item position
 /// # // rather than in the statement position which isn't allowed.
 /// # mod item_wrapper {
-/// use solana_sdk::account::KeyedAccount;
-/// use solana_sdk::instruction::InstructionError;
-/// use solana_sdk::pubkey::Pubkey;
-/// use solana_sdk::declare_program;
+/// use solana_sdk::{
+///     declare_program,
+///     instruction::InstructionError,
+///     keyed_account::KeyedAccount,
+///     process_instruction::InvokeContext,
+///     pubkey::Pubkey,
+/// };
 ///
 /// fn my_process_instruction(
 ///     program_id: &Pubkey,
 ///     keyed_accounts: &[KeyedAccount],
 ///     instruction_data: &[u8],
+///     invoke_context: &mut dyn InvokeContext,
 /// ) -> Result<(), InstructionError> {
 ///   // Process an instruction
 ///   Ok(())
@@ -134,15 +121,19 @@ macro_rules! declare_name {
 /// # // wrapper is used so that the macro invocation occurs in the item position
 /// # // rather than in the statement position which isn't allowed.
 /// # mod item_wrapper {
-/// use solana_sdk::account::KeyedAccount;
-/// use solana_sdk::instruction::InstructionError;
-/// use solana_sdk::pubkey::Pubkey;
-/// use solana_sdk::declare_program;
+/// use solana_sdk::{
+///     declare_program,
+///     instruction::InstructionError,
+///     keyed_account::KeyedAccount,
+///     process_instruction::InvokeContext,
+///     pubkey::Pubkey,
+/// };
 ///
 /// fn my_process_instruction(
 ///     program_id: &Pubkey,
 ///     keyed_accounts: &[KeyedAccount],
 ///     instruction_data: &[u8],
+///     invoke_context: &mut dyn InvokeContext,
 /// ) -> Result<(), InstructionError> {
 ///   // Process an instruction
 ///   Ok(())
@@ -167,44 +158,11 @@ macro_rules! declare_program(
         #[no_mangle]
         pub extern "C" fn $name(
             program_id: &$crate::pubkey::Pubkey,
-            keyed_accounts: &[$crate::account::KeyedAccount],
+            keyed_accounts: &[$crate::keyed_account::KeyedAccount],
             instruction_data: &[u8],
+            invoke_context: &mut dyn $crate::process_instruction::InvokeContext,
         ) -> Result<(), $crate::instruction::InstructionError> {
-            $entrypoint(program_id, keyed_accounts, instruction_data)
+            $entrypoint(program_id, keyed_accounts, instruction_data, invoke_context)
         }
     )
 );
-
-pub type ProcessInstruction = fn(&Pubkey, &[KeyedAccount], &[u8]) -> Result<(), InstructionError>;
-pub type ProcessInstructionWithContext =
-    fn(&Pubkey, &[KeyedAccount], &[u8], &mut dyn InvokeContext) -> Result<(), InstructionError>;
-
-/// Invocation context passed to loaders
-pub trait InvokeContext {
-    /// Push a program ID on to the invocation stack
-    fn push(&mut self, key: &Pubkey) -> Result<(), InstructionError>;
-    /// Pop a program ID off of the invocation stack
-    fn pop(&mut self);
-    /// Verify and update PreAccount state based on program execution
-    fn verify_and_update(
-        &mut self,
-        message: &Message,
-        instruction: &CompiledInstruction,
-        accounts: &[Rc<RefCell<Account>>],
-    ) -> Result<(), InstructionError>;
-    /// Get the program ID of the currently executing program
-    fn get_caller(&self) -> Result<&Pubkey, InstructionError>;
-    /// Get a list of built-in programs
-    fn get_programs(&self) -> &[(Pubkey, ProcessInstruction)];
-    /// Get this invocation's logger
-    fn get_logger(&self) -> Rc<RefCell<dyn Logger>>;
-    /// Are cross program invocations supported
-    fn is_cross_program_supported(&self) -> bool;
-}
-
-/// Log messages
-pub trait Logger {
-    fn log_enabled(&self) -> bool;
-    /// Log a message
-    fn log(&mut self, message: &str);
-}

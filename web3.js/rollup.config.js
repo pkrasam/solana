@@ -98,12 +98,16 @@ function generateConfig(configType) {
         'bs58',
         'buffer-layout',
         'crypto-hash',
+        'http',
+        'https',
         'jayson/lib/client/browser',
         'node-fetch',
         'rpc-websockets',
         'superstruct',
         'tweetnacl',
         'url',
+        'secp256k1',
+        'keccak',
       ];
       break;
     default:

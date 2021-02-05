@@ -6,6 +6,8 @@ import { useFetchAccountHistory } from "providers/accounts/history";
 import { Signature } from "components/common/Signature";
 import { ErrorCard } from "components/common/ErrorCard";
 import { LoadingCard } from "components/common/LoadingCard";
+import { Slot } from "components/common/Slot";
+import { displayTimestamp } from "utils/date";
 
 export function TransactionHistoryCard({ pubkey }: { pubkey: PublicKey }) {
   const address = pubkey.toBase58();
@@ -47,6 +49,7 @@ export function TransactionHistoryCard({ pubkey }: { pubkey: PublicKey }) {
     );
   }
 
+  const hasTimestamps = !!transactions.find((element) => !!element.blockTime);
   const detailsList: React.ReactNode[] = [];
   for (var i = 0; i < transactions.length; i++) {
     const slot = transactions[i].slot;
@@ -57,7 +60,7 @@ export function TransactionHistoryCard({ pubkey }: { pubkey: PublicKey }) {
       slotTransactions.push(transactions[++i]);
     }
 
-    slotTransactions.forEach(({ signature, err }) => {
+    slotTransactions.forEach(({ signature, err, blockTime }) => {
       let statusText;
       let statusClass;
       if (err) {
@@ -70,7 +73,15 @@ export function TransactionHistoryCard({ pubkey }: { pubkey: PublicKey }) {
 
       detailsList.push(
         <tr key={signature}>
-          <td className="w-1 text-monospace">{slot.toLocaleString("en-US")}</td>
+          <td className="w-1">
+            <Slot slot={slot} link />
+          </td>
+
+          {hasTimestamps && (
+            <td className="text-muted">
+              {blockTime ? displayTimestamp(blockTime * 1000, true) : "---"}
+            </td>
+          )}
 
           <td>
             <span className={`badge badge-soft-${statusClass}`}>
@@ -115,6 +126,7 @@ export function TransactionHistoryCard({ pubkey }: { pubkey: PublicKey }) {
           <thead>
             <tr>
               <th className="text-muted w-1">Slot</th>
+              {hasTimestamps && <th className="text-muted">Timestamp</th>}
               <th className="text-muted">Result</th>
               <th className="text-muted">Transaction Signature</th>
             </tr>
